@@ -3,6 +3,7 @@
 
 #include "iree/compiler/Preprocessing/Common/PassDetail.h"
 #include "iree/compiler/Preprocessing/Common/Passes.h"
+#include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -10,6 +11,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir {
 namespace iree_compiler{
@@ -21,7 +23,14 @@ namespace {
 //                        Patterns
 //-----------------------------------------------------------//
 
-class FuseDequantizationMatmul final
+// struct DequantizationMatmulFusePass
+//     : public DequantizationMatmulFuseBase<DequantizationMatmulFusePass> {
+
+//   void getDependentDialects(DialectRegistry &registry) const override {
+//     registry.insert<linalg::LinalgDialect>();
+//   }
+
+class DequantizationMatmulFusePattern final
     : public OpRewritePattern<linalg::GenericOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -34,14 +43,14 @@ public:
     if (genOpMatmul.getNumResults() != 1) return failure();
     if (genOpMatmul.getNumOperands() != 2) return failure();
 
-    auto mmIndexingMaps = genOpMatmul.getIndexingMaps();
+    // auto mmIndexingMaps = genOpMatmul.getIndexingMaps();
 
-    auto mmResultType =
-        llvm::cast<RankedTensorType>(genOpMatmul.getOutputs()[0].getType());
-    auto mmLhsType =
-        llvm::cast<RankedTensorType>(genOpMatmul.getInputs()[0].getType());
-    auto mmResultShape = mmResultType.getShape();
-    auto mmLhsShape = mmLhsType.getShape();
+    // auto mmResultType =
+    //     llvm::cast<RankedTensorType>(genOpMatmul.getOutputs()[0].getType());
+    // auto mmLhsType =
+    //     llvm::cast<RankedTensorType>(genOpMatmul.getInputs()[0].getType());
+    // auto mmResultShape = mmResultType.getShape();
+    // auto mmLhsShape = mmLhsType.getShape();
 
     auto parallel = utils::IteratorType::parallel;
     auto reduction = utils::IteratorType::reduction;
@@ -55,41 +64,78 @@ public:
 
     if (mmNLoops != mmExpectedNLoops) return failure();
 
-    for (int i; i < mmNLoops; i++){
+    for (int i = 0; i < mmNLoops; i++){
       if (mmIteratorTypes[i] != mmExpectedIteratorTypes[i]) return failure();
     }
 
     Value mmLhs = genOpMatmul->getOperand(1);
-    auto mmLhsDefiningOp = result.getDefiningOp();
-
-    if (mmLhsDefiningOp == NULL) return failure();
+    auto mmLhsDefiningOp = mmLhs.getDefiningOp();
+    linalg::GenericOp genOpDequant = dyn_cast<linalg::GenericOp>(mmLhsDefiningOp);
+    if (!genOpDequant) return failure();
 
     // Match defining op as dequantization
 
-    if (mmLhsDefiningOp.getNumResults() != 1) return failure();
-    if (mmLhsDefiningOp.getNumOperands() != 3) return failure();
+    if (genOpDequant.getNumResults() != 1) return failure();
+    if (genOpDequant.getNumOperands() != 3) return failure();
 
     SmallVector<utils::IteratorType> dqIteratorTypes =
-        mmLhsDefiningOp.getIteratorTypesArray();
+        genOpDequant.getIteratorTypesArray();
     SmallVector<utils::IteratorType> dqExpectedIteratorTypes = {parallel, parallel,
                                                                 parallel};
     
     unsigned dqNLoops = dqIteratorTypes.size();
-    unsigned dqExpectedNLoops = 5;
+    unsigned dqExpectedNLoops = 3;
 
-    for (int i; i < dqNLoops; i++){
+    if (dqNLoops != dqExpectedNLoops) return failure();
+
+    for (int i = 0; i < dqNLoops; i++){
       if (dqIteratorTypes[i] != dqExpectedIteratorTypes[i]) return failure();
     }
 
+    // Form dispatch region with dequantization and matmul
+
+    Flow::DispatchRegionOp regionOp;
+    auto maybeRegionOp = Flow::wrapOpInDispatchRegion(rewriter, genOpMatmul);
+    if (failed(maybeRegionOp))
+      return failure();
+    regionOp = *maybeRegionOp;
+
+    auto combinedRegionOp = Flow::movePrecedingOpsIntoDispatchRegion(rewriter, mmLhsDefiningOp, regionOp);
+    if (failed(combinedRegionOp))
+      return failure();
     
+    return success();
 
   }
-}
+};
 
+struct DequantizationMatmulFusePass
+    : public DequantizationMatmulFuseBase<DequantizationMatmulFusePass> {
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<linalg::LinalgDialect>();
+  }
 
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+    // Main pattern.
+    {
+      RewritePatternSet patterns(&getContext());
+      patterns.insert<DequantizationMatmulFusePattern>(context);
+      if (failed(applyPatternsAndFoldGreedily(getOperation(),
+                                              std::move(patterns)))) {
+        return signalPassFailure();
+      }
+    }
+  }
+};
 
 } // namespace
+
+std::unique_ptr<Pass> createDequantizationMatmulFusePass() {
+  return std::make_unique<DequantizationMatmulFusePass>();
+}
+
 } // namespace IREE
 } // namespace iree_compiler
 } // namespace mlir
