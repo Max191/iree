@@ -1357,12 +1357,12 @@ static LogicalResult setDefaultOpConfig(spirv::ResourceLimitsAttr limits,
   // many threads to handle out-of-bound elements (thus idle).
 
   // Returns true if the given `operand` has 32-bit element type.
-  auto has32BitElementType = [](Value operand) {
-    auto shapedType = llvm::dyn_cast<ShapedType>(operand.getType());
-    Type elementType =
-        (shapedType ? shapedType.getElementType() : operand.getType());
-    return llvm::isa<FloatType>(elementType) || elementType.isInteger(32);
-  };
+  // auto has32BitElementType = [](Value operand) {
+  //   auto shapedType = llvm::dyn_cast<ShapedType>(operand.getType());
+  //   Type elementType =
+  //       (shapedType ? shapedType.getElementType() : operand.getType());
+  //   return llvm::isa<FloatType>(elementType) || elementType.isInteger(32);
+  // };
 
   // Whether we can try to use the vectorization pipeline.
   SmallVector<int64_t> loopBounds = linalgOp.getStaticLoopRanges();
@@ -1376,7 +1376,7 @@ static LogicalResult setDefaultOpConfig(spirv::ResourceLimitsAttr limits,
           linalgOp.getIndexingMapsArray(),
           [](AffineMap map) { return map.isProjectedPermutation(); }) &&
       // TODO: Fix non-32-bit element type vectorization and remove this.
-      llvm::all_of(linalgOp->getOperands(), has32BitElementType) &&
+      // llvm::all_of(linalgOp->getOperands(), has32BitElementType) &&
       llvm::none_of(loopBounds, ShapedType::isDynamic);
 
   // Distribute workload to the given `numThreads` by allowing a potental loss.
