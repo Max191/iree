@@ -29,7 +29,6 @@ iree_cc_library(
     "ConvertConv2DToImg2Col.cpp"
     "MakeSingleDispatchForFunction.cpp"
     "PadLinalgOps.cpp"
-    "DequantizationMatmulFuse.cpp"
     "PassDetail.h"
     "Passes.cpp"
     "RematerializeParallelOps.cpp"

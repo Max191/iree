@@ -1,8 +1,8 @@
 
 
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
-#include "iree/compiler/Preprocessing/Common/PassDetail.h"
-#include "iree/compiler/Preprocessing/Common/Passes.h"
+#include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
+#include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -15,6 +15,7 @@
 namespace mlir {
 namespace iree_compiler {
 namespace IREE {
+namespace Flow {
 
 namespace {
 
@@ -27,16 +28,16 @@ static LogicalResult fuseDequantAndMatmul(RewriterBase &rewriter,
                                           Operation *matmul) {
   
   Flow::DispatchRegionOp regionOp =
-      matmul->getParentOfType<Flow::DispatchRegionOp>();
+      matmul->getParentOfType<DispatchRegionOp>();
   if (!regionOp) {
-    FailureOr<Flow::DispatchRegionOp> maybeRegionOp =
-        Flow::wrapOpInDispatchRegion(rewriter, matmul);
+    FailureOr<DispatchRegionOp> maybeRegionOp =
+        wrapOpInDispatchRegion(rewriter, matmul);
     if (failed(maybeRegionOp))
       return failure();
     regionOp = maybeRegionOp.value();
   }
 
-  FailureOr<Flow::DispatchRegionOp> maybeFusedRegionOp =
+  FailureOr<DispatchRegionOp> maybeFusedRegionOp =
       movePrecedingOpsIntoDispatchRegion(rewriter, dequant, regionOp);
   if (failed(maybeFusedRegionOp))
     return failure();
@@ -145,6 +146,7 @@ std::unique_ptr<Pass> createDequantizationMatmulFusePass() {
   return std::make_unique<DequantizationMatmulFusePass>();
 }
 
+} // namespace Flow
 } // namespace IREE
 } // namespace iree_compiler
 } // namespace mlir

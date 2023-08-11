@@ -39,6 +39,7 @@ iree_cc_library(
     "ConvertRegionToWorkgroups.cpp"
     "ConvertToFlow.cpp"
     "DeduplicateExecutables.cpp"
+    "DequantizationMatmulFuse.cpp"
     "DetachElementwiseFromNamedOps.cpp"
     "DispatchWithTransformDialect.cpp"
     "DumpDispatchGraph.cpp"
