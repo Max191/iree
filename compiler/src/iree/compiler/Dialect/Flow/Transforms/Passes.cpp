@@ -243,6 +243,7 @@ void buildFlowTransformPassPipeline(OpPassManager &passManager,
       // - Remove unit-extent dimensions.
       .addPass(mlir::createConvertElementwiseToLinalgPass)
       .addPass(createGeneralizeLinalgNamedOpsPass)
+      .addPass(createFuseDequantizationMatmulPass)
       .addPass(createFoldUnitExtentDimsPass)
       .addPass(createRaiseSpecialOps)
       .addPass(createInterchangeGenericOpsPass)

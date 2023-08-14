@@ -7,6 +7,7 @@
 #include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
+#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -65,6 +66,12 @@ static LogicalResult isGroupedContractionOp(linalg::GenericOp genericOp) {
   if (genericOp.getNumReductionLoops() != 2)
     return failure();
   return success();
+  if (!llvm::cast<ShapedType>(genericOp.getInputs()[0].getType()).hasStaticShape() ||
+      !llvm::cast<ShapedType>(genericOp.getInputs()[0].getType()).hasStaticShape() ||
+      !llvm::cast<ShapedType>(genericOp.getInputs()[0].getType()).hasStaticShape()) {
+    // Codegen can't handle the dynamic case yet.
+    return failure();
+  }
 }
 
 // Checks if the passed op is a dequantization on grouped input
@@ -172,15 +179,16 @@ public:
 
   LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
                                 PatternRewriter &rewriter) const override {
+    // Fail if op is already in a dispatch region
+    if (!isNonNullAndOutsideDispatch(genericOp)) 
+      return failure();
+
     // Match first generic op as matmul
     if (failed(isGroupedContractionOp(genericOp)))
       return failure();
 
-    // Fail if matmul has already been fused
     Value genericOpResult = genericOp->getResult(0);
     Operation *matmulOp = genericOpResult.getDefiningOp();
-    if (matmulOp->getParentOfType<Flow::DispatchRegionOp>())
-      return failure();
 
     // Match operands to dequantizations and fuse if matched
     Value lhs = genericOp->getOperand(0);
