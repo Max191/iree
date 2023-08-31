@@ -506,6 +506,8 @@ void addMultiTilingExpertPassPipeline(
   // Run IREE specific passes before vector lowering expert.
   nestedModulePM.addNestedPass<func::FuncOp>(
       createRemoveSingleIterationLoopPass());
+  nestedModulePM.addNestedPass<func::FuncOp>(
+      createLLVMCPUFoldVectorContractUnitDimsPass());
 
   {
     LLVMCPUVectorLoweringPassOptions options;
