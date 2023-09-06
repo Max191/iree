@@ -15,6 +15,8 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-llvmcpu-vector-lowering"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir {
 namespace iree_compiler {
@@ -200,6 +202,21 @@ void LLVMCPUVectorLoweringPass::runOnOperation() {
 
   LLVM_DEBUG({
     llvm::dbgs() << "\n--- After lowering vector transpose ops ---\n";
+    funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+    llvm::dbgs() << "\n\n";
+  });
+
+  // Flatten transfer ops.
+  {
+    RewritePatternSet patterns(&getContext());
+    populateLLVMCPUBreakDownSubbyteExtendPatterns(patterns);
+    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      return signalPassFailure();
+    }
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n--- After breaking down subbyte extend ops ---\n";
     funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
     llvm::dbgs() << "\n\n";
   });
