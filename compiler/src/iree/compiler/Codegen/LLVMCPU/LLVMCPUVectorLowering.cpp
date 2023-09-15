@@ -78,17 +78,17 @@ void LLVMCPUVectorLoweringPass::runOnOperation() {
           .setVectorMultiReductionLowering(vectorMultiReductionLowering)
           .setVectorTransferSplit(vectorTransferSplit);
 
-  {
-    RewritePatternSet patterns(ctx);
-    populateFoldUnitReductionDimsPatterns(patterns, ctx);
-    (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
-  }
+  // {
+  //   RewritePatternSet patterns(ctx);
+  //   populateFoldUnitReductionDimsPatterns(patterns, ctx);
+  //   (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+  // }
   
-  LLVM_DEBUG({
-    llvm::dbgs() << "\n--- After folding unit reduction dims on vector.contract ops ---\n";
-    funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
-    llvm::dbgs() << "\n\n";
-  });
+  // LLVM_DEBUG({
+  //   llvm::dbgs() << "\n--- After folding unit reduction dims on vector.contract ops ---\n";
+  //   funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+  //   llvm::dbgs() << "\n\n";
+  // });
 
   // Lower high level vector operations like contract or multidim reduce ops
   // to lower level vector ops.
