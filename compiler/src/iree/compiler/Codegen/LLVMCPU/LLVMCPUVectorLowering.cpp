@@ -90,22 +90,22 @@ void LLVMCPUVectorLoweringPass::runOnOperation() {
   //   llvm::dbgs() << "\n\n";
   // });
 
-  // {
-  //   // Special-case vector.contract codegen paths. This needs to happen
-  //   // just before the generic vector ops lowerings.
-  //   RewritePatternSet patterns(ctx);
-  //   auto target = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
-  //   populateVectorContractCustomKernelsPatterns(target, patterns);
-  //   if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
-  //     return signalPassFailure();
-  //   }
-  // }
+  {
+    // Special-case vector.contract codegen paths. This needs to happen
+    // just before the generic vector ops lowerings.
+    RewritePatternSet patterns(ctx);
+    auto target = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
+    populateVectorContractCustomKernelsPatterns(target, patterns);
+    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      return signalPassFailure();
+    }
+  }
 
-  // LLVM_DEBUG({
-  //   llvm::dbgs() << "\n--- After custom kernel lowering for vector.contract ops ---\n";
-  //   funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
-  //   llvm::dbgs() << "\n\n";
-  // });
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n--- After custom kernel lowering for vector.contract ops ---\n";
+    funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+    llvm::dbgs() << "\n\n";
+  });
 
   // Lower high level vector operations like contract or multidim reduce ops
   // to lower level vector ops.
@@ -143,6 +143,22 @@ void LLVMCPUVectorLoweringPass::runOnOperation() {
     vector::TransposeOp::getCanonicalizationPatterns(patterns, ctx);
     (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
   }
+
+  // Flatten transfer ops.
+  {
+    RewritePatternSet patterns(&getContext());
+    mlir::vector::populateVectorTransferDropUnitDimsPatterns(patterns);
+    mlir::vector::populateFlattenVectorTransferPatterns(patterns);
+    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      return signalPassFailure();
+    }
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n--- After flattening vector transfers ---\n";
+    funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+    llvm::dbgs() << "\n\n";
+  });
 
   {
     RewritePatternSet patterns(ctx);
