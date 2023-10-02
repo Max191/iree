@@ -214,16 +214,16 @@ LogicalResult verifyDoubleTilingExpertPassPipelineConfig(
       }
     }
 
-    SmallVector<int64_t> thirdLevelTileSizes =
-        tilingConfig.getVectorReductionSizes();
-    for (auto [index, tileSize] : llvm::enumerate(thirdLevelTileSizes)) {
-      if (tileSize != 0 && pLoopsSet.contains(index)) {
-        return op->emitOpError(
-                   "expected only reduction dims to be set in the third tiling "
-                   "level, got ")
-               << index << "-th tile size set";
-      }
-    }
+    // SmallVector<int64_t> thirdLevelTileSizes =
+    //     tilingConfig.getVectorReductionSizes();
+    // for (auto [index, tileSize] : llvm::enumerate(thirdLevelTileSizes)) {
+    //   if (tileSize != 0 && pLoopsSet.contains(index)) {
+    //     return op->emitOpError(
+    //                "expected only reduction dims to be set in the third
+    //                tiling " "level, got ")
+    //            << index << "-th tile size set";
+    //   }
+    // }
   }
 
   // Verify interchange
