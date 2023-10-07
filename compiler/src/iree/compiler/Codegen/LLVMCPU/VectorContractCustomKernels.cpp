@@ -90,7 +90,8 @@ static bool isMatrixTimesMatrixTransposed(vector::ContractionOp contractionOp) {
   return true;
 }
 
-static bool isVectorTimesMatrixTransposed(vector::ContractionOp contractionOp, int64_t splitSize) {
+static bool isVectorTimesMatrixTransposed(vector::ContractionOp contractionOp,
+                                          int64_t splitSize) {
   // Check that the reduction is additive.
   if (contractionOp.getKind() != vector::CombiningKind::ADD) {
     return false;
@@ -112,7 +113,8 @@ static bool isVectorTimesMatrixTransposed(vector::ContractionOp contractionOp, i
       return false;
     }
   }
-  if (parallelIterators.size() != numIters-1 || reductionIterators.size() != 1) {
+  if (parallelIterators.size() != numIters - 1 ||
+      reductionIterators.size() != 1) {
     return false;
   }
   // Give the found iterators some idiomatic names.
@@ -128,20 +130,19 @@ static bool isVectorTimesMatrixTransposed(vector::ContractionOp contractionOp, i
   SmallVector<SmallVector<int>> expectedMapResults;
   if (splitSize) {
     SmallVector<SmallVector<int>> res = {
-      {KIter, SplitIter}, {NIter, KIter, SplitIter}, {NIter, SplitIter}};
+        {KIter, SplitIter}, {NIter, KIter, SplitIter}, {NIter, SplitIter}};
     expectedMapResults = res;
     numIters = 3;
-  }
-  else {
-    SmallVector<SmallVector<int>> res = {
-      {KIter}, {NIter, KIter}, {NIter}};
+  } else {
+    SmallVector<SmallVector<int>> res = {{KIter}, {NIter, KIter}, {NIter}};
     expectedMapResults = res;
     numIters = 2;
   }
   for (int m = 0; m < 3; ++m) {
     auto map = indexingMaps[m];
     auto expectedResults = expectedMapResults[m];
-    if (map.getNumDims() != numIters || map.getNumResults() != expectedResults.size()) {
+    if (map.getNumDims() != numIters ||
+        map.getNumResults() != expectedResults.size()) {
       return false;
     }
     for (int r = 0; r < expectedResults.size(); ++r) {
@@ -203,7 +204,8 @@ static bool matchMMT(vector::ContractionOp contractionOp, int64_t mSize,
 }
 
 static bool matchVMT(vector::ContractionOp contractionOp, int64_t mSize,
-                     int64_t kSize, int64_t nSize, int splitSize, bool *transpose = nullptr) {
+                     int64_t kSize, int64_t nSize, int splitSize,
+                     bool *transpose = nullptr) {
   if (mSize != 1) {
     return false;
   }
@@ -259,11 +261,19 @@ static Value getUnpromotedInput(PatternRewriter &rewriter, Type unpromotedType,
   if (llvm::cast<VectorType>(extInput.getType()).getElementType() !=
       unpromotedType) {
     if (promoteSmallTypes) {
-      VectorType unpromotedVectorType = VectorType::get(llvm::cast<VectorType>(extInput.getType()).getShape(), unpromotedType);
-      return extSIOp ? rewriter.create<arith::ExtSIOp>(extInput.getLoc(), unpromotedVectorType, extInput).getResult() :
-                       rewriter.create<arith::ExtUIOp>(extInput.getLoc(), unpromotedVectorType, extInput).getResult();
-    }
-    else {
+      VectorType unpromotedVectorType =
+          VectorType::get(llvm::cast<VectorType>(extInput.getType()).getShape(),
+                          unpromotedType);
+      return extSIOp
+                 ? rewriter
+                       .create<arith::ExtSIOp>(extInput.getLoc(),
+                                               unpromotedVectorType, extInput)
+                       .getResult()
+                 : rewriter
+                       .create<arith::ExtUIOp>(extInput.getLoc(),
+                                               unpromotedVectorType, extInput)
+                       .getResult();
+    } else {
       return nullptr;
     }
   }
@@ -278,22 +288,22 @@ static Value extract1DSlice(PatternRewriter &rewriter, Location loc,
     SmallVector<int64_t> offsets({position});
     SmallVector<int64_t> strides({1});
     SmallVector<int64_t> sizes(dstVecType.getShape());
-    return rewriter.create<vector::ExtractStridedSliceOp>(
-        loc, input, offsets, sizes, strides);
-  }
-  else {
-    SmallVector<int64_t> inputShape(llvm::cast<VectorType>(input.getType()).getShape());
+    return rewriter.create<vector::ExtractStridedSliceOp>(loc, input, offsets,
+                                                          sizes, strides);
+  } else {
+    SmallVector<int64_t> inputShape(
+        llvm::cast<VectorType>(input.getType()).getShape());
     assert(inputShape.back() == dstVecType.getNumElements());
     std::reverse(inputShape.begin(), inputShape.end());
     int currentPos = position;
     SmallVector<int64_t> indices;
     for (auto size : inputShape) {
-      indices.push_back(currentPos%size);
+      indices.push_back(currentPos % size);
       currentPos = currentPos / size;
     }
     std::reverse(indices.begin(), indices.end());
     return rewriter.create<vector::ExtractOp>(
-        loc, input, SmallVector<int64_t>(indices.begin(), indices.end()-1));
+        loc, input, SmallVector<int64_t>(indices.begin(), indices.end() - 1));
   }
 }
 
@@ -308,7 +318,8 @@ static Value extract(PatternRewriter &rewriter, Location loc, Value input,
 }
 
 // Helper to flatten a N-dimensional vector to a 1D vector.
-static Value flattenImperfectSize(PatternRewriter &rewriter, Location loc, Value vector, VectorType regVectorType) {
+static Value flattenImperfectSize(PatternRewriter &rewriter, Location loc,
+                                  Value vector, VectorType regVectorType) {
   VectorType inputVecType = llvm::cast<VectorType>(vector.getType());
   if (regVectorType.getNumElements() == inputVecType.getShape().back()) {
     return vector;
@@ -384,9 +395,15 @@ struct MMTKernel {
   const char *asmClobbers = nullptr;
 
   void validate() const {
-    assert(m0 * k0 == lhsRegSize * lhsRegs || m0 * k0 * split0 == lhsRegSize * lhsRegs); // number of elements of LHS
-    assert(n0 * k0 == rhsRegSize * rhsRegs || n0 * k0 * split0 == rhsRegSize * rhsRegs); // number of elements of RHS
-    assert(m0 * n0 == accRegSize * accRegs || m0 * n0 * split0 == accRegSize * accRegs); // number of elements of Accum
+    assert(m0 * k0 == lhsRegSize * lhsRegs ||
+           m0 * k0 * split0 ==
+               lhsRegSize * lhsRegs); // number of elements of LHS
+    assert(n0 * k0 == rhsRegSize * rhsRegs ||
+           n0 * k0 * split0 ==
+               rhsRegSize * rhsRegs); // number of elements of RHS
+    assert(m0 * n0 == accRegSize * accRegs ||
+           m0 * n0 * split0 ==
+               accRegSize * accRegs); // number of elements of Accum
     assert(lhsType != ScalarType::None);
     assert(rhsType != ScalarType::None);
     assert(accType != ScalarType::None);
@@ -814,8 +831,10 @@ MMTKernel MMTKernel_1x2x16_i16i16i32_x86_AVX512VNNI_InlineAsm() {
   kernel.rhsType = MMTKernel::ScalarType::I16;
   kernel.accType = MMTKernel::ScalarType::I32;
   kernel.lhsCode = SmallVector<std::string>({"{zmm8}"});
-  kernel.rhsCode = SmallVector<std::string>({"{zmm9}", "{zmm10}", "{zmm11}", "{zmm12}"});
-  kernel.accCode = SmallVector<std::string>({"{zmm17}", "{zmm18}", "{zmm19}", "{zmm20}"});
+  kernel.rhsCode =
+      SmallVector<std::string>({"{zmm9}", "{zmm10}", "{zmm11}", "{zmm12}"});
+  kernel.accCode =
+      SmallVector<std::string>({"{zmm17}", "{zmm18}", "{zmm19}", "{zmm20}"});
   kernel.promoteSmallTypes = true;
   kernel.m0 = 1;
   kernel.k0 = 2;
@@ -836,7 +855,6 @@ MMTKernel MMTKernel_1x2x16_i16i16i32_x86_AVX512VNNI_InlineAsm() {
   kernel.asmClobbers = "";
   return kernel;
 }
-
 
 // Constructs the mlir::Type corresponding to a scalar type.
 Type mlirType(MLIRContext *context, MMTKernel::ScalarType t) {
@@ -923,7 +941,8 @@ private:
     validate(acc, kernel.accRegs, getAccRegVectorType());
   }
   // Helper for generateAsmCodeAndConstraints
-  std::string getConstraintCode(std::optional<std::string> kernelConstraintCode) const {
+  std::string
+  getConstraintCode(std::optional<std::string> kernelConstraintCode) const {
     if (kernelConstraintCode) {
       return std::string(*kernelConstraintCode);
     }
@@ -994,29 +1013,32 @@ private:
     // processedIdx is the index of a register in the processed asm.
     // Example:   $5   =>   processedIdx == 5
     int processedIdx = 0;
-    auto processOperands = [&](Constraints::Kind constraintKind,
-                               const char *name, int count, std::optional<SmallVector<std::string>> kernelCodes) {
-      const std::string &constraintCode = getConstraintCode(std::nullopt);
-      // unprocessedIdx is the index of a register in the unprocessed asm.
-      // Example:   $(lhs:1)   =>   unprocessedIdx == 1
-      for (int unprocessedIdx = 0; unprocessedIdx < count;
-           ++unprocessedIdx, ++processedIdx) {
-        if (kernelCodes){
-          constraints.add(constraintKind, (*kernelCodes)[unprocessedIdx]);
-        }
-        else {
-          constraints.add(constraintKind, constraintCode);
-        }
-        // Perform the code replacement for the operand.
-        // Example:   $(lhs:1)   =>   $5
-        replaceAllSubstrsInPlace(
-            code, llvm::formatv("$({0}:{1})", name, unprocessedIdx),
-            llvm::formatv("${0}", processedIdx));
-      }
-    };
-    processOperands(Constraints::Kind::InputOutput, "acc", kernel.accRegs, kernel.accCode);
-    processOperands(Constraints::Kind::Input, "lhs", kernel.lhsRegs, kernel.lhsCode);
-    processOperands(Constraints::Kind::Input, "rhs", kernel.rhsRegs, kernel.rhsCode);
+    auto processOperands =
+        [&](Constraints::Kind constraintKind, const char *name, int count,
+            std::optional<SmallVector<std::string>> kernelCodes) {
+          const std::string &constraintCode = getConstraintCode(std::nullopt);
+          // unprocessedIdx is the index of a register in the unprocessed asm.
+          // Example:   $(lhs:1)   =>   unprocessedIdx == 1
+          for (int unprocessedIdx = 0; unprocessedIdx < count;
+               ++unprocessedIdx, ++processedIdx) {
+            if (kernelCodes) {
+              constraints.add(constraintKind, (*kernelCodes)[unprocessedIdx]);
+            } else {
+              constraints.add(constraintKind, constraintCode);
+            }
+            // Perform the code replacement for the operand.
+            // Example:   $(lhs:1)   =>   $5
+            replaceAllSubstrsInPlace(
+                code, llvm::formatv("$({0}:{1})", name, unprocessedIdx),
+                llvm::formatv("${0}", processedIdx));
+          }
+        };
+    processOperands(Constraints::Kind::InputOutput, "acc", kernel.accRegs,
+                    kernel.accCode);
+    processOperands(Constraints::Kind::Input, "lhs", kernel.lhsRegs,
+                    kernel.lhsCode);
+    processOperands(Constraints::Kind::Input, "rhs", kernel.rhsRegs,
+                    kernel.rhsCode);
     constraints.setClobbers(kernel.asmClobbers);
     constraintsString = constraints.toString();
   }
@@ -1042,9 +1064,10 @@ private:
     // Create the inline asm op.
     SmallVector<Type> outputOperandTypes(
         llvm::map_range(acc, [](Value v) { return v.getType(); }));
-    auto returnType = outputOperandTypes.size() == 1 ?
-        outputOperandTypes[0] :
-        LLVM::LLVMStructType::getLiteral(context, outputOperandTypes);
+    auto returnType =
+        outputOperandTypes.size() == 1
+            ? outputOperandTypes[0]
+            : LLVM::LLVMStructType::getLiteral(context, outputOperandTypes);
     auto dialectAttr =
         LLVM::AsmDialectAttr::get(context, LLVM::AsmDialect::AD_Intel);
     std::string code;
@@ -1058,12 +1081,11 @@ private:
     SmallVector<Value> resVec;
     if (outputOperandTypes.size() == 1) {
       resVec.push_back(asmOp.getRes());
-    }
-    else {
+    } else {
       for (int i = 0; i < kernel.accRegs; ++i) {
         SmallVector<int64_t, 1> position = {i};
-        resVec.push_back(
-            rewriter.create<LLVM::ExtractValueOp>(loc, asmOp.getRes(), position));
+        resVec.push_back(rewriter.create<LLVM::ExtractValueOp>(
+            loc, asmOp.getRes(), position));
       }
     }
     return resVec;
@@ -1116,9 +1138,11 @@ public:
       return failure();
     }
     Value unpromotedLhs =
-        getUnpromotedInput(rewriter, lhsElemType, accElemType, contractionOp.getLhs(), kernel.promoteSmallTypes);
+        getUnpromotedInput(rewriter, lhsElemType, accElemType,
+                           contractionOp.getLhs(), kernel.promoteSmallTypes);
     Value unpromotedRhs =
-        getUnpromotedInput(rewriter, rhsElemType, accElemType, contractionOp.getRhs(), kernel.promoteSmallTypes);
+        getUnpromotedInput(rewriter, rhsElemType, accElemType,
+                           contractionOp.getRhs(), kernel.promoteSmallTypes);
     if (!unpromotedLhs || !unpromotedRhs) {
       return failure();
     }
@@ -1143,9 +1167,12 @@ public:
     VectorType lhsRegVectorType = generator.getLhsRegVectorType();
     VectorType rhsRegVectorType = generator.getRhsRegVectorType();
     VectorType accRegVectorType = generator.getAccRegVectorType();
-    Value lhs = flattenImperfectSize(rewriter, loc, unpromotedLhs, lhsRegVectorType);
-    Value rhs = flattenImperfectSize(rewriter, loc, unpromotedRhs, rhsRegVectorType);
-    Value acc = flattenImperfectSize(rewriter, loc, contractionOp.getAcc(), accRegVectorType);
+    Value lhs =
+        flattenImperfectSize(rewriter, loc, unpromotedLhs, lhsRegVectorType);
+    Value rhs =
+        flattenImperfectSize(rewriter, loc, unpromotedRhs, rhsRegVectorType);
+    Value acc = flattenImperfectSize(rewriter, loc, contractionOp.getAcc(),
+                                     accRegVectorType);
     // Slice into SIMD-register-sized 1D input vectors ready to feed to the
     // target SIMD instructions.
     auto sliceIntoRegVectors = [&](int regsCount, VectorType regVectorType,
@@ -1367,9 +1394,8 @@ void populateVectorContractCustomKernelsPatterns(
       patterns.add<MMTCustomKernelPattern>(
           context, MMTKernel_8x8x8_i8i8i32_Aarch64I8mm_InlineAsm());
     }
-  }
-  else if (isX86(target)) {
-    if (hasFeature(target, "+avx512vnni")){
+  } else if (isX86(target)) {
+    if (hasFeature(target, "+avx512vnni")) {
       patterns.add<MMTCustomKernelPattern>(
           context, MMTKernel_1x2x16_i16i16i32_x86_AVX512VNNI_InlineAsm());
     }

@@ -18,9 +18,9 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 
 #define DEBUG_TYPE "iree-llvmcpu-fold-unit-reduction-dims"
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -29,17 +29,18 @@
 namespace mlir {
 namespace iree_compiler {
 
-static FailureOr<Value> dropFoldableUnitIndices(PatternRewriter &rewriter,
-                            vector::ContractionOp contractOp,
-                            SmallVector<int64_t> foldIndices) {
+static FailureOr<Value>
+dropFoldableUnitIndices(PatternRewriter &rewriter,
+                        vector::ContractionOp contractOp,
+                        SmallVector<int64_t> foldIndices) {
   SmallVector<int64_t> contractShape = *contractOp.getShapeForUnroll();
-  SmallVector<vector::IteratorType> iteratorTypes = contractOp.getIteratorTypesArray();
+  SmallVector<vector::IteratorType> iteratorTypes =
+      contractOp.getIteratorTypesArray();
   auto indexingMaps = contractOp.getIndexingMapsArray();
   SmallVector<SmallVector<int64_t>> dstShapes;
   SmallVector<SmallVector<AffineExpr>> dstExprs;
-  SmallVector<Value> inputs({contractOp.getLhs(), 
-                             contractOp.getRhs(), 
-                             contractOp.getAcc()});
+  SmallVector<Value> inputs(
+      {contractOp.getLhs(), contractOp.getRhs(), contractOp.getAcc()});
   llvm::SetVector<int64_t> foldableDims;
   for (int64_t dim : foldIndices)
     foldableDims.insert(dim);
@@ -57,7 +58,8 @@ static FailureOr<Value> dropFoldableUnitIndices(PatternRewriter &rewriter,
               numSkipped++;
             }
           }
-          dstExpr.push_back(rewriter.getAffineDimExpr(dimExpr.getPosition() - numSkipped));
+          dstExpr.push_back(
+              rewriter.getAffineDimExpr(dimExpr.getPosition() - numSkipped));
         }
       } else {
         return failure();
@@ -80,8 +82,9 @@ static FailureOr<Value> dropFoldableUnitIndices(PatternRewriter &rewriter,
     // Shape unchanged
     if (dstShapes[i].size() == indexingMaps[i].getResults().size()) {
       newInputs.push_back(inputs[i]);
-      AffineMap newIndexingMap = AffineMap::get(/*dimCount=*/contractShape.size() - foldIndices.size(),
-                                                /*symCount=*/0, dstExprs[i], contractOp.getContext());
+      AffineMap newIndexingMap =
+          AffineMap::get(/*dimCount=*/contractShape.size() - foldIndices.size(),
+                         /*symCount=*/0, dstExprs[i], contractOp.getContext());
       newIndexingMaps.push_back(newIndexingMap);
       continue;
     }
@@ -89,36 +92,49 @@ static FailureOr<Value> dropFoldableUnitIndices(PatternRewriter &rewriter,
       return failure();
     }
     VectorType inputVecType = llvm::cast<VectorType>(inputs[i].getType());
-    VectorType dstType = VectorType::get(dstShapes[i],
-                                        inputVecType.getElementType());
-    
-    
+    VectorType dstType =
+        VectorType::get(dstShapes[i], inputVecType.getElementType());
+
     Value result;
     auto extsiop = inputs[i].getDefiningOp<arith::ExtSIOp>();
     auto extuiop = inputs[i].getDefiningOp<arith::ExtUIOp>();
     if (!extsiop && !extuiop) {
-      result = rewriter.create<vector::ShapeCastOp>(contractOp.getLoc(), dstType, inputs[i]);
-    }
-    else {
+      result = rewriter.create<vector::ShapeCastOp>(contractOp.getLoc(),
+                                                    dstType, inputs[i]);
+    } else {
       Value extIn = extsiop ? extsiop.getIn() : extuiop.getIn();
       VectorType extInType = llvm::dyn_cast<VectorType>(extIn.getType());
-      VectorType shapeCastOutType = VectorType::get(dstType.getShape(), extInType.getElementType());
-      Value shapeCastResult = rewriter.create<vector::ShapeCastOp>(contractOp.getLoc(), shapeCastOutType, extIn);
-      result = extsiop ? rewriter.create<arith::ExtSIOp>(contractOp.getLoc(), dstType, shapeCastResult).getResult() : 
-                         rewriter.create<arith::ExtUIOp>(contractOp.getLoc(), dstType, shapeCastResult).getResult();
+      VectorType shapeCastOutType =
+          VectorType::get(dstType.getShape(), extInType.getElementType());
+      Value shapeCastResult = rewriter.create<vector::ShapeCastOp>(
+          contractOp.getLoc(), shapeCastOutType, extIn);
+      result = extsiop ? rewriter
+                             .create<arith::ExtSIOp>(contractOp.getLoc(),
+                                                     dstType, shapeCastResult)
+                             .getResult()
+                       : rewriter
+                             .create<arith::ExtUIOp>(contractOp.getLoc(),
+                                                     dstType, shapeCastResult)
+                             .getResult();
     }
-    AffineMap newIndexingMap = AffineMap::get(/*dimCount=*/contractShape.size() - foldIndices.size(),
-                                              /*symCount=*/0, dstExprs[i], contractOp.getContext());
+    AffineMap newIndexingMap =
+        AffineMap::get(/*dimCount=*/contractShape.size() - foldIndices.size(),
+                       /*symCount=*/0, dstExprs[i], contractOp.getContext());
     newInputs.push_back(result);
     newIndexingMaps.push_back(newIndexingMap);
   }
-  auto newContract = rewriter.create<vector::ContractionOp>(
-      contractOp.getLoc(), newInputs[0], newInputs[1], newInputs[2],
-        rewriter.getAffineMapArrayAttr(newIndexingMaps), 
-        rewriter.getArrayAttr(llvm::to_vector(llvm::map_range(
-            newIteratorTypes, [&](vector::IteratorType t) -> mlir::Attribute {
-              return vector::IteratorTypeAttr::get(rewriter.getContext(), t);
-            })))).getResult();
+  auto newContract =
+      rewriter
+          .create<vector::ContractionOp>(
+              contractOp.getLoc(), newInputs[0], newInputs[1], newInputs[2],
+              rewriter.getAffineMapArrayAttr(newIndexingMaps),
+              rewriter.getArrayAttr(llvm::to_vector(llvm::map_range(
+                  newIteratorTypes,
+                  [&](vector::IteratorType t) -> mlir::Attribute {
+                    return vector::IteratorTypeAttr::get(rewriter.getContext(),
+                                                         t);
+                  }))))
+          .getResult();
   return newContract;
 }
 
@@ -128,9 +144,10 @@ public:
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(vector::ContractionOp contractOp,
-                                PatternRewriter &rewriter) const override{
+                                PatternRewriter &rewriter) const override {
     LDBG("vector.contract op:\n" << contractOp);
-    VectorType outputType = llvm::dyn_cast<VectorType>(contractOp.getAcc().getType());
+    VectorType outputType =
+        llvm::dyn_cast<VectorType>(contractOp.getAcc().getType());
     if (!outputType) {
       return failure();
     }
@@ -148,8 +165,7 @@ public:
         if (size.value() == 1) {
           unitParallelDims.push_back(size.index());
         }
-      }
-      else {
+      } else {
         numReduction++;
         if (size.value() == 1) {
           unitReductionDims.push_back(size.index());
@@ -157,35 +173,36 @@ public:
       }
     }
     if (numReduction && numReduction == unitReductionDims.size()) {
-      foldableDims.append(unitReductionDims.begin(), unitReductionDims.end()-1);
-    }
-    else {
+      foldableDims.append(unitReductionDims.begin(),
+                          unitReductionDims.end() - 1);
+    } else {
       foldableDims.append(unitReductionDims.begin(), unitReductionDims.end());
     }
     if (numParallel && numParallel == unitParallelDims.size()) {
-      foldableDims.append(unitParallelDims.begin()+1, unitParallelDims.end());
-    }
-    else {
+      foldableDims.append(unitParallelDims.begin() + 1, unitParallelDims.end());
+    } else {
       foldableDims.append(unitParallelDims.begin(), unitParallelDims.end());
     }
     if (!foldableDims.size()) {
       return failure();
     }
 
-    FailureOr<Value> maybeNewContract = dropFoldableUnitIndices(rewriter, contractOp, foldableDims);
+    FailureOr<Value> maybeNewContract =
+        dropFoldableUnitIndices(rewriter, contractOp, foldableDims);
     if (failed(maybeNewContract)) {
       return failure();
     }
     Value newContract = maybeNewContract.value();
     LDBG("Replaced vector.contract:\n" << newContract);
 
-    VectorType newOutputType = llvm::dyn_cast<VectorType>(newContract.getType());
-    if (outputType != newOutputType){
+    VectorType newOutputType =
+        llvm::dyn_cast<VectorType>(newContract.getType());
+    if (outputType != newOutputType) {
       // Reshape output of new vector.contract if needed
-      Value shapeCastResult = rewriter.create<vector::ShapeCastOp>(contractOp.getLoc(), outputType, newContract);
+      Value shapeCastResult = rewriter.create<vector::ShapeCastOp>(
+          contractOp.getLoc(), outputType, newContract);
       rewriter.replaceOp(contractOp, shapeCastResult);
-    }
-    else {
+    } else {
       rewriter.replaceOp(contractOp, newContract);
     }
 
@@ -193,17 +210,16 @@ public:
   }
 };
 
-
-class HoistShapeCastOutOfSCFFor final
-    : public OpRewritePattern<scf::ForOp> {
+class HoistShapeCastOutOfSCFFor final : public OpRewritePattern<scf::ForOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
-                                PatternRewriter &rewriter) const override{
+                                PatternRewriter &rewriter) const override {
     LDBG("forOp:\n" << forOp);
     auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    std::optional<std::pair<vector::ShapeCastOp, vector::ShapeCastOp>> hoistableShapeCast = std::nullopt;
+    std::optional<std::pair<vector::ShapeCastOp, vector::ShapeCastOp>>
+        hoistableShapeCast = std::nullopt;
     int initArgIdx;
     for (Value result : yieldOp.getOperation()->getOperands()) {
       auto outputShapeCastOp = result.getDefiningOp<vector::ShapeCastOp>();
@@ -211,7 +227,8 @@ public:
         continue;
       }
       LDBG("outputShapeCastOp:\n" << outputShapeCastOp);
-      auto contractOp = outputShapeCastOp.getSource().getDefiningOp<vector::ContractionOp>();
+      auto contractOp =
+          outputShapeCastOp.getSource().getDefiningOp<vector::ContractionOp>();
       if (!contractOp) {
         continue;
       }
@@ -239,16 +256,21 @@ public:
     vector::ShapeCastOp outSC = hoistableShapeCast->second;
     SmallVector<Value> forOpInitArgs = forOp.getInitArgs();
     Value source = forOpInitArgs[initArgIdx];
-    Value sourceSC = rewriter.create<vector::ShapeCastOp>(forOp.getLoc(), inSC.getType(), source).getResult();
+    Value sourceSC =
+        rewriter
+            .create<vector::ShapeCastOp>(forOp.getLoc(), inSC.getType(), source)
+            .getResult();
     forOpInitArgs[initArgIdx] = sourceSC;
     auto newForOp = rewriter.create<scf::ForOp>(
         forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
         forOp.getStep(), forOpInitArgs);
     LDBG("newForOp:\n" << newForOp);
-    rewriter.mergeBlocks(forOp.getBody(), newForOp.getBody(), newForOp.getBody()->getArguments());
+    rewriter.mergeBlocks(forOp.getBody(), newForOp.getBody(),
+                         newForOp.getBody()->getArguments());
     auto newYieldOp = cast<scf::YieldOp>(newForOp.getBody()->getTerminator());
     LDBG("newYieldOp:\n" << newYieldOp);
-    SmallVector<Value> newForOpResults = newYieldOp.getOperation()->getOperands();
+    SmallVector<Value> newForOpResults =
+        newYieldOp.getOperation()->getOperands();
     int contractResultIndex;
     for (auto result : llvm::enumerate(newForOpResults)) {
       if (result.value() == outSC.getResult()) {
@@ -256,25 +278,28 @@ public:
         contractResultIndex = result.index();
       }
     }
-    rewriter.updateRootInPlace(
-        newYieldOp, [&]() { newYieldOp.getOperation()->setOperands(newForOpResults); });
+    rewriter.updateRootInPlace(newYieldOp, [&]() {
+      newYieldOp.getOperation()->setOperands(newForOpResults);
+    });
     LDBG("newForOp with body:\n" << newForOp);
     SmallVector<Value> newResults = newForOp.getResults();
-    Value hoistedOutputShapeCast = rewriter.create<vector::ShapeCastOp>(forOp.getLoc(), outSC.getType(), newResults[contractResultIndex]).getResult();
+    Value hoistedOutputShapeCast =
+        rewriter
+            .create<vector::ShapeCastOp>(forOp.getLoc(), outSC.getType(),
+                                         newResults[contractResultIndex])
+            .getResult();
     LDBG("hoistedOutputShapeCast:\n" << hoistedOutputShapeCast);
     newResults[contractResultIndex] = hoistedOutputShapeCast;
     rewriter.replaceOp(forOp, newResults);
-
-
-
 
     // auto outputShapeCastOp = vector.getDefiningOp<vector::ShapeCastOp>();
     // if (!outputShapeCastOp) {
     //   return;
     // }
     // LDBG("outputShapeCastOp:\n" << outputShapeCastOp);
-    // auto contractOp = outputShapeCastOp.getSource().getDefiningOp<vector::ContractionOp>();
-    // if (!contractOp) {
+    // auto contractOp =
+    // outputShapeCastOp.getSource().getDefiningOp<vector::ContractionOp>(); if
+    // (!contractOp) {
     //   return;
     // }
     // LDBG("contractOp:\n" << contractOp);
@@ -290,36 +315,43 @@ public:
     //   return;
     // }
     // LDBG("blockArg:\n" << blockArg);
-    // auto forOp = llvm::dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-    // if (!forOp) {
+    // auto forOp =
+    // llvm::dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp()); if
+    // (!forOp) {
     //   LDBG("no forOp\n");
     //   return;
     // }
     // SmallVector<Value> forOpInitArgs = forOp.getInitArgs();
     // Value sourceInput = forOpInitArgs[blockArg.getArgNumber() - 1];
     // LDBG("sourceInput:\n" << sourceInput);
-    // Value hoistedInputShapeCast = rewriter.create<vector::ShapeCastOp>(forOp.getLoc(), inputShapeCastOp.getType(), sourceInput).getResult();
+    // Value hoistedInputShapeCast =
+    // rewriter.create<vector::ShapeCastOp>(forOp.getLoc(),
+    // inputShapeCastOp.getType(), sourceInput).getResult();
     // LDBG("hoistedInputShapeCast:\n" << hoistedInputShapeCast);
     // forOpInitArgs[blockArg.getArgNumber() - 1] = hoistedInputShapeCast;
     // auto newForOp = rewriter.create<scf::ForOp>(
     //       forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
     //       forOp.getStep(), forOpInitArgs);
     // LDBG("newForOp:\n" << newForOp);
-    // rewriter.mergeBlocks(forOp.getBody(), newForOp.getBody(), newForOp.getBody()->getArguments());
-    // auto yieldOp = cast<scf::YieldOp>(newForOp.getBody()->getTerminator());
-    // SmallVector<Value> newForOpResults = yieldOp.getOperation()->getOperands();
-    // int contractResultIndex;
-    // for (auto result : llvm::enumerate(newForOpResults)) {
+    // rewriter.mergeBlocks(forOp.getBody(), newForOp.getBody(),
+    // newForOp.getBody()->getArguments()); auto yieldOp =
+    // cast<scf::YieldOp>(newForOp.getBody()->getTerminator());
+    // SmallVector<Value> newForOpResults =
+    // yieldOp.getOperation()->getOperands(); int contractResultIndex; for (auto
+    // result : llvm::enumerate(newForOpResults)) {
     //   if (result.value() == vector) {
     //     newForOpResults[result.index()] = contractOp.getResult();
     //     contractResultIndex = result.index();
     //   }
     // }
     // rewriter.updateRootInPlace(
-    //     yieldOp, [&]() { yieldOp.getOperation()->setOperands(newForOpResults); });
+    //     yieldOp, [&]() {
+    //     yieldOp.getOperation()->setOperands(newForOpResults); });
     // LDBG("newForOp with body:\n" << newForOp);
     // SmallVector<Value> newResults = newForOp.getResults();
-    // Value hoistedOutputShapeCast = rewriter.create<vector::ShapeCastOp>(forOp.getLoc(), vector.getType(), newResults[contractResultIndex]).getResult();
+    // Value hoistedOutputShapeCast =
+    // rewriter.create<vector::ShapeCastOp>(forOp.getLoc(), vector.getType(),
+    // newResults[contractResultIndex]).getResult();
     // LDBG("hoistedOutputShapeCast:\n" << hoistedOutputShapeCast);
     // newResults[contractResultIndex] = hoistedOutputShapeCast;
     // rewriter.replaceOp(forOp, newResults);
@@ -328,14 +360,15 @@ public:
   }
 };
 
-
 namespace {
 struct LLVMCPUFoldVectorContractUnitDimsPass
-    : public LLVMCPUFoldVectorContractUnitDimsBase<LLVMCPUFoldVectorContractUnitDimsPass> {
+    : public LLVMCPUFoldVectorContractUnitDimsBase<
+          LLVMCPUFoldVectorContractUnitDimsPass> {
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, arith::ArithDialect,
-                    vector::VectorDialect, tensor::TensorDialect, scf::SCFDialect>();
+                    vector::VectorDialect, tensor::TensorDialect,
+                    scf::SCFDialect>();
   }
 
   void runOnOperation() override;
@@ -346,8 +379,8 @@ void LLVMCPUFoldVectorContractUnitDimsPass::runOnOperation() {
   Operation *funcOp = getOperation();
   MLIRContext *context = &getContext();
   RewritePatternSet foldUnitDimsPatterns(context);
-  foldUnitDimsPatterns.add<DropVectorContractUnitDims,
-                           HoistShapeCastOutOfSCFFor>(context);
+  foldUnitDimsPatterns
+      .add<DropVectorContractUnitDims, HoistShapeCastOutOfSCFFor>(context);
   if (failed(applyPatternsAndFoldGreedily(funcOp,
                                           std::move(foldUnitDimsPatterns)))) {
     return signalPassFailure();
@@ -368,7 +401,8 @@ createLLVMCPUFoldVectorContractUnitDimsPass() {
   return std::make_unique<LLVMCPUFoldVectorContractUnitDimsPass>();
 }
 
-void populateFoldVectorContractUnitDimsPass(RewritePatternSet &patterns, MLIRContext *context){
+void populateFoldVectorContractUnitDimsPass(RewritePatternSet &patterns,
+                                            MLIRContext *context) {
   patterns.add<DropVectorContractUnitDims>(context);
 }
 

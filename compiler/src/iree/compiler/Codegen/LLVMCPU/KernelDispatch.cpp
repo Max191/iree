@@ -1684,23 +1684,26 @@ static bool isReassociatedQuantizedMatvecOp(linalg::GenericOp genericOp) {
   // Check for 1 result, and 2 (input, scales) or 3 (input, scales, zero points)
   // inputs
   if (genericOp.getNumDpsInits() != 1) {
-    LLVM_DEBUG(KD_DBGS() << "Wrong number of outputs: " << genericOp.getNumDpsInits() << "\n");
+    LLVM_DEBUG(KD_DBGS() << "Wrong number of outputs: "
+                         << genericOp.getNumDpsInits() << "\n");
     return false;
   }
   if (genericOp.getNumDpsInputs() != 5) {
-    LLVM_DEBUG(KD_DBGS() << "Wrong number of inputs: " << genericOp.getNumDpsInputs() << "\n");
+    LLVM_DEBUG(KD_DBGS() << "Wrong number of inputs: "
+                         << genericOp.getNumDpsInputs() << "\n");
     return false;
   }
 
   // Check that the rank is at least 3 and all loops are parallel
   unsigned numLoops = genericOp.getNumLoops();
   unsigned numReductionLoops = genericOp.getNumReductionLoops();
-  if (numLoops != 2){
+  if (numLoops != 2) {
     LLVM_DEBUG(KD_DBGS() << "Wrong number of loops: " << numLoops << "\n");
     return false;
   }
-  if (numReductionLoops != 1){
-    LLVM_DEBUG(KD_DBGS() << "Wrong number of reduction loops: " << numReductionLoops << "\n");
+  if (numReductionLoops != 1) {
+    LLVM_DEBUG(KD_DBGS() << "Wrong number of reduction loops: "
+                         << numReductionLoops << "\n");
     return false;
   }
   // Work back from linalg.yield and check body of genericOp.
@@ -1794,7 +1797,7 @@ static LogicalResult setReassociatedQuantizedMatvecOpRootConfig(
   assert(!getLoweringConfig(genericOp) &&
          "expected lowering_config is not set");
   unsigned numLoops = genericOp.getNumLoops();
-  if (!isReassociatedQuantizedMatvecOp(genericOp)){
+  if (!isReassociatedQuantizedMatvecOp(genericOp)) {
     LLVM_DEBUG(KD_DBGS() << "Failed matching for dequantized matvec\n");
     return failure();
   }
@@ -1816,11 +1819,12 @@ static LogicalResult setReassociatedQuantizedMatvecOpRootConfig(
   LLVM_DEBUG(KD_DBGS() << "Setting dequantized matmul config\n");
   LLVM_DEBUG(KD_DBGS() << "Distribution tile sizes: " << distTileSizes << "\n");
   LLVM_DEBUG(KD_DBGS() << "Parallel tile sizes: " << parallelTileSizes << "\n");
-  LLVM_DEBUG(KD_DBGS() << "Reduction tile size: " << reductionTileSizes << "\n");
+  LLVM_DEBUG(KD_DBGS() << "Reduction tile size: " << reductionTileSizes
+                       << "\n");
 
-  DispatchLoweringPassPipeline passPipeline = 
+  DispatchLoweringPassPipeline passPipeline =
       DispatchLoweringPassPipeline::CPUDoubleTilingExpert;
-  
+
   return setOpConfigAndEntryPointFnTranslation(entryPointFn, genericOp,
                                                tileSizes, passPipeline);
 }

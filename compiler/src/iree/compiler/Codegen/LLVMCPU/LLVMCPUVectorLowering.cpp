@@ -85,11 +85,11 @@ void LLVMCPUVectorLoweringPass::runOnOperation() {
   //   populateFoldVectorContractUnitDimsPass(patterns, ctx);
   //   (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
   // }
-  
+
   // LLVM_DEBUG({
-  //   llvm::dbgs() << "\n--- After folding unit reduction dims on vector.contract ops ---\n";
-  //   funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
-  //   llvm::dbgs() << "\n\n";
+  //   llvm::dbgs() << "\n--- After folding unit reduction dims on
+  //   vector.contract ops ---\n"; funcOp.print(llvm::dbgs(),
+  //   OpPrintingFlags().useLocalScope()); llvm::dbgs() << "\n\n";
   // });
 
   {
@@ -104,7 +104,8 @@ void LLVMCPUVectorLoweringPass::runOnOperation() {
   }
 
   LLVM_DEBUG({
-    llvm::dbgs() << "\n--- After custom kernel lowering for vector.contract ops ---\n";
+    llvm::dbgs()
+        << "\n--- After custom kernel lowering for vector.contract ops ---\n";
     funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
     llvm::dbgs() << "\n\n";
   });

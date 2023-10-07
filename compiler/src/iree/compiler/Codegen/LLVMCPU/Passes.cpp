@@ -211,8 +211,8 @@ LogicalResult verifyDoubleTilingExpertPassPipelineConfig(
     // for (auto [index, tileSize] : llvm::enumerate(secondLevelTileSizes)) {
     //   if (tileSize != 0 && !pLoopsSet.contains(index)) {
     //     return op->emitOpError(
-    //                "expected only parallel dims to be set in the second tiling "
-    //                "level, got ")
+    //                "expected only parallel dims to be set in the second
+    //                tiling " "level, got ")
     //            << index << "-th tile size set";
     //   }
     // }
@@ -222,8 +222,8 @@ LogicalResult verifyDoubleTilingExpertPassPipelineConfig(
     // for (auto [index, tileSize] : llvm::enumerate(thirdLevelTileSizes)) {
     //   if (tileSize != 0 && pLoopsSet.contains(index)) {
     //     return op->emitOpError(
-    //                "expected only reduction dims to be set in the third tiling "
-    //                "level, got ")
+    //                "expected only reduction dims to be set in the third
+    //                tiling " "level, got ")
     //            << index << "-th tile size set";
     //   }
     // }

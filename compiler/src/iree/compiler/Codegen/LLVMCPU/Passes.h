@@ -115,7 +115,8 @@ void populateUnfusedFMAOpsPassPatterns(MLIRContext *context,
 void populateVectorContractCustomKernelsPatterns(
     IREE::HAL::ExecutableTargetAttr target, RewritePatternSet &patterns);
 
-void populateFoldVectorContractUnitDimsPass(RewritePatternSet &patterns, MLIRContext *context);
+void populateFoldVectorContractUnitDimsPass(RewritePatternSet &patterns,
+                                            MLIRContext *context);
 
 void populateLLVMCPUBreakDownSubbyteExtendPatterns(RewritePatternSet &patterns);
 
