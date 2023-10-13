@@ -37,6 +37,7 @@ iree_cc_library(
   SRCS
     "ConvertTMTensorToLinalgExt.cpp"
     "SetStrictSymbolicShapes.cpp"
+    "PropagateCat.cpp"
     "Passes.cpp"
   DEPS
     ::PassHeaders

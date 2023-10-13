@@ -21,4 +21,10 @@ def SetStrictSymbolicShapesPass :
   let constructor = "mlir::iree_compiler::TorchInput::createSetStrictSymbolicShapesPass()";
 }
 
+def PropagateCat :
+    Pass<"torch-iree-propagate-cat", "func::FuncOp"> {
+  let summary = "Propagates `torch.aten.cat` ops that concat on a non-outer dimension through transposes";
+  let constructor = "mlir::iree_compiler::TorchInput::createPropagateCatPass()";
+}
+
 #endif // TORCH_IREE_INPUTCONVERSION_PASSES
