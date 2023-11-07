@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
@@ -617,6 +618,91 @@ bool Flow::isGroupedDequantizationOp(Operation *op) {
       return false;
     if (!matchPattern(producer, m_Op<arith::ExtUIOp>()))
       return false;
+  }
+
+  return true;
+}
+
+/// Returns true if the operation is an generic op that represents dequant.
+/// This function checks that the genericOp:
+/// 1.
+/// 2.
+/// 3.
+/// 4.
+/// 5.
+/// 6.
+bool Flow::isDequantizationLikeOp(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp) {
+    return false;
+  }
+  if (genericOp.getNumDpsInits() != 1) {
+    return false;
+  }
+
+  // Check that the rank is at least 3 and all loops are parallel
+  unsigned numLoops = genericOp.getNumLoops();
+  unsigned numParallelLoops = genericOp.getNumParallelLoops();
+  if (numLoops != numParallelLoops) {
+    return false;
+  }
+
+  // Check that only one input has an identity map, and the rest are projected
+  // permutations and not full permutations
+  OpOperand *identityInput = nullptr;
+  for (OpOperand *input : genericOp.getDpsInputOperands()) {
+    auto inputMap = genericOp.getMatchingIndexingMap(input);
+    if (inputMap.isIdentity()) {
+      if (identityInput) {
+        return false;
+      }
+      identityInput = input;
+    } else if (!inputMap.isProjectedPermutation() || inputMap.isPermutation()) {
+      return false;
+    }
+  }
+
+  if (!identityInput) {
+    return false;
+  }
+
+  auto indexingMaps = genericOp.getIndexingMapsArray();
+  if (!indexingMaps.back().isIdentity()) {
+    return false;
+  }
+
+  // Identity input and init need to be same shape.
+  auto init = genericOp.getDpsInits()[0];
+  auto identityInputShape =
+      identityInput->get().getType().dyn_cast<ShapedType>().getShape();
+  auto initShape = init.getType().dyn_cast<ShapedType>().getShape();
+  if (identityInputShape != initShape) {
+    return false;
+  }
+
+  Type inputElementType = getElementTypeOrSelf(identityInput->get().getType());
+  Type outputElementType = getElementTypeOrSelf(genericOp->getResultTypes()[0]);
+  if (!inputElementType.isIntOrFloat() || !outputElementType.isIntOrFloat()) {
+    return false;
+  }
+  if (inputElementType.getIntOrFloatBitWidth() >=
+      outputElementType.getIntOrFloatBitWidth()) {
+    return false;
+  }
+
+  for (auto &bodyOp : genericOp.getBody()->getOperations()) {
+    if (!isa<arith::ExtUIOp, arith::ExtSIOp, arith::MulFOp, arith::MulIOp,
+             arith::AddFOp, arith::AddIOp, arith::SubFOp, arith::SubIOp,
+             arith::SIToFPOp, arith::UIToFPOp, linalg::YieldOp>(bodyOp)) {
+      return false;
+    }
+  }
+
+  if (!llvm::all_of(op->getResult(0).getUsers(), [](Operation *user) {
+        auto linalgUser = dyn_cast<linalg::LinalgOp>(user);
+        return linalgUser && linalg::isaContractionOpInterface(linalgUser);
+      })) {
+    return false;
   }
 
   return true;

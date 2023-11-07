@@ -502,7 +502,7 @@ isFusableWithConsumer(OpOperand &fusedOperand,
   }
 
   // Always fuse dequant to consumer since it's not very useful by itself.
-  if (isGroupedDequantizationOp(producer)) {
+  if (isDequantizationLikeOp(producer)) {
     return true;
   }
 
@@ -649,7 +649,7 @@ isFusableWithProducer(OpOperand &operand,
   }
 
   // Always fuse dequant to consumer since it's not very useful by itself.
-  if (isGroupedDequantizationOp(producer)) {
+  if (isDequantizationLikeOp(producer)) {
     return true;
   }
 
