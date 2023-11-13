@@ -54,8 +54,7 @@ void buildGlobalOptimizationPassPipeline(
       .addPass(createRemoveZeroExtentTensorsPass)
       .addPass(createDetachElementwiseFromNamedOpsPass)
       .addPass(mlir::createLinalgNamedOpConversionPass)
-      .addPass(createConvert1X1FilterConv2DToMatmulPass)
-      .addPass(createLiftGenericToTransposeBatchMatmulPass);
+      .addPass(createConvert1X1FilterConv2DToMatmulPass);
   mainPassManager.addPass(createEraseUnusedLinalgOperands());
 
   // Expand tensor shapes into SSA values and optimize the whole program.
@@ -76,6 +75,7 @@ void buildGlobalOptimizationPassPipeline(
       .addPass(IREE::Flow::createFoldUnitExtentDimsPass)
       .addPredicatedPass(clEnableQuantizedMatmulReassociation,
                          createReassociateQuantizedMatmulPass)
+      .addPass(createLiftGenericToTransposeBatchMatmulPass)
       .addPass(mlir::createCanonicalizerPass)
       .addPass(mlir::createCSEPass);
 
