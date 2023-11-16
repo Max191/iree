@@ -605,6 +605,11 @@ struct RaiseSpecialOpsPass : public RaiseSpecialOpsBase<RaiseSpecialOpsPass> {
     registry.insert<IREE::LinalgExt::IREELinalgExtDialect>();
   }
 
+  RaiseSpecialOpsPass(bool dataTiling) { this->dataTiling = dataTiling; }
+
+  RaiseSpecialOpsPass(const RaiseSpecialOpsPass &pass)
+      : RaiseSpecialOpsPass(pass.dataTiling) {}
+
   void runOnOperation() override {
     IRRewriter rewriter(&getContext());
 
@@ -646,13 +651,16 @@ struct RaiseSpecialOpsPass : public RaiseSpecialOpsBase<RaiseSpecialOpsPass> {
           Value src = maxReduction->getCaptured()->getOperand(0);
           softmaxRoots.push_back(std::make_pair(op, src));
         }
-        if (std::optional<Value> newRhs = matchATransposeBMatmul(op)) {
-          transposeMatmulRoots.push_back(std::make_pair(
-              cast<linalg::MatmulOp>(op.getOperation()), newRhs.value()));
-        }
-        if (std::optional<Value> newRhs = matchATransposeBBatchMatmul(op)) {
-          transposeBatchMatmulRoots.push_back(std::make_pair(
-              cast<linalg::BatchMatmulOp>(op.getOperation()), newRhs.value()));
+        if (!this->dataTiling) {
+          if (std::optional<Value> newRhs = matchATransposeBMatmul(op)) {
+            transposeMatmulRoots.push_back(std::make_pair(
+                cast<linalg::MatmulOp>(op.getOperation()), newRhs.value()));
+          }
+          if (std::optional<Value> newRhs = matchATransposeBBatchMatmul(op)) {
+            transposeBatchMatmulRoots.push_back(
+                std::make_pair(cast<linalg::BatchMatmulOp>(op.getOperation()),
+                               newRhs.value()));
+          }
         }
         if (std::optional<Value> fillInput = matchGenericFill(op)) {
           genericFills.push_back(
@@ -722,8 +730,8 @@ struct RaiseSpecialOpsPass : public RaiseSpecialOpsBase<RaiseSpecialOpsPass> {
 
 } // namespace
 
-std::unique_ptr<Pass> createRaiseSpecialOps() {
-  return std::make_unique<RaiseSpecialOpsPass>();
+std::unique_ptr<Pass> createRaiseSpecialOps(bool dataTiling) {
+  return std::make_unique<RaiseSpecialOpsPass>(dataTiling);
 }
 
 } // namespace Flow

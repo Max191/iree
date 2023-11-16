@@ -211,7 +211,7 @@ createDeduplicateExecutablesPass();
 
 // Create a pass to raise sequence of ops to higher level linalg.ext
 // representation.
-std::unique_ptr<Pass> createRaiseSpecialOps();
+std::unique_ptr<Pass> createRaiseSpecialOps(bool dataTiling = false);
 
 // Create a pass to split reduction dimension.
 std::unique_ptr<Pass> createSplitReductionPass();

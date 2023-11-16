@@ -269,6 +269,11 @@ def RaiseSpecialOps :
     Pass<"iree-flow-raise-special-ops", ""> {
   let summary = "raise special ops like softmax to the high level linalg.ext representation";
   let constructor = "mlir::iree_compiler::IREE::Flow::createRaiseSpecialOps()";
+  let options = [
+    Option<"dataTiling", "data-tiling", "bool",
+           /*default=*/"false",
+           "Indicates whether data tiling is enabled">,
+  ];
 }
 
 def SplitReduction :
