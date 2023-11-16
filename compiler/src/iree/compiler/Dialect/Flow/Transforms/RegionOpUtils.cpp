@@ -623,14 +623,6 @@ bool Flow::isGroupedDequantizationOp(Operation *op) {
   return true;
 }
 
-/// Returns true if the operation is an generic op that represents dequant.
-/// This function checks that the genericOp:
-/// 1.
-/// 2.
-/// 3.
-/// 4.
-/// 5.
-/// 6.
 bool Flow::isDequantizationLikeOp(Operation *op) {
   auto genericOp = dyn_cast<linalg::GenericOp>(op);
   if (!genericOp) {
@@ -640,7 +632,7 @@ bool Flow::isDequantizationLikeOp(Operation *op) {
     return false;
   }
 
-  // Check that the rank is at least 3 and all loops are parallel
+  // Check that the all loops are parallel
   unsigned numLoops = genericOp.getNumLoops();
   unsigned numParallelLoops = genericOp.getNumParallelLoops();
   if (numLoops != numParallelLoops) {
@@ -671,15 +663,8 @@ bool Flow::isDequantizationLikeOp(Operation *op) {
     return false;
   }
 
-  // Identity input and init need to be same shape.
-  auto init = genericOp.getDpsInits()[0];
-  auto identityInputShape =
-      identityInput->get().getType().dyn_cast<ShapedType>().getShape();
-  auto initShape = init.getType().dyn_cast<ShapedType>().getShape();
-  if (identityInputShape != initShape) {
-    return false;
-  }
-
+  // Check that the identity input element bitwidth is smaller than the output
+  // element bitwidth.
   Type inputElementType = getElementTypeOrSelf(identityInput->get().getType());
   Type outputElementType = getElementTypeOrSelf(genericOp->getResultTypes()[0]);
   if (!inputElementType.isIntOrFloat() || !outputElementType.isIntOrFloat()) {
@@ -698,13 +683,6 @@ bool Flow::isDequantizationLikeOp(Operation *op) {
     }
   }
 
-  if (!llvm::all_of(op->getResult(0).getUsers(), [](Operation *user) {
-        auto linalgUser = dyn_cast<linalg::LinalgOp>(user);
-        return linalgUser && linalg::isaContractionOpInterface(linalgUser);
-      })) {
-    return false;
-  }
-
   return true;
 }
 
@@ -721,6 +699,9 @@ bool Flow::isClonableIntoDispatchOp(Operation *op) {
   if (isa<affine::AffineApplyOp, arith::IndexCastOp, linalg::FillOp,
           tensor::EmptyOp, tensor::CastOp, tensor::ExtractOp,
           tensor::ExtractSliceOp, complex::CreateOp>(op)) {
+    return true;
+  }
+  if (isDequantizationLikeOp(op)) {
     return true;
   }
   if (isa<arith::ConstantOp>(op) || isa<complex::ConstantOp>(op)) {
@@ -781,9 +762,8 @@ static bool hasUnfusableUseInDispatch(Value v, Operation *dispatchOp) {
   return false;
 }
 
-/// Collect all ops that should be cloned into the given dispatch region op.
-static SmallVector<Operation *>
-getCloneableOps(Flow::DispatchRegionOp regionOp) {
+SmallVector<Operation *>
+Flow::getCloneableOps(Flow::DispatchRegionOp regionOp) {
   // Find values that are used inside of the dispatch region but defined outside
   // of the dispatch region.
   llvm::SetVector<Value> valuesDefinedAbove;
