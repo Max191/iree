@@ -21,6 +21,7 @@
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Interfaces/MaskableOpInterface.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -54,7 +55,7 @@ dropFoldableUnitIndices(PatternRewriter &rewriter,
     SmallVector<int64_t> dstShape;
     SmallVector<AffineExpr> dstExpr;
     for (const auto &expr : enumerate(map.getResults())) {
-      if (auto dimExpr = expr.value().dyn_cast<AffineDimExpr>()) {
+      if (auto dimExpr = dyn_cast<AffineDimExpr>(expr.value())) {
         if (!foldableDims.contains(dimExpr.getPosition())) {
           dstShape.push_back(contractShape[dimExpr.getPosition()]);
           unsigned numSkipped = 0;
