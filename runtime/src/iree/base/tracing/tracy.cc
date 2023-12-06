@@ -17,6 +17,27 @@
 extern "C" {
 #endif  // __cplusplus
 
+#if IREE_HAVE_ATTRIBUTE_WEAK
+IREE_ATTRIBUTE_WEAK void iree_hook_zone_begin(uint64_t zone_id, size_t name_len,
+                                              const char* name);
+IREE_ATTRIBUTE_WEAK void iree_hook_zone_end(uint64_t zone_id);
+#define IREE_HOOK_ZONE_BEGIN(z, l, n) \
+  do {                                \
+    if (iree_hook_zone_begin) {       \
+      iree_hook_zone_begin(z, l, n);  \
+    }                                 \
+  } while (0)
+#define IREE_HOOK_ZONE_END(z) \
+  do {                        \
+    if (iree_hook_zone_end) { \
+      iree_hook_zone_end(z);  \
+    }                         \
+  } while (0)
+#else  // not IREE_HAVE_ATTRIBUTE_WEAK
+#define IREE_HOOK_ZONE_BEGIN(z, l, n)
+#define IREE_HOOK_ZONE_END(z)
+#endif  // not IREE_HAVE_ATTRIBUTE_WEAK
+
 #if defined(TRACY_ENABLE) && defined(IREE_PLATFORM_WINDOWS)
 static HANDLE iree_dbghelp_mutex;
 void IREEDbgHelpInit(void) {
@@ -131,10 +152,12 @@ iree_zone_id_t iree_tracing_zone_begin_external_impl(
   tracy::GetProfiler().SendCallstack(IREE_TRACING_MAX_CALLSTACK_DEPTH);
 #endif  // IREE_TRACING_FEATURE_INSTRUMENTATION_CALLSTACKS
 
+  IREE_HOOK_ZONE_BEGIN(zone_id, function_name_length, function_name);
   return zone_id;
 }
 
 void iree_tracing_zone_end(iree_zone_id_t zone_id) {
+  IREE_HOOK_ZONE_END(zone_id);
   ___tracy_emit_zone_end(iree_tracing_make_zone_ctx(zone_id));
 }
 
