@@ -99,7 +99,8 @@ std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createRemoveZeroExtentTensorsPass();
 
 // Sets encoding for tensors to allow tiled execution of operations.
-std::unique_ptr<Pass> createSetEncodingPass();
+std::unique_ptr<Pass>
+createSetEncodingPass(bool decomposeMatmulTranspose = false);
 
 // Convert linalg.generic ops to linalg.batch_matmul, possibly with transposes
 // on operands/result.

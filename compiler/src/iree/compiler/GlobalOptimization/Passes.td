@@ -112,6 +112,10 @@ def RemoveZeroExtentTensors :
 def SetEncoding : Pass<"iree-global-opt-set-encoding", ""> {
   let summary = "Introduce tensor encoding for compute operations";
   let constructor = "mlir::iree_compiler::GlobalOptimization::createSetEncodingPass()";
+  let options = [
+    Option<"decomposeMatmulTranspose", "decompose-matmul-transpose", "bool",
+           /*default=*/"false", "Allow decomposition of MatmulTransposeA (and similar ops)">,
+  ];
 }
 
 #endif // IREE_COMPILER_GLOBALOPTIMIZATION_PASSES

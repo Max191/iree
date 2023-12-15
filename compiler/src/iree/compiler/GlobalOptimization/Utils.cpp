@@ -7,6 +7,7 @@
 #include "iree/compiler/GlobalOptimization/Utils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
@@ -120,6 +121,26 @@ wrapConsecutiveOpsInDispatchRegion(RewriterBase &rewriter,
   SmallVector<Operation *> precedingOps(ops.begin(), ops.end() - 1);
   return IREE::Flow::movePrecedingOpsIntoDispatchRegion(rewriter, precedingOps,
                                                         regionOp);
+}
+
+Value transposeTensor(Location loc, PatternRewriter &rewriter, Value input,
+                      SmallVector<int64_t> perm) {
+  if (!perm.size()) {
+    return input;
+  }
+  if (llvm::all_of(llvm::enumerate(perm),
+                   [](auto idx) { return idx.index() == idx.value(); })) {
+    return input;
+  }
+  auto inputType = cast<RankedTensorType>(input.getType());
+  SmallVector<OpFoldResult> inputMixedSizes =
+      tensor::getMixedSizes(rewriter, loc, input);
+  SmallVector<OpFoldResult> newInputMixedSizes =
+      applyPermutation(inputMixedSizes, perm);
+  Value init = rewriter.create<tensor::EmptyOp>(loc, newInputMixedSizes,
+                                                inputType.getElementType());
+  return rewriter.create<linalg::TransposeOp>(loc, input, init, perm)
+      .getResults()[0];
 }
 
 } // namespace mlir::iree_compiler::GlobalOptimization

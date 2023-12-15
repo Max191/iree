@@ -55,6 +55,9 @@ FailureOr<IREE::Flow::DispatchRegionOp>
 wrapConsecutiveOpsInDispatchRegion(RewriterBase &rewriter,
                                    SmallVector<Operation *> ops);
 
+Value transposeTensor(Location loc, PatternRewriter &rewriter, Value input,
+                      SmallVector<int64_t> perm);
+
 } // namespace mlir::iree_compiler::GlobalOptimization
 
 #endif // IREE_COMPILER_GLOBALOPTIMIZATION_UTILS_H_

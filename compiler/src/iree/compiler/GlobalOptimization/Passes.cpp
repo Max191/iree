@@ -17,6 +17,11 @@ namespace mlir::iree_compiler::GlobalOptimization {
 
 using FunctionLikeNest = MultiOpNest<func::FuncOp, IREE::Util::InitializerOp>;
 
+static llvm::cl::opt<bool> clDecomposeMatmulTranspose(
+    "iree-global-opt-decompose-matmul-transpose",
+    llvm::cl::desc(
+        "Enables decomposition of MatmulTransposeA (and similar ops)."),
+    llvm::cl::init(false));
 static llvm::cl::opt<bool> clEnableQuantizedMatmulReassociation(
     "iree-global-opt-enable-quantized-matmul-reassociation",
     llvm::cl::desc(
@@ -110,7 +115,7 @@ void buildGlobalOptimizationPassPipeline(
   // Enable data tiling after they are in a canonical form.
   if (transformOptions.options.dataTiling) {
     mainPassManager.addPass(createLiftGenericToTransposeBatchMatmulPass());
-    mainPassManager.addPass(createSetEncodingPass());
+    mainPassManager.addPass(createSetEncodingPass(clDecomposeMatmulTranspose));
     mainPassManager.addPass(createMaterializeHomogeneousEncodingsPass());
     mainPassManager.addPass(createCanonicalizerPass());
     mainPassManager.addPass(createCSEPass());

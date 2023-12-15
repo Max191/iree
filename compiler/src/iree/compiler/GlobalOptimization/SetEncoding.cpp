@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -386,9 +387,88 @@ struct FoldFillWithSetEncoding
   }
 };
 
+/// Pattern to decompose transposed matmul ops into a transpose + matmul.
+/// E.g., matmul_transpose_b -> transpose + matmul
+struct DecomposeMatmulTransposePattern
+    : public OpInterfaceRewritePattern<linalg::LinalgOp> {
+  using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::LinalgOp linalgOp,
+                                PatternRewriter &rewriter) const override {
+    FailureOr<Value> ret =
+        llvm::TypeSwitch<Operation *, FailureOr<Value>>(linalgOp.getOperation())
+            .Case<linalg::MatmulTransposeAOp>(
+                [&](linalg::MatmulTransposeAOp matmulOp) -> Value {
+                  Value transpose =
+                      transposeTensor(matmulOp.getLoc(), rewriter,
+                                      matmulOp->getOperand(0), {1, 0});
+                  return rewriter
+                      .create<linalg::MatmulOp>(
+                          matmulOp->getLoc(),
+                          TypeRange{matmulOp->getResultTypes()},
+                          ValueRange{transpose, matmulOp.getOperand(1)},
+                          ValueRange{matmulOp.getOperand(2)})
+                      .getResult(0);
+                })
+            .Case<linalg::MatmulTransposeBOp>(
+                [&](linalg::MatmulTransposeBOp matmulOp) -> Value {
+                  Value transpose =
+                      transposeTensor(matmulOp.getLoc(), rewriter,
+                                      matmulOp->getOperand(1), {1, 0});
+                  return rewriter
+                      .create<linalg::MatmulOp>(
+                          matmulOp->getLoc(),
+                          TypeRange{matmulOp->getResultTypes()},
+                          ValueRange{matmulOp.getOperand(0), transpose},
+                          ValueRange{matmulOp.getOperand(2)})
+                      .getResult(0);
+                })
+            .Case<linalg::BatchMatmulTransposeAOp>(
+                [&](linalg::BatchMatmulTransposeAOp matmulOp) -> Value {
+                  Value transpose =
+                      transposeTensor(matmulOp.getLoc(), rewriter,
+                                      matmulOp->getOperand(0), {0, 2, 1});
+                  return rewriter
+                      .create<linalg::BatchMatmulOp>(
+                          matmulOp->getLoc(),
+                          TypeRange{matmulOp->getResultTypes()},
+                          ValueRange{transpose, matmulOp.getOperand(1)},
+                          ValueRange{matmulOp.getOperand(2)})
+                      .getResult(0);
+                })
+            .Case<linalg::BatchMatmulTransposeBOp>(
+                [&](linalg::BatchMatmulTransposeBOp matmulOp) -> Value {
+                  Value transpose =
+                      transposeTensor(matmulOp.getLoc(), rewriter,
+                                      matmulOp->getOperand(1), {0, 2, 1});
+                  return rewriter
+                      .create<linalg::BatchMatmulOp>(
+                          matmulOp->getLoc(),
+                          TypeRange{matmulOp->getResultTypes()},
+                          ValueRange{matmulOp.getOperand(0), transpose},
+                          ValueRange{matmulOp.getOperand(2)})
+                      .getResult(0);
+                })
+            .Default([](Operation *op) { return failure(); });
+    if (failed(ret)) {
+      return failure();
+    }
+    rewriter.replaceOp(linalgOp, ret.value());
+    return success();
+  }
+};
+
 struct SetEncodingPass : public SetEncodingBase<SetEncodingPass> {
+  SetEncodingPass(bool decomposeMatmulTranspose) {
+    this->decomposeMatmulTranspose = decomposeMatmulTranspose;
+  }
+
+  SetEncodingPass(const SetEncodingPass &pass)
+      : SetEncodingPass(pass.decomposeMatmulTranspose) {}
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::LinalgExt::IREELinalgExtDialect>();
+    registry.insert<linalg::LinalgDialect>();
   }
 
   void runOnOperation() override;
@@ -399,6 +479,9 @@ void SetEncodingPass::runOnOperation() {
   MLIRContext *context = &getContext();
   {
     RewritePatternSet patterns(context);
+    if (this->decomposeMatmulTranspose) {
+      patterns.insert<DecomposeMatmulTransposePattern>(context);
+    }
     patterns.insert<setContractionOpEncoding>(context);
     linalg::FillOp::getCanonicalizationPatterns(patterns, context);
     patterns.insert<FoldFillWithSetEncoding>(context);
@@ -410,8 +493,8 @@ void SetEncodingPass::runOnOperation() {
   }
 }
 
-std::unique_ptr<Pass> createSetEncodingPass() {
-  return std::make_unique<SetEncodingPass>();
+std::unique_ptr<Pass> createSetEncodingPass(bool decomposeMatmulTranspose) {
+  return std::make_unique<SetEncodingPass>(decomposeMatmulTranspose);
 }
 
 } // namespace mlir::iree_compiler::GlobalOptimization

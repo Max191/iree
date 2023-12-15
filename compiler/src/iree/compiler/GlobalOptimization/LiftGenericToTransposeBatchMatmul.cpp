@@ -122,26 +122,6 @@ static LogicalResult hasMatmulBody(RewriterBase &rewriter,
   return success();
 }
 
-static Value transposeTensor(Location loc, PatternRewriter &rewriter,
-                             Value input, SmallVector<int64_t> perm) {
-  if (!perm.size()) {
-    return input;
-  }
-  if (llvm::all_of(llvm::enumerate(perm),
-                   [](auto idx) { return idx.index() == idx.value(); })) {
-    return input;
-  }
-  auto inputType = cast<RankedTensorType>(input.getType());
-  SmallVector<OpFoldResult> inputMixedSizes =
-      tensor::getMixedSizes(rewriter, loc, input);
-  SmallVector<OpFoldResult> newInputMixedSizes =
-      applyPermutation(inputMixedSizes, perm);
-  Value init = rewriter.create<tensor::EmptyOp>(loc, newInputMixedSizes,
-                                                inputType.getElementType());
-  return rewriter.create<linalg::TransposeOp>(loc, input, init, perm)
-      .getResults()[0];
-}
-
 static FailureOr<Value> castTensor(Location loc, PatternRewriter &rewriter,
                                    linalg::GenericOp genericOp,
                                    int64_t inputIdx, Value input) {
