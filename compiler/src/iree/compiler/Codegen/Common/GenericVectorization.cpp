@@ -122,6 +122,32 @@ static LogicalResult isWithinVectorSizeLimit(linalg::LinalgOp linalgOp,
   return success(maxFlatVecSize < maxVectorSize);
 }
 
+static std::optional<SmallVector<int64_t>>
+inferPackInputShapeFromResultShape(tensor::PackOp packOp) {
+  auto destShape = packOp.getDestType().getShape();
+  if (any_of(destShape, [](int64_t s) { return s == ShapedType::kDynamic; })) {
+    return std::nullopt;
+  }
+  auto innerTiles = packOp.getStaticInnerTiles();
+  SmallVector<int64_t> srcShape(packOp.getSourceType().getShape());
+  auto outerDimsPerm = packOp.getOuterDimsPerm();
+  if (outerDimsPerm.empty())
+    outerDimsPerm = to_vector(llvm::seq<int64_t>(packOp.getSourceRank()));
+  auto innerDimsPos = packOp.getInnerDimsPos();
+  if (innerDimsPos.empty())
+    innerDimsPos = to_vector(llvm::seq<int64_t>(innerTiles.size()));
+  auto getInnerTileSize = [&](int64_t idx) -> int64_t {
+    for (auto [i, p] : enumerate(innerDimsPos))
+      if (p == idx)
+        return innerTiles[i];
+    return 1;
+  };
+  for (auto [idx, perm] : enumerate(outerDimsPerm)) {
+    srcShape[perm] = getInnerTileSize(perm) * destShape[idx];
+  }
+  return srcShape;
+}
+
 class GenericVectorizationPass
     : public GenericVectorizationBase<GenericVectorizationPass> {
 public:
@@ -130,6 +156,7 @@ public:
     this->enableVectorMasking.setValue(options.enableVectorMasking);
     this->useConfiguredVectorSizes.setValue(options.useConfiguredVectorSizes);
     this->vectorizePadding.setValue(options.vectorizePadding);
+    this->vectorizePacking.setValue(options.vectorizePacking);
     this->vectorizeGatherAccesses.setValue(options.vectorizeGatherAccesses);
     this->enableCleanup.setValue(options.enableCleanup);
     this->generateContract.setValue(options.generateContract);
@@ -154,6 +181,8 @@ void GenericVectorizationPass::runOnOperation() {
     if (isa<linalg::LinalgOp>(op))
       candidates.push_back(op);
     if (vectorizePadding && enableVectorMasking && isa<tensor::PadOp>(op))
+      candidates.push_back(op);
+    if (vectorizePacking && enableVectorMasking && isa<tensor::PackOp>(op))
       candidates.push_back(op);
   });
   for (Operation *op : candidates) {
@@ -184,6 +213,11 @@ void GenericVectorizationPass::runOnOperation() {
       if (!ty.hasStaticShape())
         continue;
       vectorSizes.append(ty.getShape().begin(), ty.getShape().end());
+    } else if (auto packOp = dyn_cast<tensor::PackOp>(op)) {
+      auto srcPackShape = inferPackInputShapeFromResultShape(packOp);
+      if (!srcPackShape)
+        continue;
+      vectorSizes.append(srcPackShape->begin(), srcPackShape->end());
     }
     // Pad scalable dims with `false` to match the vector sizes.
     scalableVecDims.resize(vectorSizes.size());

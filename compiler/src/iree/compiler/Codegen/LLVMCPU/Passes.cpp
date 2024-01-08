@@ -363,14 +363,15 @@ void addMultiTilingExpertPassPipeline(
 
   {
     nestedModulePM.addNestedPass<func::FuncOp>(createVectorizePadPass());
-    nestedModulePM.addNestedPass<func::FuncOp>(
-        createDecomposePackUnPackOpsPass());
+    // nestedModulePM.addNestedPass<func::FuncOp>(
+    //     createDecomposePackUnPackOpsPass());
     nestedModulePM.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     nestedModulePM.addNestedPass<func::FuncOp>(createCSEPass());
 
     GenericVectorizationPassOptions options;
     options.enableVectorMasking = enableVectorMasking;
     options.vectorizePadding = true;
+    options.vectorizePacking = true;
     options.vectorizeGatherAccesses = true;
     nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
@@ -526,12 +527,13 @@ void addCPUDataTilingPipeline(OpPassManager &passManager,
   OpPassManager &nestedModulePM = passManager.nest<ModuleOp>();
   nestedModulePM.addNestedPass<func::FuncOp>(
       createLLVMCPUTilePass(tilingConfig.getVectorCommonParallelLevel()));
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      createDecomposePackUnPackOpsPass());
+  // nestedModulePM.addNestedPass<func::FuncOp>(
+  //     createDecomposePackUnPackOpsPass());
 
   {
     GenericVectorizationPassOptions options;
     options.vectorizePadding = true;
+    options.vectorizePacking = true;
     options.enableVectorMasking = enableVectorMasking;
     nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
