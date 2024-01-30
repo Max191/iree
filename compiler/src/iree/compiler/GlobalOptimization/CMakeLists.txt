@@ -37,16 +37,19 @@ iree_cc_library(
   NAME
     GlobalOptimization
   HDRS
+    "DataLayoutUtils.h"
     "Passes.h"
     "Utils.h"
   SRCS
     "CleanupNumericNarrowing.cpp"
     "Convert1X1FilterConv2DToMatmul.cpp"
+    "DataLayoutUtils.cpp"
     "DecomposeConcat.cpp"
     "DemoteContractionInputsToBF16.cpp"
     "DetachElementwiseFromNamedOps.cpp"
     "EraseUnusedLinalgOperands.cpp"
     "ExpandTensorShapes.cpp"
+    "FoldGlobalUnitDims.cpp"
     "FuseDequantizationMatmul.cpp"
     "FuseSiluHorizontalMatmul.cpp"
     "GeneralizeLinalgNamedOps.cpp"
@@ -55,6 +58,7 @@ iree_cc_library(
     "MaterializeHomogeneousEncodings.cpp"
     "OptimizeNumerics.cpp"
     "Passes.cpp"
+    "PropagateDataLayout.cpp"
     "PropagateLinalgTranspose.cpp"
     "RaiseSpecialOps.cpp"
     "RemoveZeroExtentTensors.cpp"

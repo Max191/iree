@@ -55,6 +55,12 @@ def ExpandTensorShapes :
   let constructor = "mlir::iree_compiler::GlobalOptimization::createExpandTensorShapesPass()";
 }
 
+def FoldGlobalUnitDims:
+    Pass<"iree-global-opt-fold-global-unit-dims", "mlir::ModuleOp"> {
+  let summary = "Removes unit dims from util.global ops";
+  let constructor = "mlir::iree_compiler::GlobalOptimization::createFoldGlobalUnitDimsPass()";
+}
+
 def FuseDequantizationMatmul:
     InterfacePass<"iree-global-opt-fuse-dequantization-matmul", "mlir::FunctionOpInterface"> {
   let summary = "Fuses dequantization and matmul linalg.generic ops";
@@ -94,6 +100,12 @@ def OptimizeNumerics :
     Pass<"iree-global-opt-optimize-numerics", ""> {
   let summary = "Optimizes numerics given annotations added via iree-global-opt-infer-numeric-narrowing";
   let constructor = "mlir::iree_compiler::GlobalOptimization::createOptimizeNumericsPass()";
+}
+
+def PropagateDataLayout :
+    Pass<"iree-global-opt-propagate-data-layout", "mlir::ModuleOp"> {
+  let summary = "Propagates data layouts up to globals";
+  let constructor = "mlir::iree_compiler::GlobalOptimization::createPropagateDataLayoutPass()";
 }
 
 def PropagateLinalgTranspose :

@@ -65,6 +65,9 @@ createEraseUnusedLinalgOperands();
 /// Expands tensor shape dimensions into SSA values across the program.
 std::unique_ptr<OperationPass<mlir::ModuleOp>> createExpandTensorShapesPass();
 
+/// Folds unit dims in util.global ops.
+std::unique_ptr<OperationPass<mlir::ModuleOp>> createFoldGlobalUnitDimsPass();
+
 /// Fuses dequantization and matmul linalg.generic ops
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createFuseDequantizationMatmulPass(
@@ -91,6 +94,9 @@ createMaterializeHomogeneousEncodingsPass();
 /// Optimizes numerics given annotations added via
 /// iree-global-opt-infer-numeric-narrowing.
 std::unique_ptr<Pass> createOptimizeNumericsPass();
+
+/// Propagates data layouts up to globals.
+std::unique_ptr<OperationPass<mlir::ModuleOp>> createPropagateDataLayoutPass();
 
 /// Propagates linalg.transpose ops to a restricted set of operations.
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
