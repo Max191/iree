@@ -133,26 +133,54 @@ void GlobalOptimizationOptions::bindOptions(OptionsBinder &binder) {
                    llvm::cl::desc("Strips debug assertions after any useful "
                                   "information has been extracted."),
                    llvm::cl::cat(category));
+
+  // TODO(benvanik): make this a list of scope=path like the runtime tools. Then
+  // we can import from multiple parameter files just like the tools do.
   binder.opt<std::string>(
-      "iree-opt-parameter-archive-export-file", parameterArchiveExportPath,
+      "iree-opt-parameter-import-file", parameterImportFile,
+      llvm::cl::desc("File path to an archive to import parameters from."),
+      llvm::cl::cat(category));
+  binder.opt<std::string>(
+      "iree-opt-parameter-import-scope", parameterImportScope,
+      llvm::cl::desc("Optional scope to import parameters from."),
+      llvm::cl::cat(category));
+  binder.opt<int64_t>("iree-opt-parameter-import-maximum-size",
+                      parameterImportMaximumSize,
+                      llvm::cl::desc("Maximum size of parameters to import."),
+                      llvm::cl::cat(category));
+  binder.list<std::string>("iree-opt-parameter-import-keys",
+                           parameterImportKeys,
+                           llvm::cl::desc("List of parameter keys to import."),
+                           llvm::cl::cat(category));
+
+  // TODO(benvanik): make this a list of scope=path like the runtime tools. Then
+  // we can export different scopes to different files.
+  binder.opt<std::string>(
+      "iree-opt-parameter-export-file", parameterExportFile,
       llvm::cl::desc(
           "File path to create a parameter archive using any inline global "
           "constants."),
       llvm::cl::cat(category));
   binder.opt<std::string>(
-      "iree-opt-parameter-archive-export-scope", parameterExportScope,
+      "iree-opt-parameter-export-scope", parameterExportScope,
       llvm::cl::desc("Scope for parameters in the archive created in "
                      "`iree-opt-export-parameter-archive-export-file`."),
       llvm::cl::cat(category));
   binder.opt<int64_t>(
-      "iree-opt-minimum-parameter-export-size", minimumParameterExportSize,
+      "iree-opt-parameter-export-minimum-size", parameterExportMinimumSize,
       llvm::cl::desc(
           "Minimum size of constants to export to the archive created in "
           "`iree-opt-export-parameter-archive-export-file`."),
       llvm::cl::cat(category));
+
+  // TODO(benvanik): make this an option on the parameter export pass instead?
+  // It could be useful to output both a full and splat parameter file in a
+  // single invocation, though I can't imagine any good workflows that do that
+  // (it'd be better to export once and compile from a smaller input than load
+  // all parameters every time to spit out the splat, and
+  // iree-convert-parameters is a better tool for stripping from source files).
   binder.opt<std::string>(
-      "iree-opt-splat-parameter-archive-export-file",
-      splatParameterArchiveExportPath,
+      "iree-opt-parameter-archive-splat-export-file", parameterSplatExportFile,
       llvm::cl::desc(
           "File path to create a parameter archive of splat values out of all "
           "parameter backed globals."),

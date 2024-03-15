@@ -60,6 +60,22 @@ void buildGlobalOptExprHoistingPassPipeline(
 
 void buildGlobalOptimizationPassPipeline(
     OpPassManager &mainPassManager, const TransformOptions &transformOptions) {
+  // Import parameters before any global optimization passes so that the inlined
+  // parameters are available for folding.
+  if (!transformOptions.options.parameterImportFile.empty()) {
+    IREE::IO::Parameters::ImportParametersPassOptions importParametersOptions;
+    importParametersOptions.archivePath =
+        transformOptions.options.parameterImportFile;
+    importParametersOptions.parameterScope =
+        transformOptions.options.parameterImportScope;
+    importParametersOptions.maximumSize =
+        transformOptions.options.parameterImportMaximumSize;
+    importParametersOptions.parameterKeys =
+        transformOptions.options.parameterImportKeys;
+    mainPassManager.addPass(IREE::IO::Parameters::createImportParametersPass(
+        importParametersOptions));
+  }
+
   // ML frontends have very uneven support for user-controlled types _and_ users
   // tend to use types not well suited for the work they are doing. These
   // demotions/promotions allow users to change the types after lowering out of
@@ -194,23 +210,23 @@ void buildGlobalOptimizationPassPipeline(
   // constants that aren't exported and skip it for larger parameters, but this
   // is a sensible place for the common case of wanting const-eval in the final
   // artifact + archive.
-  if (!transformOptions.options.parameterArchiveExportPath.empty()) {
+  if (!transformOptions.options.parameterExportFile.empty()) {
     IREE::IO::Parameters::ExportParametersPassOptions exportParametersOptions;
     exportParametersOptions.archivePath =
-        transformOptions.options.parameterArchiveExportPath;
+        transformOptions.options.parameterExportFile;
     exportParametersOptions.parameterScope =
         transformOptions.options.parameterExportScope;
     exportParametersOptions.minimumSize =
-        transformOptions.options.minimumParameterExportSize;
+        transformOptions.options.parameterExportMinimumSize;
     pipeline.addPass(IREE::IO::Parameters::createExportParametersPass(
         exportParametersOptions));
   }
 
-  if (!transformOptions.options.splatParameterArchiveExportPath.empty()) {
+  if (!transformOptions.options.parameterSplatExportFile.empty()) {
     IREE::IO::Parameters::GenerateSplatParameterArchivePassOptions
         generateSplatOptions;
     generateSplatOptions.archivePath =
-        transformOptions.options.splatParameterArchiveExportPath;
+        transformOptions.options.parameterSplatExportFile;
     pipeline.addPass(
         IREE::IO::Parameters::createGenerateSplatParameterArchivePass(
             generateSplatOptions));
