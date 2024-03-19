@@ -157,8 +157,8 @@ static LogicalResult
 importParameterFromSplat(StringRef fullName,
                          IREE::Util::GlobalOpInterface globalOp,
                          const iree_io_parameter_index_entry_t *entry) {
-  entry->storage.splat.pattern;
-  entry->storage.splat.pattern_length;
+  // entry->storage.splat.pattern;
+  // entry->storage.splat.pattern_length;
 
   // Map the splat pattern into an attribute.
   auto shapedType = cast<ShapedType>(globalOp.getGlobalType());
@@ -252,7 +252,7 @@ struct ImportParametersPass
       return;
     }
 
-    MLIRContext *context = &getContext();
+    // MLIRContext *context = &getContext();
     ModuleOp moduleOp = getOperation();
 
     // Open the archive file (hopefully mapping it) and parse the index.
@@ -297,6 +297,7 @@ struct ImportParametersPass
               (StringRef("__import_") + parameterAttr.getScope().getValue() +
                "_" + parameterAttr.getKey().getValue())
                   .str();
+          llvm::dbgs() << "importing: " << parameterAttr << "\n";
           if (failed(tryImportParameter(fullName, globalOp, parameterAttr,
                                         parameterIndex->get()))) {
             return signalPassFailure();
