@@ -429,10 +429,6 @@ transformGlobalsToNewLayout(IRRewriter &rewriter, SmallVector<Value> edgeNodes,
   // value of the pack. This is necessary because we have folded the pack
   // op into the new global. Additional analysis could tell us whether the
   // padding is actually needed, but for now we always pad.
-  Location globalLoc = newGlobal->getLoc();
-  auto initializerOp = rewriter.create<IREE::Util::InitializerOp>(globalLoc);
-  auto initializerBuilder =
-      OpBuilder::atBlockBegin(initializerOp.addEntryBlock());
   // If the transform has no padding value, then use a zero padding value, since
   // the global may need a pad value even if the layout found in the analysis
   // did not have a padding value.
@@ -441,13 +437,8 @@ transformGlobalsToNewLayout(IRRewriter &rewriter, SmallVector<Value> edgeNodes,
       transformPadVal.has_value()
           ? transformPadVal.value()
           : rewriter.getZeroAttr(transformedType.getElementType());
-  Value padValue =
-      initializerBuilder.create<arith::ConstantOp>(globalLoc, constPadAttr);
-  auto splatOp = initializerBuilder.create<IREE::Flow::TensorSplatOp>(
-      globalLoc, transformedType, padValue, /*result_dims=*/ValueRange{});
-  initializerBuilder.create<IREE::Util::GlobalStoreOp>(
-      globalLoc, splatOp.getResult(), newGlobal.getGlobalName());
-  initializerBuilder.create<IREE::Util::ReturnOp>(globalLoc);
+  auto padDenseAttr = DenseElementsAttr::get(transformedType, constPadAttr);
+  newGlobal.setGlobalInitialValue(padDenseAttr);
 
   // Rewrite loads and stores to use the new global.
   SmallVector<OpFoldResult> innerTilesOfr;
@@ -506,6 +497,59 @@ transformGlobalsToNewLayout(IRRewriter &rewriter, SmallVector<Value> edgeNodes,
     rewriter.eraseOp(store);
   }
   return success();
+}
+
+void getCollapsedSliceMetadata(
+    ArrayRef<int64_t> tensorShape, ArrayRef<int64_t> sliceShape,
+    SmallVector<OpFoldResult> mixedOffsets,
+    SmallVector<OpFoldResult> mixedSizes,
+    SmallVector<OpFoldResult> mixedStrides,
+    SmallVector<OpFoldResult> &collapsedOffsets,
+    SmallVector<OpFoldResult> &collapsedSizes,
+    SmallVector<OpFoldResult> &collapsedStrides,
+    std::optional<SmallVector<ReassociationIndices>> &collapsedTensorRe,
+    std::optional<SmallVector<ReassociationIndices>> &collapsedSliceRe,
+    SmallVector<int64_t> &collapsedSliceShape) {
+  int rankDiff = tensorShape.size() - sliceShape.size();
+  SmallVector<int64_t> tensorNonUnitDims, sliceNonUnitDims;
+  bool foundNonUnitSliceDim = false;
+  for (auto [tensorIdx, tensorSize] : enumerate(tensorShape)) {
+    if (tensorSize != 1) {
+      tensorNonUnitDims.push_back(tensorIdx);
+      int sliceIdx = tensorIdx - rankDiff;
+      if (sliceIdx >= 0) {
+        if (sliceShape[sliceIdx] != 1 || foundNonUnitSliceDim) {
+          collapsedSliceShape.push_back(sliceShape[sliceIdx]);
+          sliceNonUnitDims.push_back(sliceIdx);
+          foundNonUnitSliceDim = true;
+        }
+      }
+      collapsedOffsets.push_back(mixedOffsets[tensorIdx]);
+      collapsedSizes.push_back(mixedSizes[tensorIdx]);
+      collapsedStrides.push_back(mixedStrides[tensorIdx]);
+    }
+  }
+  auto getReassociationIndices = [](SmallVector<int64_t> nonUnitDims,
+                                    ArrayRef<int64_t> shape)
+      -> std::optional<SmallVector<ReassociationIndices>> {
+    SetVector<int64_t> s(nonUnitDims.begin(), nonUnitDims.end());
+    SmallVector<ReassociationIndices> reInd(nonUnitDims.size(),
+                                            ReassociationIndices{});
+    int64_t reListIdx = 0;
+    for (int64_t idx = 0; idx < shape.size(); idx++) {
+      reInd[reListIdx].push_back(idx);
+      if (s.contains(idx)) {
+        reListIdx++;
+      }
+    }
+    if (llvm::all_of(reInd,
+                     [](ReassociationIndices re) { return re.size() == 1; })) {
+      return std::nullopt;
+    }
+    return reInd;
+  };
+  collapsedTensorRe = getReassociationIndices(tensorNonUnitDims, tensorShape);
+  collapsedSliceRe = getReassociationIndices(sliceNonUnitDims, sliceShape);
 }
 
 LogicalResult

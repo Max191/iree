@@ -566,6 +566,147 @@ ChangeStatus GlobalDataLayoutValueElement::updateValue(Value value,
 }
 
 //===----------------------------------------------------------------------===//
+// Pre-processing pattern definitions
+//===----------------------------------------------------------------------===//
+
+struct FoldInsertSliceOfUnitDimCast
+    : public OpRewritePattern<tensor::InsertSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::InsertSliceOp insertOp,
+                                PatternRewriter &rewriter) const override {
+    auto castOp = insertOp.getSource().getDefiningOp<tensor::CastOp>();
+    if (!castOp) {
+      return failure();
+    }
+    auto sourceType = dyn_cast<RankedTensorType>(castOp.getSource().getType());
+    auto destType = dyn_cast<RankedTensorType>(castOp.getDest().getType());
+    if (sourceType.getRank() != destType.getRank()) {
+      return failure();
+    }
+    SetVector<int64_t> unitToDynamicIndices;
+    for (auto [idx, sourceSize, destSize] :
+         llvm::enumerate(sourceType.getShape(), destType.getShape())) {
+      if (sourceSize == destSize) {
+        continue;
+      }
+      if (sourceSize == 1 && destSize == ShapedType::kDynamic) {
+        unitToDynamicIndices.insert(idx);
+        continue;
+      }
+      return failure();
+    }
+    std::optional<llvm::SmallDenseSet<unsigned>> maybeRankReducingMask =
+        mlir::computeRankReductionMask(insertOp.getStaticSizes(),
+                                       insertOp.getSourceType().getShape());
+    if (!maybeRankReducingMask) {
+      return failure();
+    }
+    auto rankReducingMask = maybeRankReducingMask.value();
+    auto newSizes = insertOp.getMixedSizes();
+    int64_t sliceIdx = 0;
+    for (auto [idx, size] : llvm::enumerate(insertOp.getStaticSizes())) {
+      if (!rankReducingMask.contains(idx)) {
+        if (unitToDynamicIndices.contains(sliceIdx++)) {
+          newSizes[idx] = rewriter.getIndexAttr(1);
+        }
+      }
+    }
+    rewriter.replaceOpWithNewOp<tensor::InsertSliceOp>(
+        insertOp, castOp.getSource(), insertOp.getDest(),
+        insertOp.getMixedOffsets(), newSizes, insertOp.getMixedStrides());
+    return success();
+  }
+};
+
+struct FoldInsertSliceUnitDims
+    : public OpRewritePattern<tensor::InsertSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::InsertSliceOp insertOp,
+                                PatternRewriter &rewriter) const override {
+    auto sourceShape = insertOp.getSourceType().getShape();
+    auto destShape = insertOp.getDestType().getShape();
+    SmallVector<int64_t> collapsedSrcShape;
+    SmallVector<OpFoldResult> collapsedOffsets, collapsedSizes,
+        collapsedStrides;
+    std::optional<SmallVector<ReassociationIndices>> collapsedSrcRe,
+        collapsedDstRe;
+    getCollapsedSliceMetadata(
+        destShape, sourceShape, insertOp.getMixedOffsets(),
+        insertOp.getMixedSizes(), insertOp.getMixedStrides(), collapsedOffsets,
+        collapsedSizes, collapsedStrides, collapsedDstRe, collapsedSrcRe,
+        collapsedSrcShape);
+    if (!collapsedDstRe && !collapsedSrcRe) {
+      return failure();
+    }
+    Location loc = insertOp.getLoc();
+    Value source = insertOp.getSource();
+    Value dest = insertOp.getDest();
+    if (collapsedSrcRe) {
+      source = rewriter.create<tensor::CollapseShapeOp>(loc, source,
+                                                        collapsedSrcRe.value());
+    }
+    if (collapsedDstRe) {
+      dest = rewriter.create<tensor::CollapseShapeOp>(loc, dest,
+                                                      collapsedDstRe.value());
+    }
+    Value newInsert = rewriter.create<tensor::InsertSliceOp>(
+        loc, source, dest, collapsedOffsets, collapsedSizes, collapsedStrides);
+    if (!collapsedDstRe) {
+      rewriter.replaceOp(insertOp, newInsert);
+      return success();
+    }
+    rewriter.replaceOpWithNewOp<tensor::ExpandShapeOp>(
+        insertOp, insertOp.getDestType(), newInsert, collapsedDstRe.value());
+    return success();
+  }
+};
+
+struct FoldExtractSliceUnitDims
+    : public OpRewritePattern<tensor::ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExtractSliceOp extractOp,
+                                PatternRewriter &rewriter) const override {
+    auto sourceShape = extractOp.getSourceType().getShape();
+    auto resShape = extractOp.getResultType().getShape();
+    SmallVector<int64_t> collapsedResShape;
+    SmallVector<OpFoldResult> collapsedOffsets, collapsedSizes,
+        collapsedStrides;
+    std::optional<SmallVector<ReassociationIndices>> collapsedSrcRe,
+        collapsedResRe;
+    getCollapsedSliceMetadata(
+        sourceShape, resShape, extractOp.getMixedOffsets(),
+        extractOp.getMixedSizes(), extractOp.getMixedStrides(),
+        collapsedOffsets, collapsedSizes, collapsedStrides, collapsedSrcRe,
+        collapsedResRe, collapsedResShape);
+    if (!collapsedSrcRe && !collapsedResRe) {
+      return failure();
+    }
+    Location loc = extractOp.getLoc();
+    Value source = extractOp.getSource();
+    if (collapsedSrcRe) {
+      source = rewriter.create<tensor::CollapseShapeOp>(loc, source,
+                                                        collapsedSrcRe.value());
+    }
+    auto collapsedResType = RankedTensorType::get(
+        collapsedResShape, extractOp.getResultType().getElementType());
+    Value newExtract = rewriter.create<tensor::ExtractSliceOp>(
+        loc, collapsedResType, source, collapsedOffsets, collapsedSizes,
+        collapsedStrides);
+    if (!collapsedResRe) {
+      rewriter.replaceOp(extractOp, newExtract);
+      return success();
+    }
+    rewriter.replaceOpWithNewOp<tensor::ExpandShapeOp>(
+        extractOp, extractOp.getResultType(), newExtract,
+        collapsedResRe.value());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Propagation pattern definitions
 //===----------------------------------------------------------------------===//
 
@@ -796,6 +937,32 @@ struct PropagateDataLayoutPass
 
 void PropagateDataLayoutPass::runOnOperation() {
   auto moduleOp = getOperation();
+
+  {
+    MLIRContext *context = &getContext();
+    RewritePatternSet preprocessingPatterns(context);
+    preprocessingPatterns
+        .insert<FoldInsertSliceOfUnitDimCast, FoldInsertSliceUnitDims,
+                FoldExtractSliceUnitDims>(context);
+    tensor::ExtractSliceOp::getCanonicalizationPatterns(preprocessingPatterns,
+                                                        context);
+    tensor::InsertSliceOp::getCanonicalizationPatterns(preprocessingPatterns,
+                                                       context);
+    tensor::CollapseShapeOp::getCanonicalizationPatterns(preprocessingPatterns,
+                                                         context);
+    tensor::ExpandShapeOp::getCanonicalizationPatterns(preprocessingPatterns,
+                                                       context);
+    if (failed(applyPatternsAndFoldGreedily(
+            moduleOp, std::move(preprocessingPatterns)))) {
+      return signalPassFailure();
+    }
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "\n--- After preprocessing for analysis ---\n";
+    moduleOp->print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+    llvm::dbgs() << "\n\n";
+  });
 
   // Do data layout analysis and rewrite globals
   {

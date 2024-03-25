@@ -142,6 +142,22 @@ transformGlobalsToNewLayout(IRRewriter &rewriter, SmallVector<Value> edgeNodes,
                             const Explorer::GlobalInfo *globalInfo,
                             SymbolTable moduleSymbols);
 
+/// Given the metadata and tensor types of an extract_slice or insert_slice op,
+/// fill in the new slice metadata for a slice without unit dimensions. If the
+/// inputs for the new slice need to be reshaped, then also fill the
+/// reassociation indices for the reshapes on each input.
+void getCollapsedSliceMetadata(
+    ArrayRef<int64_t> tensorShape, ArrayRef<int64_t> sliceShape,
+    SmallVector<OpFoldResult> mixedOffsets,
+    SmallVector<OpFoldResult> mixedSizes,
+    SmallVector<OpFoldResult> mixedStrides,
+    SmallVector<OpFoldResult> &collapsedOffsets,
+    SmallVector<OpFoldResult> &collapsedSizes,
+    SmallVector<OpFoldResult> &collapsedStrides,
+    std::optional<SmallVector<ReassociationIndices>> &collapsedTensorRe,
+    std::optional<SmallVector<ReassociationIndices>> &collapsedSliceRe,
+    SmallVector<int64_t> &collapsedSliceShape);
+
 /// Given metadata for extract_slice or insert_slice ops and its rank-reducing
 /// mask, compute the new metadata for a slice in the packed domain defined by
 /// the passed `mixedTiles`, `innerDimsPos`, and `outerDimsPerm`. This will
