@@ -226,6 +226,8 @@ void addGPUVectorizationPassPipeline(OpPassManager &funcPassManager) {
 
   // Distribute linalg onto threads within the workgroup.
   funcPassManager.addPass(createGPUTensorTile(false));
+  funcPassManager.addPass(
+      IREE::LinalgExt::createDecomposeWinogradTransformPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 
