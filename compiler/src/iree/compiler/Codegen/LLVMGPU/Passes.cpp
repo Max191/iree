@@ -262,10 +262,10 @@ void addGPUWinogradVectorizePassPipeline(OpPassManager &funcPassManager) {
 
   // Distribute linalg onto threads within the workgroup.
   funcPassManager.addPass(createGPUTilePass());
-  funcPassManager.addPass(
-      IREE::LinalgExt::createDecomposeWinogradTransformPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
+  funcPassManager.addPass(
+      IREE::LinalgExt::createDecomposeWinogradTransformPass());
 
   // Linalg -> vector
   addGPUVectorizationPasses(funcPassManager);
