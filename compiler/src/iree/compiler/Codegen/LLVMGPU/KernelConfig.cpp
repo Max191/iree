@@ -911,7 +911,8 @@ static LogicalResult setWinogradOpConfig(mlir::FunctionOpInterface entryPoint,
           std::is_same<WinogradOp,
                        IREE::LinalgExt::WinogradOutputTransformOp>(),
       "expected winograd transform op");
-  auto pipeline = IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorize;
+  auto pipeline =
+      IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUWinogradVectorize;
   TileSizesListType tileSizes;
   std::array<int64_t, 3> workgroupSize = {32, 4, 4};
   auto iterationRank = op.getIterationDomainRank();
