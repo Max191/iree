@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include <optional>
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -130,18 +131,22 @@ static bool isSmallerThan(ArrayRef<int64_t> sourceShape,
 /// `dimSize`.
 static std::pair<OpFoldResult, OpFoldResult>
 getScaledSizeAndOffset(OpBuilder &builder, Location loc, OpFoldResult size,
-                       OpFoldResult offset, OpFoldResult dimSize,
+                       OpFoldResult offset, std::optional<OpFoldResult> dimSize,
                        int64_t offsetScale, int64_t sizeScale) {
   AffineExpr dim0, dim1, dim2;
   auto ctx = builder.getContext();
   bindDims(ctx, dim0, dim1, dim2);
   auto imageOffset = affine::makeComposedFoldedAffineApply(
       builder, loc, {dim0 * offsetScale}, offset);
-  auto dimSizeValue = getValueOrCreateConstantIndexOp(builder, loc, dimSize);
+  if (!dimSize.has_value()) {
+    auto imageSize = affine::makeComposedFoldedAffineApply(
+        builder, loc, {dim0 * sizeScale}, {size});
+    return std::make_pair(imageSize, imageOffset);
+  }
   AffineMap sizeMap =
       AffineMap::get(3, 0, {dim0 - dim1, dim2 * sizeScale}, ctx);
   auto imageSize = affine::makeComposedFoldedAffineMin(
-      builder, loc, sizeMap, {dimSizeValue, imageOffset, size});
+      builder, loc, sizeMap, {dimSize.value(), imageOffset, size});
   return std::make_pair(imageSize, imageOffset);
 }
 
@@ -2686,12 +2691,12 @@ FailureOr<TilingResult> WinogradOutputTransformOp::getTiledImplementation(
   inputSizes[4] = sizes[2];
   inputSizes[5] = outputSizes[cDim] = sizes[3];
 
-  auto hSizeAndOffset = getScaledSizeAndOffset(
-      builder, loc, sizes[1], offsets[1], outputSizes[hDim],
-      getOutputTileSize(), getOutputTileSize());
-  auto wSizeAndOffset = getScaledSizeAndOffset(
-      builder, loc, sizes[2], offsets[2], outputSizes[wDim],
-      getOutputTileSize(), getOutputTileSize());
+  auto hSizeAndOffset =
+      getScaledSizeAndOffset(builder, loc, sizes[1], offsets[1], std::nullopt,
+                             getOutputTileSize(), getOutputTileSize());
+  auto wSizeAndOffset =
+      getScaledSizeAndOffset(builder, loc, sizes[2], offsets[2], std::nullopt,
+                             getOutputTileSize(), getOutputTileSize());
 
   outputSizes[hDim] = hSizeAndOffset.first;
   outputSizes[wDim] = wSizeAndOffset.first;
@@ -2736,12 +2741,12 @@ LogicalResult WinogradOutputTransformOp::getResultTilePosition(
     if (failed(reifyResultShapes(builder, reifiedResultShapes))) {
       return failure();
     }
-    auto hSizeAndOffset = getScaledSizeAndOffset(
-        builder, loc, sizes[1], offsets[1], reifiedResultShapes[0][hDim],
-        getOutputTileSize(), getOutputTileSize());
-    auto wSizeAndOffset = getScaledSizeAndOffset(
-        builder, loc, sizes[2], offsets[2], reifiedResultShapes[0][wDim],
-        getOutputTileSize(), getOutputTileSize());
+    auto hSizeAndOffset =
+        getScaledSizeAndOffset(builder, loc, sizes[1], offsets[1], std::nullopt,
+                               getOutputTileSize(), getOutputTileSize());
+    auto wSizeAndOffset =
+        getScaledSizeAndOffset(builder, loc, sizes[2], offsets[2], std::nullopt,
+                               getOutputTileSize(), getOutputTileSize());
 
     resultSizes[hDim] = hSizeAndOffset.first;
     resultSizes[wDim] = wSizeAndOffset.first;
