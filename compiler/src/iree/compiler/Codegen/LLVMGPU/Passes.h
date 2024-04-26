@@ -55,7 +55,8 @@ void addGPUVectorizationPassPipeline(OpPassManager &funcPassManager);
 void addGPUWinogradVectorizePassPipeline(OpPassManager &funcPassManager);
 
 /// Lowering based on vector distribution patterns.
-void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager);
+void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
+                                        bool usePadToModelSharedMemcpy);
 
 /// Lowering reductions to warp reductions.
 void addGPUWarpReductionPassPipeline(OpPassManager &funcPassManager);
