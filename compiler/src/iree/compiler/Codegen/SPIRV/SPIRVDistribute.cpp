@@ -17,9 +17,11 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-spirv-distribute"
@@ -39,13 +41,26 @@ struct DistributeLoop final : public OpRewritePattern<scf::ForOp> {
     if (!numDimAttr)
       return failure();
 
+    auto funcOp = forOp->getParentOfType<FunctionOpInterface>();
+    if (!funcOp) {
+      return failure();
+    }
+    std::optional<SmallVector<int64_t>> maybeWorkgroupSize =
+        getWorkgroupSize(funcOp);
+    if (!maybeWorkgroupSize) {
+      return failure();
+    }
+    auto workgroupSize = maybeWorkgroupSize.value();
+
     Location loc = forOp.getLoc();
     auto indexType = rewriter.getIndexType();
     const std::array<gpu::Dimension, 3> symDims = {
         gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z};
     gpu::Dimension symDim = symDims[numDimAttr.getInt()];
     auto idOp = rewriter.create<gpu::ThreadIdOp>(loc, indexType, symDim);
-    auto countOp = rewriter.create<gpu::BlockDimOp>(loc, indexType, symDim);
+    // auto countOp = rewriter.create<gpu::BlockDimOp>(loc, indexType, symDim);
+    auto countOp = rewriter.create<arith::ConstantIndexOp>(
+        loc, workgroupSize[numDimAttr.getInt()]);
 
     MLIRContext *context = getContext();
     AffineExpr sym0, sym1, sym2;
