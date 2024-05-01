@@ -30,12 +30,19 @@ static int64_t calculateSharedMemoryUsedInBytes(const GPUMMASchedule &schedule,
 }
 
 bool isValidSchedule(const GPUMatmulShapeType &problem,
-                     const GPUMMASchedule &schedule) {
-  bool isValidM = (problem.mSize % (schedule.mSize * schedule.mTileCount *
+                     const GPUMMASchedule &schedule,
+                     const bool mustBeAligned) {
+  auto alignedMSize = mustBeAligned ? problem.mSize
+      : llvm::divideCeil(problem.mSize, schedule.mSize) * schedule.mSize;
+  auto alignedNSize = mustBeAligned ? problem.nSize
+      : llvm::divideCeil(problem.nSize, schedule.nSize) * schedule.nSize;
+  auto alignedKSize = mustBeAligned ? problem.kSize
+      : llvm::divideCeil(problem.kSize, schedule.kSize) * schedule.kSize;
+  bool isValidM = (alignedMSize % (schedule.mSize * schedule.mTileCount *
                                     schedule.mWarpCount)) == 0;
-  bool isValidN = (problem.nSize % (schedule.nSize * schedule.nTileCount *
+  bool isValidN = (alignedNSize % (schedule.nSize * schedule.nTileCount *
                                     schedule.nWarpCount)) == 0;
-  bool isValidK = (problem.kSize % (schedule.kSize * schedule.kTileCount)) == 0;
+  bool isValidK = (alignedKSize % (schedule.kSize * schedule.kTileCount)) == 0;
   return isValidN && isValidM && isValidK;
 }
 
@@ -49,7 +56,7 @@ fitScheduleInSharedMemory(const GPUMatmulShapeType &problem,
   int64_t rhsBitwidth =
       intrinsics[schedule.index].bType.getIntOrFloatBitWidth();
 
-  while ((!isValidSchedule(problem, schedule) && mustBeAligned) ||
+  while (!isValidSchedule(problem, schedule, mustBeAligned) ||
          calculateSharedMemoryUsedInBytes(schedule, lhsBitwidth, rhsBitwidth) >
              sharedMemLimitInBytes) {
     LLVM_DEBUG({
@@ -122,8 +129,8 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
       continue; // Cannot use this intrinsic for misaligned cases
     }
 
-    int64_t mTotalTileCount = problem.mSize / intrinsic.mSize;
-    int64_t nTotalTileCount = problem.nSize / intrinsic.nSize;
+    int64_t mTotalTileCount = llvm::divideCeil(problem.mSize, intrinsic.mSize);
+    int64_t nTotalTileCount = llvm::divideCeil(problem.nSize, intrinsic.nSize);
 
     int64_t remainingWarps = seeds.bestSubgroupCountPerWorkgroup;
     int64_t remainingTiles = seeds.bestMNTileCountPerSubgroup;
@@ -179,7 +186,7 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
       mTileCount = mGCD.getSExtValue();
     }
 
-    const uint64_t kTotalTileCount = problem.kSize / intrinsic.kSize;
+    const uint64_t kTotalTileCount = llvm::divideCeil(problem.kSize, intrinsic.kSize);
     APInt kGCD = GreatestCommonDivisor(
         APInt(64, kTotalTileCount), APInt(64, seeds.bestKTileCountPerSubgroup));
     int64_t kTileCount = kGCD.getSExtValue();
