@@ -14,6 +14,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Transform/Transforms/TransformInterpreterUtils.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/AffineExpr.h"
@@ -60,6 +62,9 @@ static bool hasValidStridesAndDilations(Operation *op) {
 }
 
 static bool isValidConv2d(Operation *op, bool &isNchw) {
+  if (!op->hasAttr("winograd_conv")) {
+    return false;
+  }
   isNchw = isa<linalg::Conv2DNchwFchwOp>(op);
   const bool isNhwc = isa<linalg::Conv2DNhwcHwcfOp>(op);
   if (!(isNchw || isNhwc)) {
@@ -335,14 +340,96 @@ public:
   }
 };
 
+enum StrategyRunResult {
+  Success = 0,
+  NotFound = 1,
+  Failed = 2,
+};
+
+static StrategyRunResult
+runTransformAnnotationStrategy(Operation *payloadRoot, StringRef entryPointName,
+                               ModuleOp &transformLibrary) {
+  /// If we have a symbol, verify the existence of the symbol within the
+  /// transform library.
+  Operation *entryPoint = transform::detail::findTransformEntryPoint(
+      payloadRoot, transformLibrary, entryPointName);
+  if (!entryPoint) {
+    return StrategyRunResult::NotFound;
+  }
+
+  transform::TransformOptions options;
+  if (failed(transform::applyTransformNamedSequence(
+          payloadRoot, entryPoint, transformLibrary,
+          options.enableExpensiveChecks(true)))) {
+    return StrategyRunResult::Failed;
+  }
+  return StrategyRunResult::Success;
+}
+
 struct ConvertConv2DToWinogradPass
     : ConvertConv2DToWinogradBase<ConvertConv2DToWinogradPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
-        .insert<linalg::LinalgDialect, IREE::LinalgExt::IREELinalgExtDialect>();
+        .insert<linalg::LinalgDialect, IREE::LinalgExt::IREELinalgExtDialect,
+                transform::TransformDialect>();
   }
   void runOnOperation() override {
     MLIRContext *context = &getContext();
+    auto funcOp = getOperation();
+
+    SmallVector<StringRef, 2> parts;
+    llvm::SplitString(llvm::StringRef(tdLibraryPath), parts, "@");
+    if (parts.size() > 2) {
+      funcOp.emitError() << "Invalid transform library path and sequence name "
+                         << tdLibraryPath;
+      return signalPassFailure();
+    }
+    bool hasTransformLibrary = !parts.empty();
+
+    std::string libraryFileName;
+    if (hasTransformLibrary) {
+      if (parts[0].empty()) {
+        funcOp.emitError() << "Cannot specify an empty library path";
+        return signalPassFailure();
+      }
+      libraryFileName = parts[0];
+    }
+
+    std::string entrySequenceName;
+    // Check if the user specified a custom entry point name.
+    if (parts.size() == 2) {
+      if (parts[1].empty()) {
+        funcOp.emitError() << "Cannot specify an empty sequence name";
+        return signalPassFailure();
+      }
+      entrySequenceName = parts[1];
+    } else {
+      entrySequenceName = "__annotate_winograd_convs";
+    }
+
+    std::optional<ModuleOp> transformLibrary = std::nullopt;
+    if (hasTransformLibrary) {
+      OwningOpRef<ModuleOp> mergedParsedLibraries;
+      if (failed(transform::detail::assembleTransformLibraryFromPaths(
+              context, SmallVector<std::string>{libraryFileName},
+              mergedParsedLibraries))) {
+        return;
+      }
+      transformLibrary = *std::move(mergedParsedLibraries);
+
+      auto runResult = runTransformAnnotationStrategy(funcOp, entrySequenceName,
+                                                      *transformLibrary);
+      if (runResult == StrategyRunResult::NotFound) {
+        funcOp.emitError() << "transform annotation strategy `"
+                           << entrySequenceName << " not found";
+        return signalPassFailure();
+      } else if (runResult == StrategyRunResult::Failed) {
+        funcOp.emitError() << "transform annotation strategy `"
+                           << entrySequenceName << "` failed to apply";
+        return signalPassFailure();
+      }
+    }
+
     RewritePatternSet patterns(&getContext());
     patterns.insert<ConvertConvToWinograd<linalg::Conv2DNhwcHwcfOp>,
                     ConvertConvToWinograd<linalg::Conv2DNchwFchwOp>>(context);
@@ -355,7 +442,8 @@ struct ConvertConv2DToWinogradPass
 
 } // namespace
 
-std::unique_ptr<Pass> createConvertConv2DToWinogradPass() {
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createConvertConv2DToWinogradPass() {
   return std::make_unique<ConvertConv2DToWinogradPass>();
 }
 
