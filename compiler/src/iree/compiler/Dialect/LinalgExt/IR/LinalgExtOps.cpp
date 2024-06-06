@@ -9,6 +9,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -22,6 +23,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
@@ -30,6 +32,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
@@ -626,6 +629,30 @@ areNotFullTiles(ArrayRef<int64_t> inputShape,
   return false;
 }
 
+static SmallVector<OpFoldResult> getMixedValues(MLIRContext *context,
+                                                ArrayRef<int64_t> staticValues,
+                                                OperandRange dynamicValues) {
+  SmallVector<OpFoldResult> mixedValues;
+  unsigned dynamicValIndex = 0;
+  OpBuilder b(context);
+  for (int64_t val : staticValues) {
+    if (!ShapedType::isDynamic(val)) {
+      mixedValues.push_back(b.getIndexAttr(val));
+    } else {
+      mixedValues.push_back(dynamicValues[dynamicValIndex++]);
+    }
+  }
+  return mixedValues;
+}
+
+static SmallVector<int64_t>
+getStaticValues(SmallVector<OpFoldResult> mixedValues) {
+  SmallVector<Value> dynamicTiles;
+  SmallVector<int64_t> staticTiles;
+  dispatchIndexOpFoldResults(mixedValues, dynamicTiles, staticTiles);
+  return staticTiles;
+}
+
 /// Utility function shared between Pack and UnPack to get the tile sizes as
 /// OpFoldResults.
 // TODO: interface or base class in .td
@@ -633,17 +660,8 @@ template <typename OpTy>
 static SmallVector<OpFoldResult> getMixedTiles(OpTy op) {
   static_assert(llvm::is_one_of<OpTy, PackOp, UnPackOp>::value,
                 "applies to only pack or unpack operations");
-  SmallVector<OpFoldResult> mixedInnerTiles;
-  unsigned dynamicValIndex = 0;
-  OpBuilder b(op.getContext());
-  for (int64_t tileSize : op.getStaticInnerTiles()) {
-    if (!ShapedType::isDynamic(tileSize)) {
-      mixedInnerTiles.push_back(b.getIndexAttr(tileSize));
-    } else {
-      mixedInnerTiles.push_back(op.getInnerTiles()[dynamicValIndex++]);
-    }
-  }
-  return mixedInnerTiles;
+  return LinalgExt::getMixedValues(op.getContext(), op.getStaticInnerTiles(),
+                                   op.getInnerTiles());
 }
 
 /// Return the tile sizes as `int64_t`. If a tile size is dynamic a sentinel
@@ -652,10 +670,7 @@ template <typename OpTy>
 static SmallVector<int64_t> getStaticTiles(OpTy op) {
   static_assert(llvm::is_one_of<OpTy, PackOp, UnPackOp>::value,
                 "applies to only pack or unpack operations");
-  SmallVector<Value> dynamicTiles;
-  SmallVector<int64_t> staticTiles;
-  dispatchIndexOpFoldResults(op.getMixedTiles(), dynamicTiles, staticTiles);
-  return staticTiles;
+  return getStaticValues(op.getMixedTiles());
 }
 
 /// Utility function shared between Pack and UnPack to get a map between
@@ -1427,6 +1442,140 @@ SmallVector<AffineMap> AttentionOp::getIndexingMapsArray() {
   return results;
 }
 
+//===----------------------------------------------------------------------===//
+// Im2colOp
+//===----------------------------------------------------------------------===//
+
+/// Return all static and dynamic strides as OpFoldResults.
+SmallVector<OpFoldResult> Im2colOp::getMixedStrides() {
+  return LinalgExt::getMixedValues(getContext(), getPureStaticStrides(),
+                                   getStrides());
+}
+
+/// Return the strides as `int64_t`, with `kDynamic for dynamic values.
+SmallVector<int64_t> Im2colOp::getStaticStrides() {
+  return getStaticValues(getMixedStrides());
+}
+
+/// Return all static and dynamic dilations as OpFoldResults.
+SmallVector<OpFoldResult> Im2colOp::getMixedDilations() {
+  return LinalgExt::getMixedValues(getContext(), getPureStaticDilations(),
+                                   getDilations());
+}
+
+/// Return the dilations as `int64_t`, with `kDynamic for dynamic values.
+SmallVector<int64_t> Im2colOp::getStaticDilations() {
+  return getStaticValues(getMixedDilations());
+}
+
+/// Return all static and dynamic kernel_size as OpFoldResults.
+SmallVector<OpFoldResult> Im2colOp::getMixedKernelSize() {
+  return LinalgExt::getMixedValues(getContext(), getPureStaticKernelSize(),
+                                   getKernelSize());
+}
+
+/// Return the kernel_size as `int64_t`, with `kDynamic for dynamic values.
+SmallVector<int64_t> Im2colOp::getStaticKernelSize() {
+  return getStaticValues(getMixedKernelSize());
+}
+
+/// Return all static and dynamic k_offset as OpFoldResults.
+SmallVector<OpFoldResult> Im2colOp::getMixedKOffset() {
+  return LinalgExt::getMixedValues(getContext(), getPureStaticKOffset(),
+                                   getKOffset());
+}
+
+/// Return the k_offset as `int64_t`, with `kDynamic for dynamic values.
+SmallVector<int64_t> Im2colOp::getStaticKOffset() {
+  return getStaticValues(getMixedKOffset());
+}
+
+/// Custom builder methods for im2col op.
+void Im2colOp::build(OpBuilder &builder, OperationState &state,
+                     ValueRange inputs, ValueRange outputs,
+                     ArrayRef<OpFoldResult> strides,
+                     ArrayRef<OpFoldResult> dilations,
+                     ArrayRef<OpFoldResult> kernelSize,
+                     ArrayRef<OpFoldResult> kOffset, ArrayRef<int64_t> batchPos,
+                     ArrayRef<int64_t> mPos, ArrayRef<int64_t> kPos) {
+  assert(strides.size() == kernelSize.size() &&
+         dilations.size() == kernelSize.size() &&
+         mPos.size() == kernelSize.size() &&
+         "strides, dilations, m_pos, and kernel expected to be the same rank");
+  SmallVector<int64_t> staticStrides, staticDilations, staticKernelSize,
+      staticKOffset;
+  SmallVector<Value> dynamicStrides, dynamicDilations, dynamicKernelSize,
+      dynamicKOffset;
+  dispatchIndexOpFoldResults(strides, dynamicStrides, staticStrides);
+  dispatchIndexOpFoldResults(dilations, dynamicDilations, staticDilations);
+  dispatchIndexOpFoldResults(kernelSize, dynamicKernelSize, staticKernelSize);
+  dispatchIndexOpFoldResults(kOffset, dynamicKOffset, staticKOffset);
+  SmallVector<Type> resultType;
+  auto outputType = outputs[0].getType();
+  if (isa<RankedTensorType>(outputType)) {
+    resultType.push_back(outputType);
+  }
+  build(builder, state, resultType, inputs, outputs, dynamicStrides,
+        builder.getDenseI64ArrayAttr(staticStrides), dynamicDilations,
+        builder.getDenseI64ArrayAttr(staticDilations), dynamicKernelSize,
+        builder.getDenseI64ArrayAttr(staticKernelSize), dynamicKOffset,
+        builder.getDenseI64ArrayAttr(staticKOffset),
+        builder.getDenseI64ArrayAttr(batchPos),
+        builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos));
+}
+
+LogicalResult Im2colOp::verify() {
+  // Operation *op = getOperation();
+  // if (getNumDpsInputs() != 1) {
+  //   return op->emitOpError("expected one input operand");
+  // }
+  // if (getNumDpsInits() != 1) {
+  //   return op->emitOpError("expected one output operand");
+  // }
+  // auto inputType = getInputType();
+  // unsigned inputRank = inputType.getRank();
+  // ArrayRef<int64_t> batchPos = getBatchPos();
+  // ArrayRef<int64_t> mPos = getMPos();
+  // ArrayRef<int64_t> kPos = getKPos();
+  // if (inputRank != batchPos.size() + mPos.size() + kPos.size()) {
+  //   return op->emitOpError("expected input rank to be the sum of batch, m,
+  //   and k ranks");
+  // }
+  // SmallVector<OpFoldResult> strides = getAsOpFoldResult(getStrides());
+  // SmallVector<OpFoldResult> dilations = getAsOpFoldResult(getDilations());
+  // SmallVector<OpFoldResult> kernelSize = getAsOpFoldResult(getKernelSize());
+  // SmallVector<OpFoldResult> imageSize = getAsOpFoldResult(getImageSize());
+  // SmallVector<OpFoldResult> channelSize =
+  // getAsOpFoldResult(getChannelSize()); int64_t kernelRank =
+  // kernelSize.size(); if (strides.size() != kernelRank) {
+  //   return op->emitOpError("expected strides rank to be equal to the kernel
+  //   rank");
+  // }
+  // if (dilations.size() != kernelRank) {
+  //   return op->emitOpError("expected dilations rank to be equal to the kernel
+  //   rank");
+  // }
+  // if (imageSize.size() != kernelRank) {
+  //   return op->emitOpError("expected image rank to be equal to the kernel
+  //   rank");
+  // }
+  // if (channelSize.empty()) {
+  //   return op->emitOpError("expected channel_size not empty");
+  // }
+  return success();
+}
+
+LogicalResult Im2colOp::fold(FoldAdaptor, SmallVectorImpl<OpFoldResult> &) {
+  return memref::foldMemRefCast(*this);
+}
+
+LogicalResult
+Im2colOp::reifyResultShapes(OpBuilder &b,
+                            ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
+  return cast<LinalgExtOp>(getOperation())
+      .reifyResultShapes(b, reifiedReturnShapes);
+}
+
 #define DEFINE_OP_GET_EFFECTS(OP_NAME)                                         \
   void OP_NAME::getEffects(                                                    \
       SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>      \
@@ -1446,6 +1595,7 @@ DEFINE_OP_GET_EFFECTS(WinogradInputTransformOp)
 DEFINE_OP_GET_EFFECTS(WinogradFilterTransformOp)
 DEFINE_OP_GET_EFFECTS(WinogradOutputTransformOp)
 DEFINE_OP_GET_EFFECTS(AttentionOp)
+DEFINE_OP_GET_EFFECTS(Im2colOp)
 
 } // namespace mlir::iree_compiler::IREE::LinalgExt
 

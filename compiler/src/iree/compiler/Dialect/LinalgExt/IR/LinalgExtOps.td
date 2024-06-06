@@ -678,6 +678,105 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Im2col
+//===----------------------------------------------------------------------===//
+
+def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+    [DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
+     DeclareOpInterfaceMethods<TilingInterface,
+      ["getIterationDomain",
+       "getLoopIteratorTypes",
+       "getResultTilePosition",
+       "getTiledImplementation",
+       "generateResultTileValue"]>]> {
+  let summary = "Attention operator";
+  let description = [{
+    Im2col op for convolutions.
+  }];
+
+  let arguments = (ins Variadic<AnyShaped>:$inputs,
+                       Variadic<AnyShaped>:$outputs,
+                       Variadic<Index>:$strides,
+                       DenseI64ArrayAttr:$pure_static_strides,
+                       Variadic<Index>:$dilations,
+                       DenseI64ArrayAttr:$pure_static_dilations,
+                       Variadic<Index>:$kernel_size,
+                       DenseI64ArrayAttr:$pure_static_kernel_size,
+                       Variadic<Index>:$k_offset,
+                       DenseI64ArrayAttr:$pure_static_k_offset,
+                       DenseI64ArrayAttr:$batch_pos,
+                       DenseI64ArrayAttr:$m_pos,
+                       DenseI64ArrayAttr:$k_pos);
+
+  let results = (outs Variadic<AnyShaped>:$results);
+  let hasFolder = 1;
+  let assemblyFormat = [{
+    attr-dict
+    `strides` `=`
+    custom<DynamicIndexList>($strides, $pure_static_strides)
+    `dilations` `=`
+    custom<DynamicIndexList>($dilations, $pure_static_dilations)
+    `kernel_size` `=`
+    custom<DynamicIndexList>($kernel_size, $pure_static_kernel_size)
+    `k_offset` `=`
+    custom<DynamicIndexList>($k_offset, $pure_static_k_offset)
+    `batch_pos` `=` $batch_pos
+    `m_pos` `=` $m_pos
+    `k_pos` `=` $k_pos
+    `ins` `(` $inputs `:` type($inputs) `)`
+    `outs` `(` $outputs `:` type($outputs) `)`
+    (`->` type($results)^)?
+  }];
+
+  let builders = [
+    OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs,
+      "ArrayRef<OpFoldResult>":$strides,
+      "ArrayRef<OpFoldResult>":$dilations,
+      "ArrayRef<OpFoldResult>":$kernel_size,
+      "ArrayRef<OpFoldResult>":$k_offset,
+      "ArrayRef<int64_t>":$batch_dimensions,
+      "ArrayRef<int64_t>":$m_dimensions,
+      "ArrayRef<int64_t>":$k_dimensions)>
+  ];
+
+  let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+    Value getInput() {
+      return getDpsInputOperand(0)->get();
+    }
+    Value getOutput() {
+      return getDpsInitOperand(0)->get();
+    }
+    ShapedType getInputType() {
+      return cast<ShapedType>(getInput().getType());
+    }
+    ShapedType getOutputType() {
+      return cast<ShapedType>(getOutput().getType());
+    }
+    int64_t getInputRank() {
+      return getInputType().getRank();
+    }
+    int64_t getOutputRank() {
+      return getOutputType().getRank();
+    }
+    // Return op metadata.
+    SmallVector<OpFoldResult> getMixedStrides();
+    SmallVector<int64_t> getStaticStrides();
+    SmallVector<OpFoldResult> getMixedDilations();
+    SmallVector<int64_t> getStaticDilations();
+    SmallVector<OpFoldResult> getMixedKernelSize();
+    SmallVector<int64_t> getStaticKernelSize();
+    SmallVector<OpFoldResult> getMixedKOffset();
+    SmallVector<int64_t> getStaticKOffset();
+
+    // Method to implement for specifying output range for
+    // DestinationStyleOpInterface
+    MutableOperandRange getDpsInitsMutable() {
+      return getOutputsMutable();
+    }
+  }];
+}
+
 } // OpGroupNonStructuredOps
 
 //===----------------------------------------------------------------------===//

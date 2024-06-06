@@ -29,6 +29,7 @@ iree_cc_library(
     "ConvertConv2DToWinograd.cpp"
     "ConvertToLoops.cpp"
     "DecomposeAttention.cpp"
+    "DecomposeIm2col.cpp"
     "DecomposeWinogradPass.cpp"
     "PadContractionToBlockSize.cpp"
     "PassDetail.h"

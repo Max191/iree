@@ -8,15 +8,23 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/OpDefinition.h"
 
 namespace mlir::iree_compiler::IREE::LinalgExt {
 
@@ -1234,6 +1242,146 @@ LogicalResult UnPackOp::generateScalarImplementation(OpBuilder &builder,
 
 SmallVector<Range> UnPackOp::getIterationDomain(OpBuilder &builder) {
   return LinalgExt::getIterationDomain(*this, builder);
+}
+
+//===----------------------------------------------------------------------===//
+// Im2colOp
+//===----------------------------------------------------------------------===//
+
+SmallVector<Range> Im2colOp::getIterationDomain(OpBuilder &builder) {
+  Location loc = getLoc();
+  Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
+  Value dest = getOutput();
+  SmallVector<Range> loopBounds(getOutputRank());
+  for (int dim = 0; dim < getOutputRank(); ++dim) {
+    loopBounds[dim].offset = zero;
+    loopBounds[dim].size = getDimValue(builder, loc, dest, dim);
+    loopBounds[dim].stride = one;
+  }
+  return loopBounds;
+}
+
+SmallVector<utils::IteratorType> Im2colOp::getLoopIteratorTypes() {
+  SmallVector<utils::IteratorType> iteratorTypes(getOutputRank(),
+                                                 utils::IteratorType::parallel);
+  return iteratorTypes;
+}
+
+FailureOr<TilingResult>
+Im2colOp::getTiledImplementation(OpBuilder &builder,
+                                 ArrayRef<OpFoldResult> offsets,
+                                 ArrayRef<OpFoldResult> sizes) {
+  Location loc = getLoc();
+  auto one = builder.getIndexAttr(1);
+  auto zero = builder.getIndexAttr(0);
+
+  ReifiedRankedShapedTypeDims reifiedInputShapes;
+  if (failed(getStaticOrReifiedInputDims(builder, loc, getInput(),
+                                         reifiedInputShapes))) {
+    return failure();
+  }
+  SmallVector<OpFoldResult> inputOffsets(getInputRank(), zero);
+  SmallVector<OpFoldResult> inputSizes(reifiedInputShapes[0]);
+
+  // Set batch offsets and sizes for input
+  for (auto [idx, dim] : llvm::enumerate(getBatchPos())) {
+    inputOffsets[dim] = offsets[idx];
+    inputSizes[dim] = sizes[idx];
+  }
+
+  // The mOffset is a linearized offset in the image dimensions, delinearizing
+  // the index gives the offset for the input.
+  SmallVector<OpFoldResult> mShape;
+  for (auto [idx, dim] : llvm::enumerate(getMPos())) {
+    OpFoldResult stride = getMixedStrides()[idx];
+    OpFoldResult dilation = getMixedDilations()[idx];
+    OpFoldResult kernelSize = getMixedKernelSize()[idx];
+    AffineExpr x, k, s, d;
+    bindDims(getContext(), x, k, s, d);
+    AffineExpr mapExpr = (x - (k - 1) * d).ceilDiv(s);
+    auto map = AffineMap::get(4, 0, {mapExpr}, getContext());
+    OpFoldResult size = affine::makeComposedFoldedAffineApply(
+        builder, loc, map, {inputSizes[dim], kernelSize, dilation, stride});
+    mShape.push_back(size);
+  }
+  OpFoldResult mOffset = offsets[offsets.size() - 2];
+
+  auto delinInds = affine::delinearizeIndex(
+      builder, loc, getValueOrCreateConstantIndexOp(builder, loc, mOffset),
+      getValueOrCreateConstantIndexOp(builder, loc, mShape));
+  if (failed(delinInds)) {
+    return failure();
+  }
+  // builder.create<affine::AffineDelinearizeIndexOp>(loc,
+  // getValueOrCreateConstantIndexOp(builder, loc, mOffset), mShape);
+  SmallVector<Value> mImageOffsets = delinInds.value();
+
+  for (auto [idx, offset] : llvm::enumerate(mImageOffsets)) {
+    inputOffsets[getMPos()[idx]] = offset;
+  }
+
+  auto outputTileSize = sizes[sizes.size() - 2];
+  for (auto [idx, dim] : llvm::enumerate(llvm::reverse(getMPos()))) {
+    OpFoldResult stride = getMixedStrides()[idx];
+    OpFoldResult dilation = getMixedDilations()[idx];
+    OpFoldResult kernelSize = getMixedKernelSize()[idx];
+    OpFoldResult outputDimSize = mShape[idx];
+    AffineExpr tileSize, inSize, outSize, k, s, d;
+    bindDims(getContext(), tileSize, s, k, d, inSize);
+    auto minMap = AffineMap::get(
+        5, 0, {(tileSize - 1) * s + (k - 1) * d + 1, inSize}, getContext());
+    inputSizes[dim] = affine::makeComposedFoldedAffineMin(
+        builder, loc, minMap,
+        {outputTileSize, stride, kernelSize, dilation, inputSizes[dim]});
+    bindDims(getContext(), tileSize, outSize);
+    outputTileSize = affine::makeComposedFoldedAffineApply(
+        builder, loc, {tileSize.ceilDiv(outSize)},
+        {outputTileSize, outputDimSize});
+  }
+
+  SmallVector<OpFoldResult> inputStrides(getInputRank(), one);
+  Value inputSlice = getSlice(builder, loc, getInput(), inputOffsets,
+                              inputSizes, inputStrides);
+  SmallVector<OpFoldResult> outputStrides(getOutputRank(), one);
+  Value outputSlice =
+      getSlice(builder, loc, getOutput(), offsets, sizes, outputStrides);
+
+  SmallVector<Type, 4> resultTypes;
+  if (hasPureTensorSemantics()) {
+    resultTypes.push_back(outputSlice.getType());
+  }
+
+  OpFoldResult kTileOffset = offsets.back();
+  OpFoldResult kOpOffset = getMixedKOffset()[0];
+  AffineExpr d0, d1;
+  bindDims(getContext(), d0, d1);
+  auto map = AffineMap::get(2, 0, {d0 + d1}, getContext());
+  OpFoldResult kOffset = affine::makeComposedFoldedAffineApply(
+      builder, loc, map, {kTileOffset, kOpOffset});
+
+  Operation *tiledOp = builder.create<Im2colOp>(
+      loc, inputSlice, outputSlice, getMixedStrides(), getMixedDilations(),
+      getMixedKernelSize(), SmallVector<OpFoldResult>{kOffset}, getBatchPos(),
+      getMPos(), getKPos());
+
+  return TilingResult{{tiledOp}, SmallVector<Value>(tiledOp->getResults())};
+}
+
+FailureOr<TilingResult>
+Im2colOp::generateResultTileValue(OpBuilder &builder, unsigned resultNumber,
+                                  ArrayRef<OpFoldResult> offsets,
+                                  ArrayRef<OpFoldResult> sizes) {
+  return getTiledImplementation(builder, offsets, sizes);
+}
+
+LogicalResult Im2colOp::getResultTilePosition(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  resultOffsets = SmallVector<OpFoldResult>(offsets);
+  resultSizes = SmallVector<OpFoldResult>(sizes);
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

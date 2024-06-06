@@ -4,17 +4,20 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -120,10 +123,7 @@ public:
 
     auto loc = convOp.getLoc();
 
-    SmallVector<int64_t> colTensorShape = {n, oh, ow, fh, fw, ic};
-
-    Value colTensor = rewriter.create<tensor::EmptyOp>(
-        loc, colTensorShape, inputType.getElementType());
+    SmallVector<int64_t> colTensorShape = {n, oh * ow, fh * fw * ic};
 
     AffineExpr nDim, ohDim, owDim, khDim, kwDim, icDim;
     bindDims(getContext(), nDim, ohDim, owDim, khDim, kwDim, icDim);
@@ -142,46 +142,55 @@ public:
     auto reduction = utils::IteratorType::reduction;
     SmallVector<utils::IteratorType, 3> img2colIterators(nloops, parallel);
 
-    SmallVector<AffineMap> img2colIndexingMaps = {
-        AffineMap::get(nloops, 0, inputExprs, rewriter.getContext()),
-        AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
+    // SmallVector<AffineMap> img2colIndexingMaps = {
+    //     AffineMap::get(nloops, 0, inputExprs, rewriter.getContext()),
+    //     AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
 
-    auto img2ColTensor = rewriter.create<linalg::GenericOp>(
-        loc, colTensor.getType(),
-        /*inputs=*/input, /*outputs=*/colTensor, img2colIndexingMaps,
-        img2colIterators,
-        [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-          nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
-        });
+    // auto img2ColTensor = rewriter.create<linalg::GenericOp>(
+    //     loc, colTensor.getType(),
+    //     /*inputs=*/input, /*outputs=*/colTensor, img2colIndexingMaps,
+    //     img2colIterators,
+    //     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+    //       nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
+    //     });
 
-    SmallVector<ReassociationIndices> img2ColTensorReassocIndices;
     SmallVector<ReassociationIndices> outputReassocIndices;
-    RankedTensorType reshapedImg2ColTensorType, reshapedOutputType;
+    RankedTensorType reshapedOutputType;
     if (n == 1) {
-      img2ColTensorReassocIndices = {{0, 1, 2}, {3, 4, 5}};
       outputReassocIndices = {{0, 1, 2}, {3}};
-
-      reshapedImg2ColTensorType = RankedTensorType::get(
-          {oh * ow, fh * fw * ic}, inputType.getElementType());
       reshapedOutputType =
           RankedTensorType::get({oh * ow, oc}, outputType.getElementType());
     } else {
-      img2ColTensorReassocIndices = {{0}, {1, 2}, {3, 4, 5}};
       outputReassocIndices = {{0}, {1, 2}, {3}};
-
-      reshapedImg2ColTensorType = RankedTensorType::get(
-          {n, oh * ow, fh * fw * ic}, inputType.getElementType());
       reshapedOutputType =
           RankedTensorType::get({n, oh * ow, oc}, outputType.getElementType());
     }
 
+    Value colTensor = rewriter.create<tensor::EmptyOp>(
+        loc, colTensorShape, inputType.getElementType());
+    SmallVector<OpFoldResult> strides(
+        2, getAsIndexOpFoldResult(convOp->getContext(), 1));
+    SmallVector<OpFoldResult> dilations(
+        2, getAsIndexOpFoldResult(convOp->getContext(), 1));
+    SmallVector<OpFoldResult> kernelSize = {
+        getAsIndexOpFoldResult(convOp->getContext(), fh),
+        getAsIndexOpFoldResult(convOp->getContext(), fw)};
+    SmallVector<OpFoldResult> kOffset = {
+        getAsIndexOpFoldResult(convOp->getContext(), 0)};
+    SmallVector<int64_t> batchPos = {0};
+    SmallVector<int64_t> mPos = {1, 2};
+    SmallVector<int64_t> kPos = {3};
+    Value img2ColTensor =
+        rewriter
+            .create<IREE::LinalgExt::Im2colOp>(
+                loc, /*inputs=*/ValueRange{input},
+                /*outputs=*/ValueRange{colTensor}, strides, dilations,
+                kernelSize, kOffset, batchPos, mPos, kPos)
+            .getResult(0);
+
     SmallVector<ReassociationIndices> filterReassocIndices = {{0, 1, 2}, {3}};
     auto reshapedFilterType =
         RankedTensorType::get({fh * fw * ic, oc}, inputType.getElementType());
-
-    Value reshapedImg2ColTensor = rewriter.create<tensor::CollapseShapeOp>(
-        loc, reshapedImg2ColTensorType, img2ColTensor.getResult(0),
-        img2ColTensorReassocIndices);
 
     Value reshapedFilter = rewriter.create<tensor::CollapseShapeOp>(
         loc, reshapedFilterType, filter, filterReassocIndices);
@@ -193,7 +202,7 @@ public:
     if (n == 1) {
       auto matmulOp = rewriter.create<linalg::MatmulOp>(
           loc, reshapedOutputType,
-          ArrayRef<Value>{reshapedImg2ColTensor, reshapedFilter},
+          ArrayRef<Value>{img2ColTensor, reshapedFilter},
           ArrayRef<Value>{reshapedOutput});
       result = matmulOp.getResults().front();
     } else {
@@ -212,7 +221,7 @@ public:
       bool isInt = llvm::isa<IntegerType>(outputType.getElementType());
       auto genericOp = rewriter.create<linalg::GenericOp>(
           loc, reshapedOutputType,
-          /*inputs=*/ValueRange{reshapedImg2ColTensor, reshapedFilter},
+          /*inputs=*/ValueRange{img2ColTensor, reshapedFilter},
           /*outputs=*/ValueRange{reshapedOutput},
           ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap}, genericIterators,
           [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
