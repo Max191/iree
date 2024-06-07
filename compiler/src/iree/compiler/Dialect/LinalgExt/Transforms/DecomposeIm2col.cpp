@@ -132,11 +132,9 @@ struct DecomposeIm2col : public OpRewritePattern<Im2colOp> {
                                              outputType.getElementType());
     auto extract = rewriter.create<tensor::ExtractSliceOp>(
         nestedLoc, extractType, inputSlice, offsets, sizes, strides);
-    SmallVector<OpFoldResult> copySize = {kTileSize};
-    Value copyInit = rewriter.create<tensor::EmptyOp>(
-        nestedLoc, copySize, outputType.getElementType());
-    auto copiedSlice = rewriter.create<linalg::CopyOp>(
-        nestedLoc, extract.getResult(), copyInit);
+    // SmallVector<OpFoldResult> copySize = {kTileSize};
+    // Value copyDest = rewriter.create<tensor::EmptyOp>(
+    //     nestedLoc, copySize, outputType.getElementType());
     offsets = SmallVector<OpFoldResult>(
         im2colOp.getOutputRank(),
         getAsIndexOpFoldResult(rewriter.getContext(), 0));
@@ -150,6 +148,11 @@ struct DecomposeIm2col : public OpRewritePattern<Im2colOp> {
     for (auto [idx, iv] : llvm::enumerate(ivs)) {
       offsets[idx] = iv;
     }
+    Value copyDest = rewriter.create<tensor::ExtractSliceOp>(
+        nestedLoc, extractType, loopNest.loops.back().getRegionIterArg(0),
+        offsets, sizes, strides);
+    auto copiedSlice = rewriter.create<linalg::CopyOp>(
+        nestedLoc, extract.getResult(), copyDest);
     auto insert = rewriter.create<tensor::InsertSliceOp>(
         nestedLoc, copiedSlice.getResult(0),
         loopNest.loops.back().getRegionIterArg(0), offsets, sizes, strides);

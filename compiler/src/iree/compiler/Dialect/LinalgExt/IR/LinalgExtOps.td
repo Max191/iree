@@ -769,6 +769,9 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     SmallVector<OpFoldResult> getMixedKOffset();
     SmallVector<int64_t> getStaticKOffset();
 
+    // Set op metadata.
+    void setMixedKOffset(SmallVector<OpFoldResult> kOffset);
+
     // Method to implement for specifying output range for
     // DestinationStyleOpInterface
     MutableOperandRange getDpsInitsMutable() {

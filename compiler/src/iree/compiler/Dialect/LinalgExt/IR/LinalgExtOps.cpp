@@ -1490,6 +1490,14 @@ SmallVector<int64_t> Im2colOp::getStaticKOffset() {
   return getStaticValues(getMixedKOffset());
 }
 
+void Im2colOp::setMixedKOffset(SmallVector<OpFoldResult> kOffset) {
+  SmallVector<int64_t> staticKOffset;
+  SmallVector<Value> dynamicKOffset;
+  dispatchIndexOpFoldResults(kOffset, dynamicKOffset, staticKOffset);
+  setPureStaticKOffset(staticKOffset);
+  getKOffsetMutable().assign(dynamicKOffset);
+}
+
 /// Custom builder methods for im2col op.
 void Im2colOp::build(OpBuilder &builder, OperationState &state,
                      ValueRange inputs, ValueRange outputs,

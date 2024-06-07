@@ -1360,10 +1360,12 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
   OpFoldResult kOffset = affine::makeComposedFoldedAffineApply(
       builder, loc, map, {kTileOffset, kOpOffset});
 
-  Operation *tiledOp = builder.create<Im2colOp>(
-      loc, inputSlice, outputSlice, getMixedStrides(), getMixedDilations(),
-      getMixedKernelSize(), SmallVector<OpFoldResult>{kOffset}, getBatchPos(),
-      getMPos(), getKPos());
+  SmallVector<Value> operands = {inputSlice, outputSlice};
+  operands.append(getOperation()->getOperands().begin() + 2,
+                  getOperation()->getOperands().end());
+  Im2colOp tiledOp = mlir::clone(builder, *this,
+      TypeRange{outputSlice.getType()}, operands);
+  tiledOp.setMixedKOffset({kOffset});
 
   return TilingResult{{tiledOp}, SmallVector<Value>(tiledOp->getResults())};
 }
