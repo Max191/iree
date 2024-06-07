@@ -242,6 +242,7 @@ static void tileAndBufferize(OpPassManager &funcPassManager) {
 static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
                                       bool earlySubsetTransferFolding = true) {
   funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeIm2colPass());
   GenericVectorizationPassOptions options;
   options.vectorizePadding = true;
   options.vectorizeGatherAccesses = true;
