@@ -336,7 +336,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager) {
 
   // Normalize loop bounds for later lowerings.
   funcPassManager.addPass(iree_compiler::createNormalizeLoopBoundsPass(
-      /*normalizeFor=*/false, /*normalizeForall=*/true));
+      /*normalizeFor=*/true, /*normalizeForall=*/true));
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
   funcPassManager.addPass(createLoopInvariantCodeMotionPass());
@@ -1049,6 +1049,8 @@ static void buildLLVMGPUCodegenConfigurationPassPipelineImpl(
     OpPassManager &modulePassManager) {
   {
     FunctionLikeNest funcPassManager(modulePassManager);
+    funcPassManager.addPass(IREE::LinalgExt::createConvertConv2DToIm2ColOpPass);
+    funcPassManager.addPass(createCleanupBufferAllocViewPass);
     funcPassManager.addPass(createGPUGeneralizeNamedOpsPass);
     addCommonTargetExecutablePreprocessingPasses(funcPassManager);
   }
