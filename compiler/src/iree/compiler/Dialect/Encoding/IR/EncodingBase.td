@@ -105,7 +105,7 @@ def EncodingAttr :
 
     /// Given the dim position of the encoding `user_indexing_maps`, returns the
     /// matching index of the given encoding's tensor.
-    unsigned mapDimToOperandIndex(int64_t dimPos);
+    std::optional<unsigned> mapDimToOperandIndex(int64_t dimPos);
 
     /// Returns an integer array with values in `round_dims_to`.
     ArrayRef<int64_t> getRoundDimsToArray();

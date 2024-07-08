@@ -52,8 +52,8 @@ static RankedTensorType transposeIfNarrowNResult(RankedTensorType tensorType) {
     int m = cDims->m[0];
     int n = cDims->n[0];
     std::swap(permIndices[m], permIndices[n]);
-    int mDim = encoding.mapDimToOperandIndex(m);
-    int nDim = encoding.mapDimToOperandIndex(n);
+    int mDim = encoding.mapDimToOperandIndex(m).value();
+    int nDim = encoding.mapDimToOperandIndex(n).value();
     std::swap(newShape[mDim], newShape[nDim]);
     std::swap(newOriginalShape[mDim], newOriginalShape[nDim]);
   }
@@ -111,9 +111,7 @@ getMaterializedType(RankedTensorType tensorType,
     return dropEncoding(tensorType);
   }
   return cast<RankedTensorType>(tensor::PackOp::inferPackedType(
-      getOriginalTypeWithEncoding(maybeTransposedTensorType)
-          .clone(tensorType.getElementType()),
-      materializeEncodingInfo->innerTileSizes,
+      maybeTransposedTensorType, materializeEncodingInfo->innerTileSizes,
       materializeEncodingInfo->innerDimsPos,
       materializeEncodingInfo->outerDimsPerm));
 }
@@ -181,29 +179,34 @@ MaterializeEncodingInfo getEncodingInfoForMatmul(EncodingAttr encoding,
   assert(cDims->m.size() <= 1 && cDims->n.size() <= 1 && cDims->k.size() <= 1 &&
          cDims->batch.size() <= 1 &&
          "Expected at most one M, N, K, and Batch dimension");
-  if (!cDims->batch.empty()) {
-    encodingInfo.outerDimsPerm.push_back(
-        encoding.mapDimToOperandIndex(cDims->batch[0]));
+  std::optional<int64_t> batchIdx =
+      cDims->batch.empty() ? std::nullopt
+                           : encoding.mapDimToOperandIndex(cDims->batch[0]);
+  if (batchIdx) {
+    encodingInfo.outerDimsPerm.push_back(batchIdx.value());
   }
-  if (index != IREE::Encoding::MATMUL_RHS && !cDims->m.empty()) {
-    encodingInfo.outerDimsPerm.push_back(
-        encoding.mapDimToOperandIndex(cDims->m[0]));
-    encodingInfo.innerDimsPos.push_back(
-        encoding.mapDimToOperandIndex(cDims->m[0]));
+  std::optional<int64_t> mIdx =
+      cDims->m.empty() ? std::nullopt
+                       : encoding.mapDimToOperandIndex(cDims->m[0]);
+  if (mIdx && index != IREE::Encoding::MATMUL_RHS) {
+    encodingInfo.outerDimsPerm.push_back(mIdx.value());
+    encodingInfo.innerDimsPos.push_back(mIdx.value());
     encodingInfo.innerTileSizes.push_back(tileMxNxK.M);
   }
-  if (index != IREE::Encoding::MATMUL_LHS && !cDims->n.empty()) {
-    encodingInfo.outerDimsPerm.push_back(
-        encoding.mapDimToOperandIndex(cDims->n[0]));
-    encodingInfo.innerDimsPos.push_back(
-        encoding.mapDimToOperandIndex(cDims->n[0]));
+  std::optional<int64_t> nIdx =
+      cDims->n.empty() ? std::nullopt
+                       : encoding.mapDimToOperandIndex(cDims->n[0]);
+  if (nIdx && index != IREE::Encoding::MATMUL_LHS) {
+    encodingInfo.outerDimsPerm.push_back(nIdx.value());
+    encodingInfo.innerDimsPos.push_back(nIdx.value());
     encodingInfo.innerTileSizes.push_back(tileMxNxK.N);
   }
-  if (index != IREE::Encoding::MATMUL_RESULT) {
-    encodingInfo.outerDimsPerm.push_back(
-        encoding.mapDimToOperandIndex(cDims->k[0]));
-    encodingInfo.innerDimsPos.push_back(
-        encoding.mapDimToOperandIndex(cDims->k[0]));
+  std::optional<int64_t> kIdx =
+      cDims->k.empty() ? std::nullopt
+                       : encoding.mapDimToOperandIndex(cDims->k[0]);
+  if (kIdx && index != IREE::Encoding::MATMUL_RESULT) {
+    encodingInfo.outerDimsPerm.push_back(kIdx.value());
+    encodingInfo.innerDimsPos.push_back(kIdx.value());
     encodingInfo.innerTileSizes.push_back(tileMxNxK.K);
   }
   return encodingInfo;
