@@ -120,35 +120,6 @@ public:
 
     SmallVector<int64_t> colTensorShape = {n, oh * ow, fh * fw * ic};
 
-    AffineExpr nDim, ohDim, owDim, khDim, kwDim, icDim;
-    bindDims(getContext(), nDim, ohDim, owDim, khDim, kwDim, icDim);
-
-    auto shSym = rewriter.getAffineConstantExpr(
-        convOp.getStrides().getValues<int64_t>()[0]);
-    auto swSym = rewriter.getAffineConstantExpr(
-        convOp.getStrides().getValues<int64_t>()[1]);
-
-    SmallVector<AffineExpr> inputExprs = {nDim, ohDim * shSym + khDim,
-                                          owDim * swSym + kwDim, icDim};
-
-    auto nloops = colTensorShape.size();
-
-    auto parallel = utils::IteratorType::parallel;
-    auto reduction = utils::IteratorType::reduction;
-    SmallVector<utils::IteratorType, 3> img2colIterators(nloops, parallel);
-
-    // SmallVector<AffineMap> img2colIndexingMaps = {
-    //     AffineMap::get(nloops, 0, inputExprs, rewriter.getContext()),
-    //     AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
-
-    // auto img2ColTensor = rewriter.create<linalg::GenericOp>(
-    //     loc, colTensor.getType(),
-    //     /*inputs=*/input, /*outputs=*/colTensor, img2colIndexingMaps,
-    //     img2colIterators,
-    //     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-    //       nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
-    //     });
-
     SmallVector<ReassociationIndices> outputReassocIndices;
     RankedTensorType reshapedOutputType;
     if (n == 1) {
@@ -163,8 +134,8 @@ public:
 
     Value colTensor = rewriter.create<tensor::EmptyOp>(
         loc, colTensorShape, inputType.getElementType());
-    SmallVector<int64_t> strides(2, 1);
-    SmallVector<int64_t> dilations(2, 1);
+    SmallVector<int64_t> strides(convOp.getStrides().getValues<int64_t>());
+    SmallVector<int64_t> dilations(convOp.getDilations().getValues<int64_t>());
     SmallVector<OpFoldResult> kernelSize = {
         getAsIndexOpFoldResult(convOp->getContext(), fh),
         getAsIndexOpFoldResult(convOp->getContext(), fw)};
@@ -210,6 +181,8 @@ public:
       auto lhsMap = AffineMap::get(4, 0, {bDim, mDim, kDim}, getContext());
       auto rhsMap = AffineMap::get(4, 0, {kDim, nDim}, getContext());
       auto resultMap = AffineMap::get(4, 0, {bDim, mDim, nDim}, getContext());
+      auto parallel = utils::IteratorType::parallel;
+      auto reduction = utils::IteratorType::reduction;
       SmallVector<utils::IteratorType> genericIterators = {parallel, parallel,
                                                            parallel, reduction};
       bool isInt = llvm::isa<IntegerType>(outputType.getElementType());
@@ -238,169 +211,6 @@ public:
 
     rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
-    return success();
-  }
-};
-
-// Similar to the conv pattern above except there is no reduction among the
-// input channels so each convolution can be a matrix-vector product and
-// by transposing both input filter so channels are outer most the computation
-// is a batched matrix-vector product.
-class ConvertDepthwiseConv2DNhwcHwc final
-    : public OpRewritePattern<linalg::DepthwiseConv2DNhwcHwcOp> {
-public:
-  using OpRewritePattern<linalg::DepthwiseConv2DNhwcHwcOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(linalg::DepthwiseConv2DNhwcHwcOp convOp,
-                                PatternRewriter &rewriter) const override {
-    auto inputType =
-        llvm::cast<RankedTensorType>(convOp.getInputs()[0].getType());
-    auto filterType =
-        llvm::cast<RankedTensorType>(convOp.getInputs()[1].getType());
-    auto outputType =
-        llvm::cast<RankedTensorType>(convOp.getOutputs()[0].getType());
-
-    if (!filterType.hasStaticShape() || !inputType.hasStaticShape()) {
-      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
-        diag << "[unimplemented] "
-             << "expected 'filterType' and 'inputType' to have static shapes.";
-      });
-    }
-
-    // TODO: Support dilation.
-    if (!hasAllOneValues(convOp.getDilations()))
-      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
-        diag << "[unimplemented] "
-             << "expected no dilations (expected dilations to all be one).";
-      });
-
-    auto loc = convOp.getLoc();
-
-    auto transposeOperand = [&](Value operand, ArrayRef<int64_t> indices) {
-      auto operandTensorType = llvm::cast<RankedTensorType>(operand.getType());
-      auto nloops = indices.size();
-      auto inputShape = operandTensorType.getShape();
-
-      SmallVector<AffineExpr> exprs =
-          llvm::map_to_vector(indices, [&](int64_t index) -> AffineExpr {
-            return rewriter.getAffineDimExpr(index);
-          });
-
-      SmallVector<int64_t> targetShape = llvm::map_to_vector(
-          indices, [&](int64_t index) -> int64_t { return inputShape[index]; });
-
-      Value outputTensor = rewriter.create<tensor::EmptyOp>(
-          loc, targetShape, operandTensorType.getElementType());
-
-      SmallVector<utils::IteratorType> loopAttributeTypes(
-          nloops, utils::IteratorType::parallel);
-
-      SmallVector<AffineMap> indexingMaps = {
-          inversePermutation(
-              AffineMap::get(nloops, 0, exprs, rewriter.getContext())),
-          AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
-
-      auto transposedOp = rewriter.create<linalg::GenericOp>(
-          loc, outputTensor.getType(),
-          /*inputs=*/operand, /*outputs=*/outputTensor, indexingMaps,
-          loopAttributeTypes,
-          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-            nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
-          });
-
-      return transposedOp.getResult(0);
-    };
-
-    Value input = convOp.getInputs()[0];
-    Value filter = convOp.getInputs()[1];
-    Value output = convOp.getOutputs()[0];
-
-    // Transpose input, filter so channels are outermost
-    auto inputT = transposeOperand(input, {0, 3, 1, 2});
-    auto filterT = transposeOperand(filter, {2, 0, 1});
-    auto filterTShape =
-        llvm::cast<RankedTensorType>(filterT.getType()).getShape();
-    auto outputShape = outputType.getShape();
-
-    const int n = outputShape[0];
-    const int oh = outputShape[1];
-    const int ow = outputShape[2];
-    const int c = outputShape[3];
-    const int fh = filterTShape[1];
-    const int fw = filterTShape[2];
-
-    SmallVector<int64_t> colTensorShape = {n, c, oh, ow, fh, fw};
-    Value transposedOutputTensor = transposeOperand(output, {0, 3, 1, 2});
-
-    AffineExpr nDim, cDim, ohDim, owDim, khDim, kwDim;
-    bindDims(getContext(), nDim, cDim, ohDim, owDim, khDim, kwDim);
-
-    auto shSym = rewriter.getAffineConstantExpr(
-        convOp.getStrides().getValues<int64_t>()[0]);
-    auto swSym = rewriter.getAffineConstantExpr(
-        convOp.getStrides().getValues<int64_t>()[1]);
-
-    SmallVector<AffineExpr> inputExprs = {nDim, cDim, ohDim * shSym + khDim,
-                                          owDim * swSym + kwDim};
-
-    auto nloops = colTensorShape.size();
-
-    SmallVector<utils::IteratorType> loopAttributeTypes(
-        nloops, utils::IteratorType::parallel);
-
-    SmallVector<AffineMap> indexingMaps = {
-        AffineMap::get(nloops, 0, inputExprs, rewriter.getContext()),
-        AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
-
-    Value colTensor = rewriter.create<tensor::EmptyOp>(
-        loc, colTensorShape, inputType.getElementType());
-
-    auto img2ColTensor = rewriter.create<linalg::GenericOp>(
-        loc, colTensor.getType(),
-        /*inputs=*/inputT, /*outputs=*/colTensor, indexingMaps,
-        loopAttributeTypes,
-        [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-          nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
-        });
-
-    SmallVector<ReassociationIndices> img2ColTensorReassocIndices = {
-        {0, 1}, {2, 3}, {4, 5}};
-    SmallVector<ReassociationIndices> filterReassociationIndice = {{0}, {1, 2}};
-    SmallVector<ReassociationIndices> outputReassociationIndice = {{0, 1},
-                                                                   {2, 3}};
-
-    auto reshapedImg2ColTensorType = RankedTensorType::get(
-        {n * c, oh * ow, fh * fw}, inputType.getElementType());
-    auto reshapedFilterTensorType =
-        RankedTensorType::get({c, fh * fw}, filterType.getElementType());
-    auto reshapedOutputTensorType =
-        RankedTensorType::get({n * c, oh * ow}, outputType.getElementType());
-
-    Value reshapedImg2ColTensor = rewriter.create<tensor::CollapseShapeOp>(
-        loc, reshapedImg2ColTensorType, img2ColTensor.getResult(0),
-        img2ColTensorReassocIndices);
-    Value reshapedFilterTensor = rewriter.create<tensor::CollapseShapeOp>(
-        loc, reshapedFilterTensorType, filterT, filterReassociationIndice);
-    Value reshapedoutputTensor = rewriter.create<tensor::CollapseShapeOp>(
-        loc, reshapedOutputTensorType, transposedOutputTensor,
-        outputReassociationIndice);
-
-    auto batchMatVecResult = rewriter.create<linalg::BatchMatvecOp>(
-        loc, TypeRange{reshapedoutputTensor.getType()},
-        ValueRange{reshapedImg2ColTensor, reshapedFilterTensor},
-        ValueRange{reshapedoutputTensor});
-
-    SmallVector<ReassociationIndices> batchMatVecReassociationIndice = {{0, 1},
-                                                                        {2, 3}};
-
-    Value batchMatVecResultReshaped = rewriter.create<tensor::ExpandShapeOp>(
-        loc, transposedOutputTensor.getType(), batchMatVecResult.getResult(0),
-        batchMatVecReassociationIndice);
-
-    auto transposedResult =
-        transposeOperand(batchMatVecResultReshaped, {0, 2, 3, 1});
-
-    rewriter.replaceOp(convOp, ArrayRef<Value>{transposedResult});
     return success();
   }
 };
@@ -451,39 +261,28 @@ public:
 
     auto loc = convOp.getLoc();
 
-    SmallVector<int64_t> colTensorShape = {n, ic, fh, fw, oh, ow};
+    SmallVector<int64_t> colTensorShape = {n, oh * ow, ic * fh * fw};
 
     Value colTensor = rewriter.create<tensor::EmptyOp>(
         loc, colTensorShape, inputType.getElementType());
-
-    AffineExpr nDim, icDim, khDim, kwDim, ohDim, owDim;
-    bindDims(getContext(), nDim, icDim, khDim, kwDim, ohDim, owDim);
-
-    auto shSym = rewriter.getAffineConstantExpr(
-        convOp.getStrides().getValues<int64_t>()[0]);
-    auto swSym = rewriter.getAffineConstantExpr(
-        convOp.getStrides().getValues<int64_t>()[1]);
-
-    SmallVector<AffineExpr> inputExprs = {nDim, icDim, ohDim * shSym + khDim,
-                                          owDim * swSym + kwDim};
-
-    auto nloops = colTensorShape.size();
-
-    auto parallel = utils::IteratorType::parallel;
-    auto reduction = utils::IteratorType::reduction;
-    SmallVector<utils::IteratorType, 3> img2colIterators(nloops, parallel);
-
-    SmallVector<AffineMap> img2colIndexingMaps = {
-        AffineMap::get(nloops, 0, inputExprs, rewriter.getContext()),
-        AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
-
-    auto img2ColTensor = rewriter.create<linalg::GenericOp>(
-        loc, colTensor.getType(),
-        /*inputs=*/input, /*outputs=*/colTensor, img2colIndexingMaps,
-        img2colIterators,
-        [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-          nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
-        });
+    SmallVector<int64_t> strides(convOp.getStrides().getValues<int64_t>());
+    SmallVector<int64_t> dilations(convOp.getDilations().getValues<int64_t>());
+    SmallVector<OpFoldResult> kernelSize = {
+        getAsIndexOpFoldResult(convOp->getContext(), fh),
+        getAsIndexOpFoldResult(convOp->getContext(), fw)};
+    SmallVector<OpFoldResult> kOffset = {
+        getAsIndexOpFoldResult(convOp->getContext(), 0)};
+    SmallVector<OpFoldResult> mOffset = {
+        getAsIndexOpFoldResult(convOp->getContext(), 0)};
+    SmallVector<int64_t> batchPos = {0};
+    SmallVector<int64_t> mPos = {2, 3};
+    SmallVector<int64_t> kPos = {1};
+    Value img2ColTensor =
+        rewriter
+            .create<IREE::LinalgExt::Im2colOp>(
+                loc, input, /*output=*/colTensor, strides, dilations,
+                kernelSize, mOffset, kOffset, batchPos, mPos, kPos)
+            .getResult(0);
 
     SmallVector<ReassociationIndices> filterReassocIndices = {{0}, {1, 2, 3}};
     auto reshapedFilterType =
@@ -491,39 +290,26 @@ public:
     Value reshapedFilter = rewriter.create<tensor::CollapseShapeOp>(
         loc, reshapedFilterType, filter, filterReassocIndices);
 
-    SmallVector<ReassociationIndices> img2ColTensorReassocIndices;
     SmallVector<ReassociationIndices> outputReassocIndices;
-    RankedTensorType reshapedImg2ColTensorType, reshapedOutputType;
+    RankedTensorType reshapedOutputType;
     if (n == 1) {
-      img2ColTensorReassocIndices = {{0, 1, 2, 3}, {4, 5}};
       outputReassocIndices = {{0, 1}, {2, 3}};
-
-      reshapedImg2ColTensorType = RankedTensorType::get(
-          {fh * fw * ic, oh * ow}, inputType.getElementType());
       reshapedOutputType =
           RankedTensorType::get({oc, oh * ow}, outputType.getElementType());
     } else {
-      img2ColTensorReassocIndices = {{0}, {1, 2, 3}, {4, 5}};
       outputReassocIndices = {{0}, {1}, {2, 3}};
-
-      reshapedImg2ColTensorType = RankedTensorType::get(
-          {n, fh * fw * ic, oh * ow}, inputType.getElementType());
       reshapedOutputType =
           RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
     }
-
-    Value reshapedImg2ColTensor = rewriter.create<tensor::CollapseShapeOp>(
-        loc, reshapedImg2ColTensorType, img2ColTensor.getResult(0),
-        img2ColTensorReassocIndices);
 
     Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
         loc, reshapedOutputType, output, outputReassocIndices);
 
     Value result;
     if (n == 1) {
-      auto matmulOp = rewriter.create<linalg::MatmulOp>(
+      auto matmulOp = rewriter.create<linalg::MatmulTransposeBOp>(
           loc, reshapedOutputType,
-          ArrayRef<Value>{reshapedFilter, reshapedImg2ColTensor},
+          ArrayRef<Value>{reshapedFilter, img2ColTensor},
           ArrayRef<Value>{reshapedOutput});
       result = matmulOp.getResults().front();
     } else {
@@ -535,19 +321,28 @@ public:
       AffineExpr bDim, mDim, nDim, kDim;
       bindDims(getContext(), bDim, mDim, nDim, kDim);
       auto lhsMap = AffineMap::get(4, 0, {mDim, kDim}, getContext());
-      auto rhsMap = AffineMap::get(4, 0, {bDim, kDim, nDim}, getContext());
+      auto rhsMap = AffineMap::get(4, 0, {bDim, nDim, kDim}, getContext());
       auto resultMap = AffineMap::get(4, 0, {bDim, mDim, nDim}, getContext());
+      auto parallel = utils::IteratorType::parallel;
+      auto reduction = utils::IteratorType::reduction;
       SmallVector<utils::IteratorType> genericIterators = {parallel, parallel,
                                                            parallel, reduction};
       bool isInt = llvm::isa<IntegerType>(outputType.getElementType());
       auto genericOp = rewriter.create<linalg::GenericOp>(
           loc, reshapedOutputType,
-          /*inputs=*/ValueRange{reshapedFilter, reshapedImg2ColTensor},
+          /*inputs=*/ValueRange{reshapedFilter, img2ColTensor},
           /*outputs=*/ValueRange{reshapedOutput},
           ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap}, genericIterators,
           [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-            Value mul = createMul(loc, args[0], args[1], isInt, nestedBuilder);
-            Value add = createAdd(loc, mul, args[2], isInt, nestedBuilder);
+            Value lhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[0],
+                                             args[2].getType(),
+                                             /*isUnsignedCast=*/false);
+            Value rhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[1],
+                                             args[2].getType(),
+                                             /*isUnsignedCast=*/false);
+            Value mul = createMul(nestedLoc, lhs, rhs, isInt, nestedBuilder);
+            Value add =
+                createAdd(nestedLoc, mul, args[2], isInt, nestedBuilder);
             nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
           });
       result = genericOp.getResults().front();
@@ -571,8 +366,7 @@ struct ConvertConv2DToIm2ColOpPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(&getContext());
-    patterns.insert<ConvertConv2DNhwcHwcf, ConvertDepthwiseConv2DNhwcHwc,
-                    ConvertConv2DNchwFchw>(context);
+    patterns.insert<ConvertConv2DNhwcHwcf, ConvertConv2DNchwFchw>(context);
     linalg::FillOp::getCanonicalizationPatterns(patterns, context);
     tensor::populateFoldTensorEmptyPatterns(patterns);
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
