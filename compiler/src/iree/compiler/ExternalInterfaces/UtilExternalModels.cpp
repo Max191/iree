@@ -113,25 +113,6 @@ struct GenericNumericCastExternalModel {
 // TiedOpInterface
 //===----------------------------------------------------------------------===//
 
-struct SetEncodingTiedOpInterface
-    : public IREE::Util::TiedOpInterface::ExternalModel<
-          SetEncodingTiedOpInterface, IREE::Encoding::SetEncodingOp> {
-  Value getTiedResult(Operation *op, unsigned resultIndex) const {
-    auto setEncodingOp = cast<IREE::Encoding::SetEncodingOp>(op);
-    return IREE::Util::TiedOpInterface::findTiedBaseValue(
-        setEncodingOp.getSource());
-  }
-
-  ::std::optional<unsigned>
-  getTiedResultOperandIndex(Operation *op, unsigned resultIndex) const {
-    return {0}; // dest
-  }
-
-  SmallVector<int64_t> getTiedResultOperandIndices(Operation *op) const {
-    return {0}; // dest
-  }
-};
-
 struct InsertSliceOpTiedOpInterface
     : public IREE::Util::TiedOpInterface::ExternalModel<
           InsertSliceOpTiedOpInterface, tensor::InsertSliceOp> {
@@ -300,12 +281,6 @@ void registerUtilExternalModels(DialectRegistry &registry) {
         arith::BitcastOp, arith::ExtFOp, arith::ExtUIOp, arith::ExtSIOp,
         arith::FPToSIOp, arith::FPToUIOp, arith::IndexCastOp, arith::TruncFOp,
         arith::TruncIOp, arith::SIToFPOp, arith::UIToFPOp>(context);
-  });
-
-  registry.addExtension(+[](MLIRContext *context,
-                            IREE::Encoding::IREEEncodingDialect *dialect) {
-    IREE::Encoding::SetEncodingOp::attachInterface<SetEncodingTiedOpInterface>(
-        *context);
   });
 
   registry.addExtension(
