@@ -11,6 +11,7 @@
 #include "iree/compiler/Dialect/Flow/Transforms/FormDispatchRegions.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -587,45 +588,45 @@ FailureOr<Operation *> hoistOutOfDispatch(RewriterBase &rewriter,
   }
 
   // Step 3: Collect the new set of dispatch results and dynamic dims, and
-  //         create a new dispatch region to replace the old one.
+  //         create a new dispatch region to replace the old one. The new
+  //         dispatch may have duplicated results,
 
-  // Once the new dispatch region is created, the operands of the new hoisted op
-  // need to be replaced with the matching results of the new dispatch. Since
-  // these results may not be consecutive at the end of the dispatch's result
-  // list, `newResultIndsMap` maps a given value inside of the dispatch region
-  // to its new result index in the final dispatch region op.
-  DenseMap<Value, int64_t> newResultIndsMap;
   // Get the new dispatch region return values and dynamic dims, excluding the
   // ones coming from the `hoistedOp`.
   auto dispatchReturnOp = cast<IREE::Flow::ReturnOp>(
       dispatchRegionOp.getBody().front().getTerminator());
-  SmallVector<Value, 2> newDispatchReturnOperands;
-  SmallVector<Value, 4> newDispatchResultDynamicDims;
-  for (OpOperand &operand : dispatchReturnOp->getOpOperands()) {
-    if (operand.get().getDefiningOp() == hoistedOp) {
-      continue;
-    }
-    newResultIndsMap.insert({operand.get(), newDispatchReturnOperands.size()});
-    newDispatchReturnOperands.push_back(operand.get());
-    auto dims =
-        dispatchRegionOp.getResultDynamicDims(operand.getOperandNumber());
-    newDispatchResultDynamicDims.append(dims.begin(), dims.end());
-  }
+  SmallVector<Value, 2> newDispatchReturnOperands(
+      dispatchReturnOp->getOperands());
+  SmallVector<Value, 4> newDispatchResultDynamicDims(
+      dispatchRegionOp.getResultDims());
 
   // Add the operands of the `op` to the new return values of the dispatch, and
   // add their result dynamic dims to the new result dynamic dims.
-  llvm::SmallSetVector<Value, 2> returnOperandSet(
-      newDispatchReturnOperands.begin(), newDispatchReturnOperands.end());
+  // Save the result index in the new dispatch corresponding to each hoisted op
+  // operand in `resultIndsForHoistedOperands`, so uses can be replaced later.
+  SmallVector<int64_t> resultIndsForHoistedOperands;
   for (OpOperand &operand : op->getOpOperands()) {
     // Only need to yield operands defined in the dispatch region.
     if (operand.get().getParentRegion() != &dispatchRegionOp.getBody()) {
       continue;
     }
-    // Skip already yielded operands.
-    if (returnOperandSet.contains(operand.get())) {
-      continue;
+
+    // If the operand is already yielded by the dispatch, don't yield it again,
+    // and save the result index.
+    int hoistedOperandResultIdx;
+    if (llvm::any_of(
+            dispatchRegionOp->getOpOperands(), [&](OpOperand &returnOperand) {
+              if (returnOperand.get() != operand.get()) {
+                return false;
+              }
+              hoistedOperandResultIdx = returnOperand.getOperandNumber();
+              return true;
+            })) {
+      resultIndsForHoistedOperands.push_back(hoistedOperandResultIdx);
+      break;
     }
-    newResultIndsMap.insert({operand.get(), newDispatchReturnOperands.size()});
+    resultIndsForHoistedOperands.push_back(newDispatchReturnOperands.size());
+
     // Save operand and dynamic dims to add to the dispatch region.
     newDispatchReturnOperands.push_back(operand.get());
     SmallVector<Value> dims;
@@ -667,33 +668,27 @@ FailureOr<Operation *> hoistOutOfDispatch(RewriterBase &rewriter,
   rewriter.replaceOpWithNewOp<IREE::Flow::ReturnOp>(newDispatchReturnOp,
                                                     newDispatchReturnOperands);
 
-  // Step 4: Fixup all uses. Still need to replace the operands of the hoisted
-  //         op, and replace the remaining uses of the old dispatch region with
-  //         the new dispatch region results.
-
   // Replace operands of the `hoistedOp` with dispatch region results. They are
   // currently using values from inside the dispatch region.
-  for (auto operand : newDispatchReturnOperands) {
-    auto dispatchResIdx = newResultIndsMap[operand];
-    Value dispatchResult = newDispatchRegionOp->getResults()[dispatchResIdx];
-    rewriter.replaceUsesWithIf(operand, dispatchResult,
+  for (auto [idx, operand] : llvm::enumerate(hoistedOp->getOperands())) {
+    auto newResultIdx = resultIndsForHoistedOperands[idx];
+    Value newDispatchResult = newDispatchRegionOp->getResults()[newResultIdx];
+    rewriter.replaceUsesWithIf(operand, newDispatchResult,
                                [&](OpOperand &opOperand) {
                                  return opOperand.getOwner() == hoistedOp;
                                });
   }
 
+  // Step 4: Fixup all uses. Still need to replace the operands of the hoisted
+  //         op, and replace the remaining uses of the old dispatch region with
+  //         the new dispatch region results.
+
   // Replace the uses of the original dispatch region results with the final
   // dispatch region results.
-  for (auto &opOperand : dispatchReturnOp->getOpOperands()) {
-    Value result = dispatchRegionOp.getResults()[opOperand.getOperandNumber()];
-    // Skip results that are not in `newResultIndsMap`, since they were replaced
-    // earlier by the `hoistedOp` results.
-    if (!newResultIndsMap.contains(opOperand.get())) {
-      continue;
-    }
-    int64_t newResultIdx = newResultIndsMap[opOperand.get()];
-    Value newResult = newDispatchRegionOp->getResults()[newResultIdx];
-    rewriter.replaceAllUsesWith(result, newResult);
+  for (auto [idx, result] : llvm::enumerate(dispatchRegionOp->getResults())) {
+    Value newDispatchResult = newDispatchRegionOp->getResults()[idx];
+    Value dispatchResult = dispatchRegionOp->getResults()[idx];
+    rewriter.replaceAllUsesWith(dispatchResult, newDispatchResult);
   }
 
   return hoistedOp;
