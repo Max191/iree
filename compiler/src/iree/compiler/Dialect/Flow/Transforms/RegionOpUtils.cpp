@@ -595,10 +595,21 @@ FailureOr<Operation *> hoistOutOfDispatch(RewriterBase &rewriter,
   // ones coming from the `hoistedOp`.
   auto dispatchReturnOp = cast<IREE::Flow::ReturnOp>(
       dispatchRegionOp.getBody().front().getTerminator());
-  SmallVector<Value, 2> newDispatchReturnOperands(
-      dispatchReturnOp->getOperands());
-  SmallVector<Value, 4> newDispatchResultDynamicDims(
-      dispatchRegionOp.getResultDims());
+  SmallVector<Value, 2> newDispatchReturnOperands;
+  SmallVector<Value, 4> newDispatchResultDynamicDims;
+  // Keep track of which results in the original dispatch region correspond to
+  // which results in the new dispatch region with `oldDispatchResultInds`.
+  SmallVector<int64_t, 2> oldDispatchResultInds;
+  for (OpOperand &operand : dispatchReturnOp->getOpOperands()) {
+    if (operand.get().getDefiningOp() == hoistedOp) {
+      continue;
+    }
+    oldDispatchResultInds.push_back(operand.getOperandNumber());
+    newDispatchReturnOperands.push_back(operand.get());
+    auto dims =
+        dispatchRegionOp.getResultDynamicDims(operand.getOperandNumber());
+    newDispatchResultDynamicDims.append(dims.begin(), dims.end());
+  }
 
   // Add the operands of the `op` to the new return values of the dispatch, and
   // add their result dynamic dims to the new result dynamic dims.
@@ -613,22 +624,22 @@ FailureOr<Operation *> hoistOutOfDispatch(RewriterBase &rewriter,
 
     // If the operand is already yielded by the dispatch, don't yield it again,
     // and save the result index.
-    int hoistedOperandResultIdx;
-    if (llvm::any_of(
-            dispatchRegionOp->getOpOperands(), [&](OpOperand &returnOperand) {
-              if (returnOperand.get() != operand.get()) {
-                return false;
-              }
-              hoistedOperandResultIdx = returnOperand.getOperandNumber();
-              return true;
-            })) {
-      resultIndsForHoistedOperands.push_back(hoistedOperandResultIdx);
+    bool resultAlreadyYielded = false;
+    for (auto [idx, returnOperand] :
+         llvm::enumerate(newDispatchReturnOperands)) {
+      if (returnOperand == operand.get()) {
+        resultAlreadyYielded = true;
+        resultIndsForHoistedOperands.push_back(idx);
+        break;
+      }
+    }
+    if (resultAlreadyYielded) {
       break;
     }
     resultIndsForHoistedOperands.push_back(newDispatchReturnOperands.size());
+    newDispatchReturnOperands.push_back(operand.get());
 
     // Save operand and dynamic dims to add to the dispatch region.
-    newDispatchReturnOperands.push_back(operand.get());
     SmallVector<Value> dims;
     if (failed(reifyDynamicResultDims(rewriter, operand.get(), dims))) {
       return op->emitOpError(
@@ -685,9 +696,9 @@ FailureOr<Operation *> hoistOutOfDispatch(RewriterBase &rewriter,
 
   // Replace the uses of the original dispatch region results with the final
   // dispatch region results.
-  for (auto [idx, result] : llvm::enumerate(dispatchRegionOp->getResults())) {
-    Value newDispatchResult = newDispatchRegionOp->getResults()[idx];
-    Value dispatchResult = dispatchRegionOp->getResults()[idx];
+  for (auto [oldIdx, newIdx] : llvm::enumerate(oldDispatchResultInds)) {
+    Value newDispatchResult = newDispatchRegionOp->getResults()[newIdx];
+    Value dispatchResult = dispatchRegionOp->getResults()[oldIdx];
     rewriter.replaceAllUsesWith(dispatchResult, newDispatchResult);
   }
 
