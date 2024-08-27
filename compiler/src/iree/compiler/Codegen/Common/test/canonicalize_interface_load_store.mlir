@@ -118,3 +118,31 @@ func.func @fold_reshape_slice_store(%x: index) {
   flow.dispatch.tensor.store %5, %2, offsets = [%x], sizes = [864], strides = [1] : tensor<864xf32> -> !flow.dispatch.tensor<writeonly:tensor<1728xf32>>
   return
 }
+
+// -----
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>
+]>
+// CHECK: #[[$MAP:.+]] = affine_map<()[s0] -> (s0 ceildiv 288)>
+// CHECK-LABEL: func.func @fold_reshape_slice_load
+func.func @fold_reshape_slice_load(%x: index) {
+  // CHECK-SAME: %[[X:[A-Za-z0-9]+]]: index
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %cst = arith.constant 0.0 : f32
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : !flow.dispatch.tensor<readonly:tensor<1728xf32>>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : !flow.dispatch.tensor<writeonly:tensor<3x3x1x96xf32>>
+  //  CHECK: %[[SRC:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0) : !flow.dispatch.tensor<readonly:tensor<6x3x1x96xf32>>
+  //  CHECK: %[[OUT:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0) : !flow.dispatch.tensor<writeonly:tensor<3x3x1x96xf32>>
+  //  CHECK: %[[XDIV:.+]] = affine.apply #[[$MAP]]()[%[[X]]]
+  //  CHECK: %[[LOAD:.+]] = flow.dispatch.tensor.load %[[SRC]], offsets = [%[[XDIV]], 0, 0, 0], sizes = [3, 3, 1, 96]
+  //  CHECK-SAME: !flow.dispatch.tensor<readonly:tensor<6x3x1x96xf32>> -> tensor<3x3x1x96xf32>
+  %3 = flow.dispatch.tensor.load %1, offsets = [%x], sizes = [864], strides = [1] : !flow.dispatch.tensor<readonly:tensor<1728xf32>> -> tensor<864xf32>
+  %4 = tensor.expand_shape %3 [[0, 1, 2, 3]] output_shape [3, 3, 1, 96] : tensor<864xf32> into tensor<3x3x1x96xf32>
+  //  CHECK: %[[FILL:.+]] = linalg.fill ins(%{{.+}}) outs(%[[LOAD]] : tensor<3x3x1x96xf32>)
+  %5 = linalg.fill ins(%cst : f32) outs(%4 : tensor<3x3x1x96xf32>) -> tensor<3x3x1x96xf32>
+  //  CHECK: flow.dispatch.tensor.store %[[FILL]], %[[OUT]]
+  flow.dispatch.tensor.store %5, %2, offsets=[0, 0, 0, 0], sizes =[3, 3, 1, 96], strides=[1, 1, 1, 1] : tensor<3x3x1x96xf32> -> !flow.dispatch.tensor<writeonly:tensor<3x3x1x96xf32>>
+  return
+}
