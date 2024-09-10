@@ -43,9 +43,11 @@ struct ValueBarrierOpBufferizationInterface
                     const AnalysisState &state) const {
     SmallVector<bufferization::AliasingValue> alist;
     alist.reserve(op->getNumResults());
-    for (Value result : op->getResults()) {
-      alist.push_back({result, BufferRelation::Equivalent});
-    }
+    // for (Value result : op->getResults()) {
+    //   alist.push_back({result, BufferRelation::Equivalent});
+    // }
+    alist.push_back({op->getResult(opOperand.getOperandNumber()),
+                     BufferRelation::Equivalent});
     return alist;
   }
 
