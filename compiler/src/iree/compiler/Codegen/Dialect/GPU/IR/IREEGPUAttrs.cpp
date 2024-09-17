@@ -7,6 +7,7 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include <numeric>
 
+#include "iree/compiler/Codegen/Common/GPU/GPUTileSwizzleUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/DerivedConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
@@ -906,6 +907,71 @@ DataTiledMMAAttr::getABCVectorTypes() const {
 
 int64_t DataTiledMMAAttr::getSubgroupSize() const {
   return getIntrinsicSubgroupSize(getIntrinsic().getValue());
+}
+
+int getElementsPerThread(MMAIntrinsic intrinsic, MMAFragment fragment) {
+  auto layout = getSingleSubgroupLayout(intrinsic, fragment);
+  return std::reduce(layout.element.begin(), layout.element.end(), 1,
+                     std::multiplies<int64_t>());
+}
+
+LogicalResult DataTiledMMAAttr::populateOperandOffsetsSizesStrides(
+    OpBuilder &builder, Location loc, IREE::GPU::MMAFragment fragment,
+    Value threadId, ArrayRef<int64_t> permutation,
+    SmallVector<OpFoldResult> &offsets, SmallVector<OpFoldResult> &sizes,
+    SmallVector<OpFoldResult> &strides) const {
+  // Get the swizzle describing the internal layout of this fragment.
+  TileSwizzle swizzle = getSwizzle(*this, fragment);
+
+  // Get the expanded tile shape.
+  SmallVector<int> tileShape;
+  for (auto e : swizzle.expandShape) {
+    for (auto d : e) {
+      tileShape.push_back(d);
+    }
+  }
+  applyPermutationToVector(tileShape, swizzle.permutation);
+  SmallVector<OpFoldResult> tileShapeOfr;
+  for (int d : tileShape) {
+    tileShapeOfr.push_back(builder.getIndexAttr(d));
+  }
+
+  // Populate sizes and strides.
+  int expandedRank = tileShape.size();
+  sizes = SmallVector<OpFoldResult>(expandedRank, builder.getIndexAttr(1));
+  strides = SmallVector<OpFoldResult>(expandedRank, builder.getIndexAttr(1));
+  int elementsPerThread =
+      getElementsPerThread(getIntrinsic().getValue(), fragment);
+  int productSize = 1;
+  for (int i = tileShape.size() - 1; i >= 0; --i) {
+    if (productSize >= elementsPerThread) {
+      assert(productSize == elementsPerThread);
+      break;
+    }
+    productSize *= tileShape[swizzle.permutation[i]];
+    sizes[i] = builder.getIndexAttr(tileShape[swizzle.permutation[i]]);
+  }
+
+  // Populate offsets by delinearizing threadId times elementsPerThread.
+  Value flatOffset = builder.create<arith::MulIOp>(
+      loc, threadId,
+      builder.create<arith::ConstantIndexOp>(loc, elementsPerThread));
+  offsets = builder
+                .create<affine::AffineDelinearizeIndexOp>(loc, flatOffset,
+                                                          tileShapeOfr)
+                ->getResults();
+
+  // Insert 1's for the outer dimensions.
+  // QUESTION: why is this needed and somehow not in
+  // MMAAttr::populateOperandOffsetsSizesStrides?
+  offsets.insert(offsets.begin(), builder.getIndexAttr(1));
+  offsets.insert(offsets.begin(), builder.getIndexAttr(1));
+  sizes.insert(sizes.begin(), builder.getIndexAttr(1));
+  sizes.insert(sizes.begin(), builder.getIndexAttr(1));
+  strides.insert(strides.begin(), builder.getIndexAttr(1));
+  strides.insert(strides.begin(), builder.getIndexAttr(1));
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

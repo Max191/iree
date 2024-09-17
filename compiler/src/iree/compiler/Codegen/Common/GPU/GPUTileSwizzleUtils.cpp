@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/GPU/GPUTileSwizzleUtils.h"
-#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 
 namespace mlir::iree_compiler {
 
@@ -131,6 +130,84 @@ TileSwizzle getIntrinsicSwizzle(IREE::GPU::MMAIntrinsic intrinsic,
     }
   }
 
+  return swizzle;
+}
+
+// Returns the index of the dimension whose flattened size (flattening inner
+// dimensions into it) matches the given `targetSize`. This is used to compute
+// interleaving indices.
+//
+// Example:
+//    Input shape = [16, 8, 4, 4]
+//    Input targetSize = 16
+// -> Return 2, because the tail of the shape starting at index 2 is [4, 4],
+//    whose product equals targetSize.
+static int64_t getDimIdxForTargetSize(const SmallVector<int64_t> &shape,
+                                      int64_t targetSize) {
+  int interleaveAt = 0;
+  int size = 1;
+  for (interleaveAt = shape.size() - 1; interleaveAt >= 0; --interleaveAt) {
+    assert(size <= targetSize);
+    assert((targetSize % size) == 0);
+    if (size == targetSize) {
+      break;
+    }
+    size *= shape[interleaveAt];
+  }
+  return interleaveAt;
+}
+
+// Generates the swizzle for the full data-tiled-mma tile, including all the
+// relevant unrolling factors.
+TileSwizzle getSwizzle(IREE::GPU::DataTiledMMAAttr mma,
+                       IREE::GPU::MMAFragment fragment) {
+  auto [AType, BType, CType] = mma.getABCElementTypes();
+  int ABits = AType.getIntOrFloatBitWidth();
+  int BBits = BType.getIntOrFloatBitWidth();
+  // TODO(bjacob): Should be looked up from GPU target, instead of hard-coded.
+  const int targetPreferredLoadBitWidth = 128;
+  auto swizzle = getIntrinsicSwizzle(mma.getIntrinsic().getValue(), fragment);
+  switch (fragment) {
+  case IREE::GPU::MMAFragment::Lhs:
+    // A-matrix (LHS). Source dimensions are M (index 0) and K (index 1).
+    // Unroll on K with interleaving, then on M.
+    if (mma.getUnrollK() > 1) {
+      unroll(swizzle, 1, mma.getUnrollK());
+      int interleavingIdx = getDimIdxForTargetSize(
+          swizzle.expandShape[1],
+          targetPreferredLoadBitWidth / (mma.getUnrollK() * ABits));
+      interleave(swizzle, 1, interleavingIdx);
+    }
+    if (mma.getUnrollM() > 1) {
+      unroll(swizzle, 0, mma.getUnrollM());
+    }
+    break;
+  case IREE::GPU::MMAFragment::Rhs:
+    // B-matrix (RHS). Since the pack ops already took care of transposing B,
+    // source dimensions are N (index 0) and K (index 1).
+    // Unroll on K with interleaving, then on N.
+    if (mma.getUnrollK() > 1) {
+      unroll(swizzle, 1, mma.getUnrollK());
+      int interleavingIdx = getDimIdxForTargetSize(
+          swizzle.expandShape[1],
+          targetPreferredLoadBitWidth / (mma.getUnrollK() * BBits));
+      interleave(swizzle, 1, interleavingIdx);
+    }
+    if (mma.getUnrollN() > 1) {
+      unroll(swizzle, 0, mma.getUnrollN());
+    }
+    break;
+  case IREE::GPU::MMAFragment::Acc:
+    // C-matrix (accumulator). Source dimensions are M (index 0) and N (index
+    // 1). Unroll on N, then on M.
+    if (mma.getUnrollN() > 1) {
+      unroll(swizzle, 1, mma.getUnrollN());
+    }
+    if (mma.getUnrollM() > 1) {
+      unroll(swizzle, 0, mma.getUnrollM());
+    }
+    break;
+  }
   return swizzle;
 }
 

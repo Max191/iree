@@ -8,6 +8,7 @@
 #define IREE_COMPILER_SRC_IREE_COMPILER_CODEGEN_COMMON_GPU_GPUTILESWIZZLEUTILS_H_
 
 #include "iree/compiler/Codegen/Common/TileSwizzle.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUEnums.h"
 
 namespace mlir::iree_compiler {
@@ -16,6 +17,11 @@ namespace mlir::iree_compiler {
 // layout consumed by the given `intrinsic` and `fragment`.
 TileSwizzle getIntrinsicSwizzle(IREE::GPU::MMAIntrinsic intrinsic,
                                 IREE::GPU::MMAFragment fragment);
+
+// Returns the swizzle for the full data-tiled-mma tile, including all the
+// relevant unrolling factors.
+TileSwizzle getSwizzle(IREE::GPU::DataTiledMMAAttr mma,
+                       IREE::GPU::MMAFragment fragment);
 
 // Unrolls the dimension given by `srcIndex` by the given `unrollFactor`.
 // This is not interleaving layouts. The layout will consist of multiple copies
