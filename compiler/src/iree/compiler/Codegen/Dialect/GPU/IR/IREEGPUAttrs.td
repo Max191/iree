@@ -129,6 +129,7 @@ class IREEGPU_MmaVectorLayoutAttr<string attrname, string mmaintrinsic> :
     "getContractionLayout",
     "getMNKShape",
     "getSubgroupSize",
+    "getMmaScope",
     "buildMmaOperation",
     "populateOperandOffsetsSizesStrides",
     "materializeOperandConcreteShape",
@@ -220,6 +221,7 @@ def IREEGPU_DataTiledMMAAttr :
     // implementation is required by the MmaInterfaceAttr.
     "getABCVectorTypes",
     "getMNKShape",
+    "getMmaScope",
     "getSubgroupSize",
     "populateOperandOffsetsSizesStrides",
   ]>
