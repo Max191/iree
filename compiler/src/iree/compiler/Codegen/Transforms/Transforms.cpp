@@ -592,6 +592,13 @@ struct FoldExpandShapeIntoInterfaceTensorStore
         !storeOp.strides().empty())
       return failure();
 
+    ArrayRef<int64_t> targetShape = storeOp.getTargetType().getShape();
+    if (llvm::any_of(storeOp.getStaticOffsets(),
+                     [](int64_t off) { return off != 0; }) ||
+        !llvm::equal(targetShape, storeOp.getStaticSizes())) {
+      return failure();
+    }
+
     auto reshapeOp = storeOp.getValue().getDefiningOp<tensor::ExpandShapeOp>();
     if (!reshapeOp) {
       return failure();
