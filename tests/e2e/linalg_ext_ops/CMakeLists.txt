@@ -67,7 +67,6 @@ iree_check_single_backend_test_suite(
     "requires-gpu-nvidia"
 )
 
-# TODO(#18649): Add back top-k test once MI250 correctness is resolved.
 iree_check_single_backend_test_suite(
   NAME
     check_rocm_hip
@@ -75,7 +74,7 @@ iree_check_single_backend_test_suite(
     "scan.mlir"
     "scatter.mlir"
     "sort.mlir"
-#     "top-k.mlir"
+    "top-k.mlir"
     "winograd_input.mlir"
     "winograd_output.mlir"
   TARGET_BACKEND
