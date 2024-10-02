@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
+#include <numeric>
 
 #include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
@@ -13,8 +14,10 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUOps.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -29,6 +32,16 @@
 namespace mlir::iree_compiler::IREE::GPU {
 
 constexpr int64_t kCacheLineSizeBits = 128 * 8;
+
+template <typename T>
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const llvm::SmallVectorImpl<T> &vector) {
+  for (T element : vector) {
+    os << element << " ";
+  }
+
+  return os;
+}
 
 LogicalResult
 setDataTiledMultiMmaLoweringConfig(IREE::GPU::TargetAttr target,
@@ -124,19 +137,33 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
     return failure();
   }
 
-  // For now we are not being smart and trying to reshape dimensions to allow
-  // for better usage of intrinsics, and instead are tiling all dimensions
-  // except the inner most m, n, and k dimensions to 1.
-  int64_t mDim = contractionDims.m.back();
-  int64_t nDim = contractionDims.n.back();
-  int64_t kDim = contractionDims.k.back();
-
   // Dynamic dims are expected to be taken care of earlier in the pipeline.
-  if (ShapedType::isDynamic(bounds[mDim]) ||
-      ShapedType::isDynamic(bounds[nDim]) ||
-      ShapedType::isDynamic(bounds[kDim])) {
+  if (ShapedType::isDynamic(bounds[contractionDims.m.back()]) ||
+      ShapedType::isDynamic(bounds[contractionDims.n.back()]) ||
+      ShapedType::isDynamic(bounds[contractionDims.k.back()])) {
     return failure();
   }
+
+  SmallVector<int64_t> mDims, nDims, kDims;
+  for (auto mDim : contractionDims.m) {
+    if (!ShapedType::isDynamic(bounds[mDim])) {
+      mDims.push_back(mDim);
+    }
+  }
+  for (auto nDim : contractionDims.n) {
+    if (!ShapedType::isDynamic(bounds[nDim])) {
+      nDims.push_back(nDim);
+    }
+  }
+  for (auto kDim : contractionDims.k) {
+    if (!ShapedType::isDynamic(bounds[kDim])) {
+      kDims.push_back(kDim);
+    }
+  }
+
+  auto getDimBounds = [&](SmallVector<int64_t> dims) -> SmallVector<int64_t> {
+    return llvm::map_to_vector(dims, [&](int64_t dim) { return bounds[dim]; });
+  };
 
   Value lhs = linalgOp.getDpsInputOperand(0)->get();
   Value rhs = linalgOp.getDpsInputOperand(1)->get();
@@ -146,8 +173,9 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   Type rhsElemType = getElementTypeOrSelf(rhs);
   Type initElemType = getElementTypeOrSelf(init);
 
-  GPUMatmulShapeType problem{bounds[mDim], bounds[nDim], bounds[kDim],
-                             lhsElemType,  rhsElemType,  initElemType};
+  GPUMatmulShapeType problem{getDimBounds(mDims), getDimBounds(nDims),
+                             getDimBounds(kDims), lhsElemType,
+                             rhsElemType,         initElemType};
 
   SmallVector<GPUMatmulShapeType> intrinsics;
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
@@ -157,8 +185,9 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
       continue;
     intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType);
   }
-  if (intrinsics.empty())
+  if (intrinsics.empty()) {
     return failure();
+  }
 
   GPUMMAHeuristicSeeds seeds;
   int64_t inBitWidth = lhsElemType.getIntOrFloatBitWidth();
@@ -166,7 +195,9 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   // Note that the following heuristic seeds are just placeholder values.
   // We need to clean it up and make it adjusting to different targets.
   // See https://github.com/iree-org/iree/issues/16341 for details.
-  if (problem.mSize * problem.nSize <= 512 * 512) {
+  int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+  int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+  if (mSize * nSize <= 512 * 512) {
     // For matmuls with small M*N size, we want to distribute M*N onto more
     // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
     // and a larger bestKTileCountPerSubgroup.
@@ -190,10 +221,10 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   // TODO: Drop this. This is only a consideration for other pipelines.
   SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
   bool transposedLhs =
-      kDim !=
+      kDims.back() !=
       llvm::cast<AffineDimExpr>(maps[0].getResults().back()).getPosition();
   bool transposedRhs =
-      nDim !=
+      nDims.back() !=
       llvm::cast<AffineDimExpr>(maps[1].getResults().back()).getPosition();
 
   // First try to find a schedule with an exactly matching intrinsic.
@@ -215,14 +246,16 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   LDBG("Target Subgroup size: " << targetSubgroupSize);
   LDBG("Schedule: sizes [" << schedule->mSize << ", " << schedule->nSize << ", "
                            << schedule->kSize << "]");
-  LDBG("Schedule: tile counts [" << schedule->mTileCount << ", "
-                                 << schedule->nTileCount << ", "
-                                 << schedule->kTileCount << "]");
-  LDBG("Schedule: warp counts [" << schedule->mWarpCount << ", "
-                                 << schedule->nWarpCount << "]");
+  LDBG("Schedule: tile counts [" << schedule->mTileCounts << ", "
+                                 << schedule->nTileCounts << ", "
+                                 << schedule->kTileCounts << "]");
+  LDBG("Schedule: warp counts [" << schedule->mWarpCounts << ", "
+                                 << schedule->nWarpCounts << "]");
 
-  std::array<int64_t, 3> workgroupSize{
-      schedule->nWarpCount * targetSubgroupSize, schedule->mWarpCount, 1};
+  int64_t flatWorkgroupSize =
+      targetSubgroupSize * ShapedType::getNumElements(schedule->nWarpCounts) *
+      ShapedType::getNumElements(schedule->mWarpCounts);
+  std::array<int64_t, 3> workgroupSize{flatWorkgroupSize, 1, 1};
 
   SmallVector<int64_t> workgroupTileSizes(linalgOp.getNumLoops(), 0);
   SmallVector<int64_t> reductionTileSizes(linalgOp.getNumLoops(), 0);
@@ -244,16 +277,30 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
     reductionTileSizes[k] = 1;
   }
 
-  // Compute the M/N dimension tile size by multiplying subgroup information.
-  workgroupTileSizes[mDim] = schedule->mWarpCount * schedule->mTileCount;
-  workgroupTileSizes[nDim] = schedule->nWarpCount * schedule->nTileCount;
+  // Adjust the inner bound size for packing to intrinsic shapes, since tiling
+  // happens after packing.
+  assert(bounds[mDims.back()] % schedule->mSize == 0 &&
+         bounds[nDims.back()] % schedule->nSize == 0 &&
+         "expected inner bound to be evenly divisible by schedule sizes.");
+  bounds[mDims.back()] /= schedule->mSize;
+  bounds[nDims.back()] /= schedule->nSize;
 
-  // Specify the subgroup tile sizes from the mma schedule. This is applied
-  subgroupTileSizes[mDim] = schedule->mTileCount;
-  subgroupTileSizes[nDim] = schedule->nTileCount;
+  // Compute the M/N dimension tile size by multiplying subgroup information.
+  for (auto [i, mDim] : llvm::enumerate(mDims)) {
+    workgroupTileSizes[mDim] =
+        schedule->mWarpCounts[i] * schedule->mTileCounts[i];
+    subgroupTileSizes[mDim] = schedule->mTileCounts[i];
+  }
+  for (auto [i, nDim] : llvm::enumerate(nDims)) {
+    workgroupTileSizes[nDim] =
+        schedule->nWarpCounts[i] * schedule->nTileCounts[i];
+    subgroupTileSizes[nDim] = schedule->nTileCounts[i];
+  }
 
   // Similarly the reduction tile size is just the post-packing tile count.
-  reductionTileSizes[kDim] = schedule->kTileCount;
+  for (auto [i, kDim] : llvm::enumerate(kDims)) {
+    reductionTileSizes[kDim] = schedule->kTileCounts[i];
+  }
 
   IREE::GPU::MmaInterfaceAttr mmaKind =
       target.getWgp().getMma()[schedule->index];
