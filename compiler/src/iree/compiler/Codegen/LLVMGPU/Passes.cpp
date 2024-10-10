@@ -10,6 +10,7 @@
 
 #include "iree-dialects/Dialect/LinalgTransform/Passes.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
+#include "iree/compiler/Codegen/Common/PassUtils.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Passes.h"
@@ -1186,16 +1187,29 @@ static LogicalResult igemmConfigFn(linalg::GenericOp genericOp,
   return success();
 }
 
+static void addGPUDataTilingConfigurationPasses(FunctionLikeNest &passManager) {
+  passManager
+      .addPass([]() {
+        return createDecomposePackUnPackOpsPass(/*tileOuterToOne=*/false,
+                                                /*useOnlyReshapes=*/true,
+                                                /*controlFn=*/std::nullopt);
+      })
+      .addPass(createPropagateReshapesByExpansionPass)
+      .addPass(createGPUGeneralizeNamedOpsPass);
+}
+
 static void buildLLVMGPUCodegenConfigurationPassPipelineImpl(
     OpPassManager &modulePassManager) {
   {
     FunctionLikeNest funcPassManager(modulePassManager);
-    funcPassManager.addPredicatedPass(clLLVMGPUUseIgemm, []() {
-      return createConvolutionToIGEMMPass(igemmConfigFn);
-    });
-    funcPassManager.addPass(createGPUGeneralizeNamedOpsPass);
+    funcPassManager.addPass(createGPUMaterializeDeviceEncodingPass)
+        .addPredicatedPass(
+            clLLVMGPUUseIgemm,
+            []() { return createConvolutionToIGEMMPass(igemmConfigFn); })
+        .addPass(createGPUGeneralizeNamedOpsPass);
     addCommonTargetExecutablePreprocessingPasses(funcPassManager);
     addEncodingToNopPasses(funcPassManager);
+    addGPUDataTilingConfigurationPasses(funcPassManager);
   }
   modulePassManager.addPass(createMaterializeUserConfigsPass());
   modulePassManager.addPass(createLLVMGPUSelectLoweringStrategyPass());
@@ -1240,7 +1254,8 @@ static void buildROCDLCodegenConfigurationPassPipelineImpl(
     OpPassManager &modulePassManager) {
   {
     FunctionLikeNest funcPassManager(modulePassManager);
-    funcPassManager.addPass(createGPUGeneralizeNamedOpsPass);
+    funcPassManager.addPass(createGPUMaterializeDeviceEncodingPass)
+        .addPass(createGPUGeneralizeNamedOpsPass);
     addCommonTargetExecutablePreprocessingPasses(funcPassManager);
   }
   modulePassManager.addPass(createMaterializeUserConfigsPass());
