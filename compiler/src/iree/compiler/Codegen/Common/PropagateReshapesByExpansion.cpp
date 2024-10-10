@@ -7,6 +7,7 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -16,6 +17,48 @@ namespace mlir::iree_compiler {
 #include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
+
+// Indicates whether the given linalg op represents a transpose. In particular,
+// it requires a single input where the indexing maps are full permutations and
+// non-equal.
+static bool isaTransposeOpInterface(linalg::LinalgOp linalgOp) {
+  if (linalgOp.getNumParallelLoops() != linalgOp.getNumLoops())
+    return false;
+
+  if (linalgOp.getNumDpsInputs() != 1 || linalgOp.getNumDpsInits() != 1)
+    return false;
+  auto mapRange = linalgOp.getIndexingMapsArray();
+  if (mapRange.size() != 2 || !mapRange.front().isPermutation() ||
+      !mapRange.back().isPermutation() || mapRange.front() == mapRange.back()) {
+    return false;
+  }
+  return llvm::hasSingleElement(linalgOp.getBlock()->getOperations());
+}
+
+struct RaiseLinalgTransposeGeneric final
+    : public OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    if (!isaTransposeOpInterface(genericOp)) {
+      return failure();
+    }
+
+    auto mapRange = genericOp.getIndexingMapsArray();
+    AffineMap outMap = mapRange.back();
+    AffineMap inMap = mapRange.front();
+    SmallVector<int64_t> perm;
+    // To get the permutation, look at each output index and find which
+    // dimension in the input we're reading from for that index.
+    for (AffineExpr expr : outMap.getResults()) {
+      perm.push_back(*inMap.getResultPosition(expr));
+    }
+    rewriter.replaceOpWithNewOp<linalg::TransposeOp>(
+        genericOp, genericOp.getDpsInputs()[0], genericOp.getDpsInits()[0], perm);
+    return success();
+  }
+};
 
 struct PropagateReshapesByExpansionPass final
     : impl::PropagateReshapesByExpansionPassBase<
@@ -65,6 +108,12 @@ void PropagateReshapesByExpansionPass::runOnOperation() {
   tensor::ExpandShapeOp::getCanonicalizationPatterns(bubbleExpandShapePatterns,
                                                      context);
   populateReshapeToInterfaceTensorPatterns(bubbleExpandShapePatterns);
+
+  bubbleExpandShapePatterns.add<RaiseLinalgTransposeGeneric>(context);
+  linalg::TransposeOp::getCanonicalizationPatterns(
+      bubbleExpandShapePatterns, context);
+  linalg::GenericOp::getCanonicalizationPatterns(
+      bubbleExpandShapePatterns, context);
 
   if (failed(applyPatternsAndFoldGreedily(
           getOperation(), std::move(bubbleExpandShapePatterns)))) {
