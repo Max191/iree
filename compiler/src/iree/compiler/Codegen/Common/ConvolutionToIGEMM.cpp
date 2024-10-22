@@ -29,7 +29,7 @@ using iree_compiler::IREE::LinalgExt::IREELinalgExtDialect;
 struct SetIGEMMConfiguration final : OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern::OpRewritePattern;
 
-  SetIGEMMConfiguration(MLIRContext *context, ConfigFn configFn)
+  SetIGEMMConfiguration(MLIRContext *context, IGEMMConfigFn configFn)
       : OpRewritePattern(context), configFn(configFn) {}
 
   LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
@@ -67,7 +67,7 @@ struct SetIGEMMConfiguration final : OpRewritePattern<linalg::GenericOp> {
   }
 
 private:
-  ConfigFn configFn;
+  IGEMMConfigFn configFn;
 };
 
 class ConvolutionToIGEMMPass final
@@ -75,28 +75,22 @@ class ConvolutionToIGEMMPass final
 public:
   using ConvolutionToIGEMMPassBase::ConvolutionToIGEMMPassBase;
 
-  explicit ConvolutionToIGEMMPass(ConfigFn configFn) : configFn(configFn) {}
+  explicit ConvolutionToIGEMMPass(std::optional<IGEMMConfigFn> configFn,
+                                  std::optional<IGEMMControlFn> controlFn)
+      : configFn(configFn), controlFn(controlFn) {}
 
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<tensor::TensorDialect, IREELinalgExtDialect>();
-  }
   void runOnOperation() override {
     MLIRContext *context = &getContext();
 
     // Rewrite convolutions into a im2col and GEMM.
     {
-      auto conv2dToIm2colControlFn = [](Operation *conv) {
-        // Don't transform convolutions that have a preset lowering config.
-        if (getLoweringConfig(conv)) {
-          return false;
-        }
-        return true;
-      };
       MLIRContext *context = &getContext();
       RewritePatternSet patterns(context);
       iree_compiler::IREE::LinalgExt::populateConv2DToIm2colOpPatterns(
-          patterns, conv2dToIm2colControlFn);
-      patterns.add<SetIGEMMConfiguration>(context, configFn);
+          patterns, controlFn);
+      if (configFn.has_value()) {
+        patterns.add<SetIGEMMConfiguration>(context, configFn.value());
+      }
       if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                               std::move(patterns)))) {
         return signalPassFailure();
@@ -149,17 +143,16 @@ public:
   }
 
 private:
-  ConfigFn configFn = [](linalg::GenericOp genericOp,
-                         IREE::LinalgExt::Im2colOp im2colOp) {
-    return failure();
-  };
+  std::optional<IGEMMConfigFn> configFn;
+  std::optional<IGEMMControlFn> controlFn;
 };
 
 } // namespace
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createConvolutionToIGEMMPass(ConfigFn configFn) {
-  return std::make_unique<ConvolutionToIGEMMPass>(configFn);
+createConvolutionToIGEMMPass(std::optional<IGEMMConfigFn> configFn,
+                             std::optional<IGEMMControlFn> controlFn) {
+  return std::make_unique<ConvolutionToIGEMMPass>(configFn, controlFn);
 }
 
 } // namespace mlir::iree_compiler

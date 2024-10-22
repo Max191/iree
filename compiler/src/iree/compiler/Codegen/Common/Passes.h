@@ -60,12 +60,14 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createConvertToDestinationPassingStylePass(
     bool useWARForCooperativeMatrixCodegen);
 
-using ConfigFn =
+using IGEMMConfigFn =
     std::function<LogicalResult(linalg::GenericOp, IREE::LinalgExt::Im2colOp)>;
+using IGEMMControlFn = std::function<bool(Operation *)>;
 /// Pass to convert Conv2D ops into IGEMM (Im2colOp + matmul). `configFn` is
 /// used to set lowering configurations on the resulting ops, if necessary.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createConvolutionToIGEMMPass(ConfigFn configFn);
+createConvolutionToIGEMMPass(std::optional<IGEMMConfigFn> configFn,
+                             std::optional<IGEMMControlFn> controlFn);
 
 std::unique_ptr<Pass> createDecomposeSoftmaxPass(bool useFusion);
 
