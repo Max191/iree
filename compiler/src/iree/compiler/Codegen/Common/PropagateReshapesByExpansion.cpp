@@ -7,7 +7,14 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVectorExtras.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
@@ -16,6 +23,62 @@ namespace mlir::iree_compiler {
 #include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
+
+/// Returns true if the `dest` can be expanded with the inner expanded sizes
+/// of `sliceStaticSizes`. This checks that the product of the inner
+/// sliceStaticSizes for each set of ReassociationIndices evenly divides the
+/// matching `dest` size.
+static bool canExpandDest(SmallVector<ReassociationIndices> reInds,
+                          ArrayRef<int64_t> sliceStaticSizes, Value dest) {
+  auto destType = cast<ShapedType>(dest.getType());
+  for (auto [reassociations, destSize] :
+       llvm::zip_equal(reInds, destType.getShape())) {
+    int64_t totalInnerSize = 1;
+    for (int i = 1; i < reassociations.size(); ++i) {
+      int64_t expandedInnerSize = sliceStaticSizes[reassociations[i]];
+      if (ShapedType::isDynamic(expandedInnerSize)) {
+        return false;
+      }
+      totalInnerSize *= expandedInnerSize;
+    }
+    if (destSize % totalInnerSize != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct ExpandForallOp final : OpRewritePattern<tensor::ParallelInsertSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tensor::ParallelInsertSliceOp parallelInsertOp,
+                                PatternRewriter &rewriter) const override {
+    auto collapseOp =
+        parallelInsertOp.getSource().getDefiningOp<tensor::CollapseShapeOp>();
+    if (!collapseOp) {
+      return failure();
+    }
+    Value insertDest = parallelInsertOp.getDest();
+    if (!insertDest.hasOneUse()) {
+      return failure();
+    }
+
+    SmallVector<ReassociationIndices> reInds =
+        collapseOp.getReassociationIndices();
+    if (!canExpandDest(collapseOp.getReassociationIndices(),
+                       parallelInsertOp.getStaticSizes(), insertDest)) {
+      return failure();
+    }
+
+    OpResult tiedResult = parallelInsertOp.getTiedOpResult();
+    auto forallOp = dyn_cast<scf::ForallOp>(tiedResult.getOwner());
+    if (!forallOp) {
+      return failure();
+    }
+    SmallVector<Value> forallOutputs(forallOp.getOutputs());
+
+    return success();
+  }
+};
 
 struct PropagateReshapesByExpansionPass final
     : impl::PropagateReshapesByExpansionPassBase<
@@ -64,6 +127,7 @@ void PropagateReshapesByExpansionPass::runOnOperation() {
                                                context);
   tensor::ExpandShapeOp::getCanonicalizationPatterns(bubbleExpandShapePatterns,
                                                      context);
+  // bubbleExpandShapePatterns.add<ExpandForallOp>(context);
   populateReshapeToInterfaceTensorPatterns(bubbleExpandShapePatterns);
 
   if (failed(applyPatternsAndFoldGreedily(
