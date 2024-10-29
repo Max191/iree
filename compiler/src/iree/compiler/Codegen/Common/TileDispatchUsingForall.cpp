@@ -30,6 +30,117 @@ namespace mlir::iree_compiler {
 
 namespace {
 
+struct SwapExtractSliceOfCollapse final
+    : OpRewritePattern<tensor::ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tensor::ExtractSliceOp sliceOp,
+                                PatternRewriter &rewriter) const override {
+    auto reshapeOp =
+        sliceOp.getSource().getDefiningOp<tensor::CollapseShapeOp>();
+    if (!reshapeOp) {
+      return failure();
+    }
+
+    if (!areAllConstantIntValue(sliceOp.getMixedStrides(), 1)) {
+      return rewriter.notifyMatchFailure(sliceOp, "slice has non-unit strides");
+    }
+
+    std::optional<llvm::SmallDenseSet<unsigned int>> maybeRankReductionMask =
+        mlir::computeRankReductionMask(sliceOp.getStaticSizes(),
+                                       sliceOp.getResultType().getShape());
+    if (!maybeRankReductionMask) {
+      return rewriter.notifyMatchFailure(
+          sliceOp, "could not compute rank reduction mask");
+    }
+    auto rankReductionMask = maybeRankReductionMask.value();
+
+    Value reshapeSrc = reshapeOp.getSrc();
+    SmallVector<OpFoldResult> reshapeSrcSizes =
+        tensor::getMixedSizes(rewriter, reshapeSrc.getLoc(), reshapeSrc);
+    SmallVector<ReassociationIndices> reassociations =
+        reshapeOp.getReassociationIndices();
+    SmallVector<OpFoldResult> offsets = sliceOp.getMixedOffsets();
+    SmallVector<OpFoldResult> sizes = sliceOp.getMixedSizes();
+    auto getStaticValues = [](SmallVector<OpFoldResult> ofrs) {
+      SmallVector<int64_t> staticValues;
+      SmallVector<Value> dynamicValues;
+      dispatchIndexOpFoldResults(ofrs, dynamicValues, staticValues);
+      return staticValues;
+    };
+    SmallVector<int64_t> staticSizes = getStaticValues(sizes);
+
+    SmallVector<OpFoldResult> expandedOffsets;
+    SmallVector<OpFoldResult> expandedSizes;
+    SmallVector<int64_t> expandedSliceShape;
+    for (auto [idx, reassociation] : llvm::enumerate(reassociations)) {
+      if (reassociation.size() == 1) {
+        expandedOffsets.push_back(offsets[idx]);
+        expandedSizes.push_back(sizes[idx]);
+        if (!rankReductionMask.contains(idx)) {
+          expandedSliceShape.push_back(staticSizes[idx]);
+        }
+        continue;
+      }
+      std::optional<int64_t> offset = getConstantIntValue(offsets[idx]);
+      if (!offset.has_value() || offset.value() != 0) {
+        return rewriter.notifyMatchFailure(
+            sliceOp, "slice has non zero offset along collapsed dimensions");
+      }
+      // Get product of constant reshape source sizes within the reassociation
+      // group. If any sizes are not constant, then bail.
+      int64_t groupFlatSize = 1;
+      for (auto groupIdx : reassociation) {
+        std::optional<int64_t> constSrcSize =
+            getConstantIntValue(reshapeSrcSizes[groupIdx]);
+        if (!constSrcSize) {
+          return rewriter.notifyMatchFailure(
+              sliceOp, "collapsed dimensions are not static");
+        }
+        groupFlatSize *= constSrcSize.value();
+
+        // Also save sizes and offsets for the expanded slice later.
+        expandedOffsets.push_back(rewriter.getIndexAttr(0));
+        expandedSizes.push_back(rewriter.getIndexAttr(constSrcSize.value()));
+        if (!rankReductionMask.contains(idx)) {
+          expandedSliceShape.push_back(constSrcSize.value());
+        }
+      }
+      // If the flat group size is not equal to the slice size, then bail.
+      std::optional<int64_t> size = getConstantIntValue(sizes[idx]);
+      if (!size.has_value() || size.value() != groupFlatSize) {
+        return rewriter.notifyMatchFailure(
+            sliceOp, "slice is not full along collapsed dimensions");
+      }
+    }
+
+    RankedTensorType expandedSliceType =
+        reshapeOp.getSrcType().clone(expandedSliceShape);
+    SmallVector<OpFoldResult> expandedStrides(expandedOffsets.size(),
+                                              rewriter.getIndexAttr(1));
+    auto expandedSlice = rewriter.create<tensor::ExtractSliceOp>(
+        reshapeOp->getLoc(), expandedSliceType, reshapeSrc, expandedOffsets,
+        expandedSizes, expandedStrides);
+
+    SmallVector<ReassociationIndices> sliceReassociations;
+    int64_t sliceReIdx = 0;
+    for (auto [idx, reassociation] : llvm::enumerate(reassociations)) {
+      ReassociationIndices reInds;
+      if (rankReductionMask.contains(idx)) {
+        continue;
+      }
+      for (int i = 0; i < reassociation.size(); ++i) {
+        reInds.push_back(sliceReIdx++);
+      }
+      sliceReassociations.push_back(reInds);
+    }
+
+    rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(sliceOp, expandedSlice,
+                                                         sliceReassociations);
+
+    return success();
+  }
+};
+
 struct TileAndDistributeToWorkgroupsUsingForallOpPass final
     : public impl::TileAndDistributeToWorkgroupsUsingForallOpPassBase<
           TileAndDistributeToWorkgroupsUsingForallOpPass> {
@@ -465,6 +576,12 @@ void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
     return std::nullopt;
   };
   tileAndFuseOptions.setFusionControlFn(controlFn);
+
+  RewritePatternSet cleanupPatterns(context);
+  cleanupPatterns.add<SwapExtractSliceOfCollapse>(context);
+  tileAndFuseOptions.cleanupPatterns =
+      FrozenRewritePatternSet(std::move(cleanupPatterns));
+
   rewriter.setInsertionPoint(tilableOp);
 
   // If the `tilableOp` is a `memref` op, then just tile the operation.
