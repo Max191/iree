@@ -126,29 +126,22 @@ getMmaScheduleFromProblemAndTarget(IREE::GPU::TargetAttr target,
   GPUMMAHeuristicSeeds seeds;
   assert(problem.aType == problem.bType &&
          "expected the same aType and bType.");
-  int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
 
   // Note that the following heuristic seeds are just placeholder values.
   // We need to clean it up and make it adjusting to different targets.
   // See https://github.com/iree-org/iree/issues/16341 for details.
-  int64_t mSize = ShapedType::getNumElements(problem.mSizes);
-  int64_t nSize = ShapedType::getNumElements(problem.nSizes);
-  if (mSize * nSize <= 512 * 512) {
+  if (problem.mSizes[0] * problem.nSizes[0] <= 512 * 512) {
     // For matmuls with small M*N size, we want to distribute M*N onto more
     // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
     // and a larger bestKTileCountPerSubgroup.
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
              /*bestMNTileCountPerSubgroup=*/4,
-             /*bestKTileCountPerSubgroup=*/8,
-             /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
+             /*bestKTileCountPerSubgroup=*/8};
   } else {
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
-             /*bestMNTileCountPerSubgroup=*/16,
-             /*bestKTileCountPerSubgroup=*/4,
-             /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / 2 /
-                 inBitWidth};
+             /*bestMNTileCountPerSubgroup=*/8,
+             /*bestKTileCountPerSubgroup=*/4};
   }
-
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
 
   // First try to find a schedule with an exactly matching intrinsic.
