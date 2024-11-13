@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -103,10 +104,22 @@ private:
 
 static LogicalResult commonRunOnOperation(
     MLIRContext *ctx, FunctionOpInterface funcOp, bool useOnlyReshapes,
-    bool tileOuterToOne,
+    bool tileOuterToOne, bool decomposeConfiguredOps,
     std::optional<PackUnPackControlFn> controlFn = std::nullopt) {
+  if (!decomposeConfiguredOps) {
+    controlFn = [&](Operation *op) -> LogicalResult {
+      if (getLoweringConfig(op)) {
+        return failure();
+      }
+      return controlFn ? controlFn.value()(op) : success();
+    };
+  }
   // Generalization patterns for outer unit dims have higher priority because
   // they do not generate reshape ops.
+  // TODO(Max191): These GeneralizeOuterUnitDims patterns do not have a control
+  // function, so they will not obey the control function of this pass. A
+  // control function needs to be added upstream, and then it can be passed
+  // here.
   if (!useOnlyReshapes) {
     RewritePatternSet patterns(ctx);
     patterns.add<linalg::DecomposeOuterUnitDimsPackOpPattern,
@@ -266,7 +279,8 @@ struct DecomposePackUnPackOpsPass final
 
 void DecomposePackUnPackOpsPass::runOnOperation() {
   if (failed(commonRunOnOperation(&getContext(), getOperation(),
-                                  useOnlyReshapes, tileOuterToOne))) {
+                                  useOnlyReshapes, tileOuterToOne,
+                                  decomposeConfiguredOps))) {
     return signalPassFailure();
   }
 }
@@ -349,6 +363,7 @@ static LogicalResult isUnpaddedAndAtBoundary(Operation *op) {
 void DecomposeBoundaryPackUnPackOpsPass::runOnOperation() {
   if (failed(commonRunOnOperation(&getContext(), getOperation(),
                                   /*useOnlyReshapes=*/true, tileOuterToOne,
+                                  decomposeConfiguredOps,
                                   isUnpaddedAndAtBoundary))) {
     return signalPassFailure();
   }

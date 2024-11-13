@@ -178,6 +178,8 @@ def DecomposePackUnPackOpsPass :
   let options = [
     Option<"tileOuterToOne", "tile-outer-to-one", "bool", "false",
            "Always apply tiling to make outer dimension be ones">,
+    Option<"decomposeConfiguredOps", "decompose-configured-ops", "bool", "true",
+           "Decompose pack and unpack ops with a lowering configuration.">,
     Option<"useOnlyReshapes", "use-only-reshapes", "bool", "false",
            "Use decomposition into reshape ops, even when packing unit dimensions.">
   ];
@@ -194,7 +196,9 @@ def DecomposeBoundaryPackUnPackOpsPass :
   let summary = "Wrapper for DecomposePackUnPackOpsPass to decompose ops at function boundaries";
   let options = [
     Option<"tileOuterToOne", "tile-outer-to-one", "bool", "false",
-           "Always apply tiling to make outer dimension be ones">
+           "Always apply tiling to make outer dimension be ones">,
+    Option<"decomposeConfiguredOps", "decompose-configured-ops", "bool", "true",
+           "Decompose pack and unpack ops with a lowering configuration.">
   ];
   let dependentDialects = [
     "arith::ArithDialect",

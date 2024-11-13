@@ -359,7 +359,11 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createGPUPromoteMatmulOperandsPass());
   funcPassManager.addPass(createGPUPackToIntrinsicsPass());
   // Decompose packs and unpacks that are at the function boundary.
-  funcPassManager.addPass(createDecomposeBoundaryPackUnPackOpsPass());
+  {
+    DecomposeBoundaryPackUnPackOpsPassOptions options;
+    options.decomposeConfiguredOps = false;
+    funcPassManager.addPass(createDecomposeBoundaryPackUnPackOpsPass(options));
+  }
 
   // Step 1.5. Expand result shapes of MultiMmaOps before tiling, and
   // propagate reshapes to the function boundary.
@@ -383,6 +387,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   // Step 3. Decompose pack and unpack ops and propagate the resulting reshapes.
   funcPassManager.addPass(createDecomposePackUnPackOpsPass(
       DecomposePackUnPackOpsPassOptions{/*tileOuterToOne=*/false,
+                                        /*decomposeConfiguredOps=*/true,
                                         /*useOnlyReshapes=*/true}));
 
   // Step 3.5. Expand the inner dimensions of MultiMma ops in preparation for
@@ -930,6 +935,7 @@ void addGPUPackUnPackPasses(OpPassManager &funcPassManager) {
 
   funcPassManager.addPass(createDecomposePackUnPackOpsPass(
       DecomposePackUnPackOpsPassOptions{/*tileOuterToOne=*/true,
+                                        /*decomposeConfiguredOps=*/true,
                                         /*useOnlyReshapes=*/false}));
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());

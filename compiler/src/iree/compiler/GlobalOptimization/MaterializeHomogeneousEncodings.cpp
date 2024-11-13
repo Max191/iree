@@ -78,6 +78,7 @@ struct MaterializeHomogeneousEncodingsPass final
       FunctionLikeNest(passManager).addPass([&]() {
         return createDecomposePackUnPackOpsPass(
             DecomposePackUnPackOpsPassOptions{/*tileOuterToOne=*/false,
+                                              /*decomposeConfiguredOps=*/true,
                                               /*useOnlyReshapes=*/true});
       });
     } else {
