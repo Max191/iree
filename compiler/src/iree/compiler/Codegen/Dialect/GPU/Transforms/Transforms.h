@@ -51,6 +51,15 @@ namespace mlir::iree_compiler::IREE::GPU {
 ///  [#gpu.thread<z>, #gpu.thread<y>, #gpu.thread<x>]
 /// or
 ///  [#gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]
+//  This will result in the loop body not obeying DPS,
+// but it is expected that there should be another consumer to fuse that is
+// a DPS op, which will correct the DPS of the forall body. For example, a
+// common result of this transformation can look like
+// ```
+// %original_dest = ...
+// %extracted_dest = tensor.extract_slice %original_dest ...
+// %forall = scf.forall ... shared_outs(%arg = %extracted_dest) ... {
+//   %slice = tensor.extract_slice
 LogicalResult fuseForallIntoConsumer(RewriterBase &rewriter,
                                      scf::ForallOp producer,
                                      scf::ForallOp consumer,
@@ -98,6 +107,53 @@ FailureOr<scf::ForallOp>
 fuseCollapseShapeIntoProducerForall(RewriterBase &rewriter,
                                     scf::ForallOp forallOp,
                                     tensor::CollapseShapeOp collapseOp);
+
+/// Function to fuse an extract slice op into a forall op producer. This rewrite
+/// effectively bubbles the extract_slice op up through the forall output
+/// operand, and the block argument inside the forall becomes the size of the
+/// slice. Only equivalent subset users are allowed on the forall init block
+/// argument, and all users of the block argument will be clamped to fit into
+/// the new slice.
+/// *NOTE: This can create dynamically zero sized tensors.
+///
+/// The following example illustrates a simple case of this transformation:
+/// ```
+/// %forall = scf.forall ... shared_outs(%arg = %dest) -> tensor<16xf32> {
+///   %init_slice = tensor.extract_slice %arg ...
+///       tensor<16xf32> to tensor<4xf32>
+///   ...
+///   scf.in_parallel {
+///     tensor.parallel_insert_slice %val into %arg ...
+///         tensor<4xf32> into tensor<16xf32>
+///   }
+/// }
+/// %extract = tensor.extract_slice %forall ...
+///     tensor<16xf32> into tensor<?xf32>
+/// ```
+/// After the transformation this would become:
+/// ```
+/// %extract = tensor.extract_slice %dest ...
+///     tensor<16xf32> into tensor<?xf32>
+/// %forall = scf.forall ... shared_outs(%arg = %extract) -> tensor<?xf32> {
+///   // `%init_slice` can be dynamically zero sized.
+///   %init_slice = tensor.extract_slice %arg ...
+///       tensor<?xf32> to tensor<?xf32>
+///   %padded_init_slice = tensor.pad %init_slice ...
+///       tensor<?xf32> to tensor<4xf32>
+///   ...
+///   // `%clamped_val` can be dynamically zero sized.
+///   %clamped_val = tensor.extract_slice %val ...
+///       tensor<4xf32> to tensor<?xf32>
+///   scf.in_parallel {
+///     tensor.parallel_insert_slice %clamped_val into %arg ...
+///         tensor<?xf32> into tensor<?xf32>
+///   }
+/// }
+/// ```
+FailureOr<scf::ForallOp>
+fuseExtractSliceIntoProducerForall(RewriterBase &rewriter,
+                                   scf::ForallOp forallOp,
+                                   tensor::ExtractSliceOp extractSliceOp);
 
 // Helper to convert a contraction-like linalg op to an iree_gpu.multi_mma.
 FailureOr<IREE::GPU::MultiMmaOp>
