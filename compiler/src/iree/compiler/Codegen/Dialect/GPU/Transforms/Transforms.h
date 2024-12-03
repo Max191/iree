@@ -56,6 +56,50 @@ LogicalResult fuseForallIntoConsumer(RewriterBase &rewriter,
                                      scf::ForallOp consumer,
                                      SmallVector<Operation *> consumerChain);
 
+/// Function to fuse a collapse shape op into a forall op producer. This
+/// rewrite effectively bubbles the collapse_shape op up through the forall
+/// output operand, and the block argument inside the forall becomes expanded
+/// with the reassociation indices of the collapse. Only equivalent subset users
+/// are allowed on the forall init block argument, and all users of the block
+/// argument will be collapsed. The following example illustrates a simple
+/// case of this transformation:
+///
+/// ```
+/// %forall = scf.forall ... shared_outs(%arg = %dest) -> tensor<4x4xf32> {
+///   %init_slice = tensor.extract_slice %arg ...
+///       tensor<4x4xf32> to tensor<1x4xf32>
+///   ...
+///   scf.in_parallel {
+///     tensor.parallel_insert_slice %val into %arg ...
+///         tensor<1x4xf32> into tensor<4x4xf32>
+///   }
+/// }
+/// %collapse = tensor.collapse_shape %forall ...
+///     tensor<4x4xf32> into tensor<16xf32>
+/// ```
+/// After the transformation this would become:
+/// ```
+/// %collapse = tensor.collapse_shape %dest ...
+///     tensor<4x4xf32> into tensor<16xf32>
+/// %forall = scf.forall ... shared_outs(%arg = %collapse) -> tensor<16xf32> {
+///   %init_slice = tensor.extract_slice %arg ...
+///       tensor<16xf32> to tensor<4xf32>
+///   %expanded_init_slice = tensor.expand_shape %init_slice ...
+///       tensor<4xf32> to tensor<1x4xf32>
+///   ...
+///   %collapsed_val = tensor.collapse_shape %val ...
+///       tensor<1x4xf32> to tensor<4xf32>
+///   scf.in_parallel {
+///     tensor.parallel_insert_slice %collapsed_val into %arg ...
+///         tensor<4xf32> into tensor<16xf32>
+///   }
+/// }
+/// ```
+FailureOr<scf::ForallOp>
+fuseCollapseShapeIntoProducerForall(RewriterBase &rewriter,
+                                    scf::ForallOp forallOp,
+                                    tensor::CollapseShapeOp collapseOp);
+
 // Helper to convert a contraction-like linalg op to an iree_gpu.multi_mma.
 FailureOr<IREE::GPU::MultiMmaOp>
 convertContractionToMultiMma(RewriterBase &rewriter, linalg::LinalgOp linalgOp,
