@@ -16,11 +16,16 @@
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
@@ -33,6 +38,261 @@ namespace mlir::iree_compiler::IREE::GPU {
 
 constexpr int64_t kCacheLineSizeBits = 128 * 8;
 constexpr int64_t kPreferredCopyNumBits = 128;
+
+template <typename T>
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const llvm::SmallVectorImpl<T> &vector) {
+  for (T element : vector) {
+    os << element << " ";
+  }
+
+  return os;
+}
+
+/// Compute the workgroup tile size multiples for pack or unpack based on the
+/// inner tile sizes. Returns a pair of vectors `{srcMultiples, destMultiples}`
+/// for the multiples required for the source and destination tensors.
+static std::pair<SmallVector<int64_t>, SmallVector<int64_t>>
+inferWorkgroupTileMultiplesFromPackUnPack(Operation *op) {
+  SmallVector<int64_t> srcMultiples, destMultiples;
+  llvm::TypeSwitch<Operation *, void>(op)
+      .Case<tensor::PackOp>([&](tensor::PackOp packOp) {
+        LDBG(
+            "Inferring workgroup tile size multiples from pack op: " << packOp);
+        srcMultiples.append(packOp.getSourceRank(), 1);
+        destMultiples.append(packOp.getSourceRank(), 1);
+        SmallVector<int64_t> innerTiles = packOp.getStaticTiles();
+        if (ShapedType::isDynamicShape(innerTiles)) {
+          destMultiples.append(SmallVector<int64_t>(innerTiles.size(), 1));
+          LLVM_DEBUG(DBGS() << "Cannot infer multiple for dynamic inner tiles."
+                               "Defaulting to all 1.");
+        }
+        for (auto [tile, pos] :
+             llvm::zip_equal(innerTiles, packOp.getInnerDimsPos())) {
+          destMultiples.push_back(tile);
+          srcMultiples[pos] *= tile;
+        }
+      })
+      .Case<tensor::UnPackOp>([&](tensor::UnPackOp unpackOp) {
+        LDBG("Inferring workgroup tile size multiples from unpack op: "
+             << unpackOp);
+        srcMultiples.append(unpackOp.getDestRank(), 1);
+        destMultiples.append(unpackOp.getDestRank(), 1);
+        SmallVector<int64_t> innerTiles = unpackOp.getStaticTiles();
+        if (ShapedType::isDynamicShape(innerTiles)) {
+          srcMultiples.append(SmallVector<int64_t>(innerTiles.size(), 1));
+          LLVM_DEBUG(DBGS() << "Cannot infer multiple for dynamic inner tiles."
+                               "Defaulting to all 1.");
+        }
+        for (auto [tile, pos] :
+             llvm::zip_equal(innerTiles, unpackOp.getInnerDimsPos())) {
+          srcMultiples.push_back(tile);
+          destMultiples[pos] *= tile;
+        }
+      })
+      .Default(
+          [](Operation *) { assert(false && "expected pack or unpack op"); });
+  return {srcMultiples, destMultiples};
+}
+
+/// Given some initial operand, result, and iteration space multiples, compute
+/// the least common multiples for each dimension of the iteration space, and
+/// adjust the given multiples so all operands, results, and iteration
+/// dimensions agree.
+static void inferWorkgroupTileMultiplesFromLinalgOp(
+    linalg::LinalgOp linalgOp, SmallVector<int64_t> &iterationMultiples,
+    SmallVector<SmallVector<int64_t>> &operandMultiples,
+    SmallVector<SmallVector<int64_t>> &resultMultiples) {
+  LDBG("Inferring workgroup tile size multiples for linalgOp: " << linalgOp);
+  LDBG("operandMultiples: " << operandMultiples);
+  LDBG("resultMultiples: " << resultMultiples);
+  SmallVector<int64_t> linalgOpMultiples(
+      linalgOp.getIteratorTypesArray().size(), 1);
+  for (auto [operandIdx, map, multiples] :
+       llvm::enumerate(linalgOp.getIndexingMapsArray(), operandMultiples)) {
+    for (auto [idx, dim] : llvm::enumerate(map.getResults())) {
+      auto dimExpr = dyn_cast<AffineDimExpr>(dim);
+      if (!dimExpr) {
+        continue;
+      }
+      int64_t dimPos = dimExpr.getPosition();
+      int64_t lcm = std::lcm(iterationMultiples[dimPos], multiples[idx]);
+      // If the operand is a DPS init, then include the result dims in the LCM.
+      int64_t dpsInitIdx = operandIdx - linalgOp.getNumDpsInputs();
+      if (dpsInitIdx >= 0) {
+        lcm = std::lcm(resultMultiples[dpsInitIdx][idx], lcm);
+        resultMultiples[dpsInitIdx][idx] = lcm;
+      }
+      iterationMultiples[dimPos] = lcm;
+      operandMultiples[operandIdx][idx] = lcm;
+    }
+  }
+  LDBG("iterationMultiples: " << iterationMultiples);
+}
+
+static SmallVector<int64_t> getDefaultValueMultiples(Value v) {
+  auto shapedType = dyn_cast<ShapedType>(v.getType());
+  return shapedType ? SmallVector<int64_t>(shapedType.getRank(), 1)
+                    : SmallVector<int64_t>();
+}
+
+static SmallVector<int64_t> inferResultWorkgroupTileMultiples(OpResult result) {
+  LDBG("Inferring workgroup tile size multiples for result: " << result);
+  // Gather multiples for all operands from producers.
+  Operation *op = result.getOwner();
+  auto getOperandMultiples = [&]() -> SmallVector<SmallVector<int64_t>> {
+    SmallVector<SmallVector<int64_t>> operandMultiples;
+    for (Value operand : op->getOperands()) {
+      auto producerResult = dyn_cast<OpResult>(operand);
+      if (!producerResult) {
+        operandMultiples.push_back(getDefaultValueMultiples(operand));
+        continue;
+      }
+      operandMultiples.push_back(
+          inferResultWorkgroupTileMultiples(producerResult));
+    }
+    return operandMultiples;
+  };
+  // Propagate the operand multiples through the given operation to compute
+  // the multiples for the desired result.
+  return llvm::TypeSwitch<Operation *, SmallVector<int64_t>>(op)
+      .Case<tensor::ExpandShapeOp>([&](tensor::ExpandShapeOp expandOp) {
+        SmallVector<int64_t> srcMultiples = getOperandMultiples()[0];
+        LDBG("Inferring workgroup tile size multiples for expand_shape "
+             "result: "
+             << result);
+        SmallVector<int64_t> multiples(expandOp.getResultType().getRank(), 1);
+        ArrayRef<int64_t> outputShape = expandOp.getStaticOutputShape();
+        for (auto [multiple, group] : llvm::zip_equal(
+                 srcMultiples, expandOp.getReassociationIndices())) {
+          if (group.size() == 1) {
+            multiples[group[0]] = multiple;
+            continue;
+          }
+          int64_t residualMultiple = multiple;
+          for (int i = group.size() - 1; i >= 0; --i) {
+            int64_t outputSize = outputShape[group[i]];
+            if (ShapedType::isDynamic(outputSize)) {
+              LLVM_DEBUG(DBGS() << "Cannot infer multiple with dynamic size. "
+                                   "defaulting to all 1");
+              multiples = SmallVector<int64_t>(outputShape.size(), 1);
+              return multiples;
+            }
+            if (residualMultiple % outputSize != 0) {
+              LLVM_DEBUG(DBGS() << "Expanded size does not divide producer "
+                                   "multiple. Defaulting to all 1");
+              multiples = SmallVector<int64_t>(outputShape.size(), 1);
+              return multiples;
+            }
+            if (residualMultiple >= outputSize) {
+              multiples[group[i]] = outputSize;
+              residualMultiple /= outputSize;
+              continue;
+            }
+            multiples[group[i]] = residualMultiple;
+            residualMultiple = 1;
+            break;
+          }
+        }
+        LLVM_DEBUG(DBGS() << "Inferred expand_shape result multiples: "
+                          << multiples);
+        return multiples;
+      })
+      .Case<tensor::PackOp>([&](tensor::PackOp) {
+        return inferWorkgroupTileMultiplesFromPackUnPack(op).second;
+      })
+      .Case<tensor::UnPackOp>([&](tensor::UnPackOp) {
+        return inferWorkgroupTileMultiplesFromPackUnPack(op).second;
+      })
+      .Case<linalg::LinalgOp>([&](linalg::LinalgOp linalgOp) {
+        SmallVector<SmallVector<int64_t>> operandMultiples =
+            getOperandMultiples();
+        LDBG("Inferring workgroup tile size multiples for linalg op result #"
+             << result.getResultNumber() << ": " << result);
+        SmallVector<SmallVector<int64_t>> resultMultiples = llvm::map_to_vector(
+            linalgOp->getResults(), getDefaultValueMultiples);
+        SmallVector<int64_t> iterationMultiples(
+            linalgOp.getIteratorTypesArray().size(), 1);
+        inferWorkgroupTileMultiplesFromLinalgOp(
+            linalgOp, iterationMultiples, operandMultiples, resultMultiples);
+        return resultMultiples[result.getResultNumber()];
+      })
+      .Default([&](Operation *) {
+        LDBG("Unsupported operation. Defualting to all 1: " << result);
+        return getDefaultValueMultiples(result);
+      });
+}
+
+static SmallVector<int64_t> inferUseWorkgroupTileMultiples(OpOperand *use) {
+  LDBG("Inferring workgroup tile size multiples for operand "
+       << use->getOperandNumber() << " of user: " << use->getOwner());
+  // Gather multiples for all operands from producers.
+  Operation *op = use->getOwner();
+  auto getResultMultiples = [&]() -> SmallVector<SmallVector<int64_t>> {
+    SmallVector<SmallVector<int64_t>> resultMultiples;
+    for (Value result : op->getResults()) {
+      for (OpOperand &opUse : result.getUses()) {
+        resultMultiples.push_back(inferUseWorkgroupTileMultiples(&opUse));
+      }
+    }
+    return resultMultiples;
+  };
+  // Propagate the operand multiples through the given operation to compute
+  // the multiples for the desired result.
+  return llvm::TypeSwitch<Operation *, SmallVector<int64_t>>(op)
+      .Case<tensor::CollapseShapeOp>([&](tensor::CollapseShapeOp collapseOp) {
+        SmallVector<int64_t> destMultiples = getResultMultiples()[0];
+        LDBG("Inferring workgroup tile size multiples for collapse_shape "
+             "source: "
+             << collapseOp);
+        SmallVector<int64_t> multiples(collapseOp.getSrcType().getRank(), 1);
+        ArrayRef<int64_t> expandedShape = collapseOp.getSrcType().getShape();
+        for (auto [multiple, group] : llvm::zip_equal(
+                 destMultiples, collapseOp.getReassociationIndices())) {
+          if (group.size() == 1) {
+            multiples[group[0]] = multiple;
+            continue;
+          }
+          int64_t residualMultiple = multiple;
+          for (int i = group.size() - 1; i >= 0; --i) {
+            int64_t expandedSize = expandedShape[group[i]];
+            if (ShapedType::isDynamic(expandedSize)) {
+              LLVM_DEBUG(DBGS() << "Cannot infer multiple with dynamic size. "
+                                   "defaulting to all 1");
+              multiples = SmallVector<int64_t>(expandedShape.size(), 1);
+              return multiples;
+            }
+            if (residualMultiple % expandedSize != 0) {
+              LLVM_DEBUG(DBGS() << "Expanded size does not divide producer "
+                                   "multiple. Defaulting to all 1");
+              multiples = SmallVector<int64_t>(expandedShape.size(), 1);
+              return multiples;
+            }
+            if (residualMultiple >= expandedSize) {
+              multiples[group[i]] = expandedSize;
+              residualMultiple /= expandedSize;
+              continue;
+            }
+            multiples[group[i]] = residualMultiple;
+            residualMultiple = 1;
+            break;
+          }
+        }
+        LLVM_DEBUG(DBGS() << "Inferred collapse_shape source multiples: "
+                          << multiples);
+        return multiples;
+      })
+      .Case<tensor::PackOp>([&](tensor::PackOp) {
+        return inferWorkgroupTileMultiplesFromPackUnPack(op).first;
+      })
+      .Case<tensor::UnPackOp>([&](tensor::UnPackOp) {
+        return inferWorkgroupTileMultiplesFromPackUnPack(op).first;
+      })
+      .Default([&](Operation *) {
+        LDBG("Unsupported operation. Defualting to all 1: " << use->get());
+        return getDefaultValueMultiples(use->get());
+      });
+}
 
 LogicalResult setDataTiledMultiMmaLoweringConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
@@ -668,6 +928,28 @@ LogicalResult setTileAndFuseLoweringConfig(IREE::GPU::TargetAttr target,
     }
   }
 
+  SmallVector<SmallVector<int64_t>> operandMultiples;
+  for (Value operand : linalgOp->getOperands()) {
+    auto result = dyn_cast<OpResult>(operand);
+    operandMultiples.push_back(result
+                                   ? inferResultWorkgroupTileMultiples(result)
+                                   : getDefaultValueMultiples(operand));
+  }
+  SmallVector<SmallVector<int64_t>> resultMultiples;
+  for (Value result : linalgOp->getResults()) {
+    for (OpOperand &use : result.getUses()) {
+      resultMultiples.push_back(inferUseWorkgroupTileMultiples(&use));
+    }
+  }
+  SmallVector<int64_t> tileSizeMultiples(
+      linalgOp.getIteratorTypesArray().size(), 1);
+  inferWorkgroupTileMultiplesFromLinalgOp(linalgOp, tileSizeMultiples,
+                                          operandMultiples, resultMultiples);
+  for (int i = 0; i < workgroupTileSizes.size(); ++i) {
+    workgroupTileSizes[i] =
+        std::max(tileSizeMultiples[i], workgroupTileSizes[i]);
+  }
+
   // Attach the MMA schedule as an attribute to the entry point export function
   // for later access in the pipeline.
   MLIRContext *context = linalgOp.getContext();
@@ -807,7 +1089,6 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
   Builder b(context);
   attrs.emplace_back(StringAttr::get(context, "workgroup"),
                      b.getI64ArrayAttr(workgroupTileSizes));
-
   attrs.emplace_back(StringAttr::get(context, "thread"),
                      b.getI64ArrayAttr(threadTileSizes));
 
@@ -821,6 +1102,134 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
       entryPoint, scatter, loweringConfig,
       IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTileAndFuse,
       {flatWorkgroupSize, 1, 1}, flatWorkgroupSize, DictionaryAttr());
+}
+
+LogicalResult setPackUnPackLoweringConfig(IREE::GPU::TargetAttr target,
+                                          mlir::FunctionOpInterface entryPoint,
+                                          Operation *op) {
+  if (!isa<tensor::PackOp, tensor::UnPackOp>(op)) {
+    return failure();
+  }
+  auto resultType = cast<RankedTensorType>(op->getResultTypes()[0]);
+  const int subgroupSize = target.getPreferredSubgroupSize();
+
+  // We want a large enough workgroup tile size so that each thread will have
+  // enough elements to load in a potentially coalesced manner. We are also
+  // restricted to workgroup tile sizes that are a multiple of the inner tiles.
+  // For PackOp, this means all inner tile dimensions must be full, and for
+  // UnPackOp, the tile sizes should be multiples of the corresponding inner
+  // tiles.
+  const int minPreferredBitsPerSubgroup = kPreferredCopyNumBits * subgroupSize;
+  const int minPreferredElementsPerSubgroup = llvm::divideCeil(
+      minPreferredBitsPerSubgroup, resultType.getElementTypeBitWidth());
+
+  SmallVector<int64_t> workgroupTileSizes;
+  LogicalResult status =
+      llvm::TypeSwitch<Operation *, LogicalResult>(op)
+          .Case<tensor::PackOp>([&](tensor::PackOp packOp) {
+            SmallVector<int64_t> innerTiles = packOp.getStaticTiles();
+            if (ShapedType::isDynamicShape(innerTiles)) {
+              LDBG("pack op has dynamic inner tiles");
+              return failure();
+            }
+            int64_t innerTileNumElements =
+                std::reduce(innerTiles.begin(), innerTiles.end(), 1,
+                            std::multiplies<int64_t>());
+            int64_t numInnerTiles = llvm::divideCeil(
+                minPreferredElementsPerSubgroup, innerTileNumElements);
+            int64_t outerTilesRank = resultType.getRank() - innerTiles.size();
+            // Initialize outer tile sizes to 1 and try to distribute any static
+            // sizes from innermost to outermost in order to have at least
+            // `numInnerTiles` in each workgroup tile.
+            workgroupTileSizes.append(SmallVector<int64_t>(outerTilesRank, 1));
+            for (int i = outerTilesRank - 1; i >= 0; --i) {
+              // Dynamic dims will be tiled to 1.
+              if (resultType.isDynamicDim(i)) {
+                continue;
+              }
+              // Distribute the full dimension if possible.
+              if (resultType.getDimSize(i) < numInnerTiles) {
+                workgroupTileSizes[i] = 0;
+                numInnerTiles =
+                    llvm::divideCeil(numInnerTiles, resultType.getDimSize(i));
+                continue;
+              }
+              workgroupTileSizes[i] = llvm::PowerOf2Ceil(numInnerTiles);
+              if (workgroupTileSizes[i] >= resultType.getDimSize(i)) {
+                workgroupTileSizes[i] = 0;
+              }
+              break;
+            }
+            workgroupTileSizes.append(innerTiles);
+            return success();
+          })
+          .Case<tensor::UnPackOp>([&](tensor::UnPackOp unpackOp) {
+            SmallVector<int64_t> innerTiles = unpackOp.getStaticTiles();
+            if (ShapedType::isDynamicShape(innerTiles)) {
+              LDBG("pack op has dynamic inner tiles");
+              return failure();
+            }
+            int64_t innerTileNumElements =
+                std::reduce(innerTiles.begin(), innerTiles.end(), 1,
+                            std::multiplies<int64_t>());
+            int64_t numInnerTiles = llvm::divideCeil(
+                minPreferredElementsPerSubgroup, innerTileNumElements);
+            // Initialize tile sizes to the innerTiles sizes.
+            workgroupTileSizes.append(
+                SmallVector<int64_t>(resultType.getRank(), 1));
+            for (auto [pos, tile] :
+                 llvm::zip_equal(unpackOp.getInnerDimsPos(), innerTiles)) {
+              workgroupTileSizes[pos] = tile;
+            }
+
+            for (int i = resultType.getRank() - 1; i >= 0; --i) {
+              // Dynamic dims get a single tile.
+              if (resultType.isDynamicDim(i)) {
+                continue;
+              }
+              int64_t numTiles = llvm::divideFloorSigned(
+                  resultType.getDimSize(i), workgroupTileSizes[i]);
+              // Distribute as much of the dimension as possible while still
+              // being a multiple of the innerTiles size.
+              if (numTiles < numInnerTiles) {
+                workgroupTileSizes[i] *= numTiles;
+                numInnerTiles = llvm::divideCeil(numInnerTiles, numTiles);
+                continue;
+              }
+              workgroupTileSizes[i] *= std::min<int64_t>(
+                  llvm::PowerOf2Ceil(numInnerTiles), numTiles);
+              break;
+            }
+            return success();
+          })
+          .Default([](Operation *) {
+            assert(false && "unexpected non pack or unpack op");
+            return failure();
+          });
+  if (failed(status)) {
+    return failure();
+  }
+
+  // Just use one subgroup for now.
+  int64_t flatWorkgroupSize = subgroupSize;
+
+  // Only set the workgroup tile sizes, since pack and unpack ops will be
+  // decomposed before thread tiling.
+  MLIRContext *context = op->getContext();
+  SmallVector<NamedAttribute, 1> attrs;
+  Builder b(context);
+  attrs.emplace_back(StringAttr::get(context, "workgroup"),
+                     b.getI64ArrayAttr(workgroupTileSizes));
+  auto configDict = DictionaryAttr::get(context, attrs);
+  auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
+
+  LDBG("Selected pack or unpack lowering config: " << loweringConfig << "\n");
+
+  // TODO(qedawkins): Use a shared pipeline identifier here.
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPoint, op, loweringConfig,
+      IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTileAndFuse,
+      {flatWorkgroupSize, 1, 1}, subgroupSize, DictionaryAttr());
 }
 
 //===----------------------------------------------------------------------===//

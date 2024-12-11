@@ -47,6 +47,12 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
                                        mlir::FunctionOpInterface entryPoint,
                                        Operation *op);
 
+/// Helper for setting up a default tile and fuse config for pack and unpack
+/// ops.
+LogicalResult setPackUnPackLoweringConfig(IREE::GPU::TargetAttr target,
+                                          mlir::FunctionOpInterface entryPoint,
+                                          Operation *op);
+
 //===----------------------------------------------------------------------===//
 // Pass Pipeline Options
 //===----------------------------------------------------------------------===//

@@ -35,6 +35,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Matchers.h"
@@ -2372,6 +2373,11 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
       LDBG("Tile and fuse default config");
       return success();
     }
+    if (succeeded(IREE::GPU::setPackUnPackLoweringConfig(target, entryPointFn,
+                                                         computeOp))) {
+      LDBG("Tile and fuse Pack UnPack config");
+      return success();
+    }
   }
   if (succeeded(setVectorDistributionConfig(target, entryPointFn, computeOp))) {
     return success();
@@ -2517,8 +2523,8 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
   // Find the root operation. linalg.generic, linalg.fill, and scatter are not
   // root operations if there are other compute operations present.
   for (Operation *op : llvm::reverse(computeOps)) {
-    if (!isa<linalg::GenericOp, linalg::FillOp, IREE::LinalgExt::ScatterOp>(
-            op)) {
+    if (!isa<linalg::GenericOp, linalg::FillOp, IREE::LinalgExt::ScatterOp,
+             tensor::PackOp, tensor::UnPackOp>(op)) {
       rootOperation = op;
       break;
     }
@@ -2531,10 +2537,21 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
     }
   }
 
-  // Generic ops take priority over scatter and fill ops as the root op.
+  // // tensor.pack and tensor.unpack take priority over other parallel ops.
+  // if (!rootOperation) {
+  //   for (Operation *op : llvm::reverse(computeOps)) {
+  //     if (isa<tensor::PackOp, tensor::UnPackOp>(op)) {
+  //       rootOperation = op;
+  //       break;
+  //     }
+  //   }
+  // }
+
+  // Generic, pack and unpack ops take priority over scatter and fill ops as the
+  // root op.
   if (!rootOperation) {
     for (Operation *op : llvm::reverse(computeOps)) {
-      if (isa<linalg::GenericOp>(op)) {
+      if (isa<linalg::GenericOp, tensor::PackOp, tensor::UnPackOp>(op)) {
         rootOperation = op;
         break;
       }
@@ -2549,6 +2566,15 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
       }
     }
   }
+
+  // if (!rootOperation) {
+  //   for (Operation *op : llvm::reverse(computeOps)) {
+  //     if (isa<tensor::PackOp, tensor::UnPackOp>(op)) {
+  //       rootOperation = op;
+  //       break;
+  //     }
+  //   }
+  // }
 
   if (!rootOperation) {
     // No root operation found, set it to none.

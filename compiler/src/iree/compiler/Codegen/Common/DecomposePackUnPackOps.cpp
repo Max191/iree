@@ -106,8 +106,9 @@ static LogicalResult commonRunOnOperation(
     MLIRContext *ctx, FunctionOpInterface funcOp, bool useOnlyReshapes,
     bool tileOuterToOne, bool decomposeConfiguredOps,
     std::optional<PackUnPackControlFn> controlFn = std::nullopt) {
+  std::optional<PackUnPackControlFn> composedControlFn = controlFn;
   if (!decomposeConfiguredOps) {
-    controlFn = [&](Operation *op) -> LogicalResult {
+    composedControlFn = [&](Operation *op) -> LogicalResult {
       if (getLoweringConfig(op)) {
         return failure();
       }
@@ -136,7 +137,7 @@ static LogicalResult commonRunOnOperation(
   // tiled to one.
   if (!tileOuterToOne) {
     RewritePatternSet patterns(ctx);
-    patterns.add<LowerPackPattern, LowerUnPackPattern>(ctx, controlFn);
+    patterns.add<LowerPackPattern, LowerUnPackPattern>(ctx, composedControlFn);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       funcOp.emitError(
           "failed to apply generalization patterns on pack/unpack ops for "
@@ -171,7 +172,7 @@ static LogicalResult commonRunOnOperation(
             }));
     {
       WalkResult status = funcOp->walk([&](tensor::PackOp op) {
-        if (controlFn && failed(controlFn.value()(op))) {
+        if (composedControlFn && failed(composedControlFn.value()(op))) {
           return WalkResult::advance();
         }
         FailureOr<scf::SCFTileAndFuseResult> tileAndFuseResult =
@@ -206,7 +207,7 @@ static LogicalResult commonRunOnOperation(
             });
     {
       WalkResult status = funcOp->walk([&](tensor::UnPackOp op) {
-        if (controlFn && failed(controlFn.value()(op))) {
+        if (composedControlFn && failed(composedControlFn.value()(op))) {
           return WalkResult::advance();
         }
         FailureOr<scf::SCFTilingResult> tilingResult = scf::tileUsingSCF(
@@ -251,7 +252,8 @@ static LogicalResult commonRunOnOperation(
   {
     RewritePatternSet patterns(ctx);
     if (useOnlyReshapes) {
-      patterns.add<LowerPackPattern, LowerUnPackPattern>(ctx, controlFn);
+      patterns.add<LowerPackPattern, LowerUnPackPattern>(ctx,
+                                                         composedControlFn);
     } else {
       patterns.add<linalg::DecomposeOuterUnitDimsPackOpPattern,
                    linalg::DecomposeOuterUnitDimsUnPackOpPattern>(ctx);

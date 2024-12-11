@@ -16,6 +16,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -35,6 +36,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/SubsetOpInterface.h"
 
 #define DEBUG_TYPE "iree-codegen-gpu-transforms"
 
@@ -342,6 +344,30 @@ collapsableSlicePrecondition(RewriterBase &rewriter,
   return success();
 }
 
+static Operation *
+setInsertionPointToLastIndexOperand(RewriterBase &rewriter,
+                                    tensor::ParallelInsertSliceOp op) {
+  DominanceInfo domInfo;
+  auto subsetOp = cast<SubsetInsertionOpInterface>(op.getOperation());
+  SmallVector<Value> values = subsetOp.getValuesNeededToBuildSubsetExtraction();
+  Operation *lastOp = nullptr;
+  for (auto val : values) {
+    auto definingOp = val.getDefiningOp();
+    if (!definingOp) {
+      definingOp = cast<BlockArgument>(val).getParentBlock()->getParentOp();
+    }
+    if (!lastOp || domInfo.dominates(lastOp, definingOp)) {
+      lastOp = definingOp;
+      if (auto blockArg = dyn_cast<BlockArgument>(val)) {
+        rewriter.setInsertionPointToStart(blockArg.getParentBlock());
+        continue;
+      }
+      rewriter.setInsertionPointAfter(lastOp);
+    }
+  }
+  return lastOp;
+}
+
 /// Collapse all `ops` with the given `reassociations`. All `ops` are expected
 /// to have equivalent offsets, sizes, and strides. All strides are expected to
 /// be 1. This function assumes that the parallelInsertOp passes the
@@ -351,8 +377,8 @@ collapseParallelInsertOp(RewriterBase &rewriter,
                          tensor::ParallelInsertSliceOp parallelInsertOp,
                          SmallVector<ReassociationIndices> reassociations) {
   // Compute the collapsed offsets, sizes, and strides.
-  rewriter.setInsertionPoint(parallelInsertOp.getParallelCombiningParent());
-  Location loc = parallelInsertOp.getParallelCombiningParent()->getLoc();
+  auto lastOp = setInsertionPointToLastIndexOperand(rewriter, parallelInsertOp);
+  Location loc = lastOp->getLoc();
   int64_t resultIdx = parallelInsertOp.getTiedOpResult().getResultNumber();
   auto forallOp = parallelInsertOp->getParentOfType<scf::ForallOp>();
   Value loopInit = forallOp.getOutputs()[resultIdx];
@@ -543,8 +569,8 @@ clampParallelInsertSliceOp(RewriterBase &rewriter,
                            SmallVector<OpFoldResult> upperBoundSizes) {
   // Clamp the sizes of the parallel insert source.
   OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPoint(parallelInsertOp.getParallelCombiningParent());
-  Location loc = parallelInsertOp.getParallelCombiningParent()->getLoc();
+  auto lastOp = setInsertionPointToLastIndexOperand(rewriter, parallelInsertOp);
+  Location loc = lastOp->getLoc();
 
   auto clampSizes = [&](SmallVector<OpFoldResult> offsets,
                         SmallVector<OpFoldResult> sizes, Location loc) {
