@@ -298,7 +298,7 @@ collapsableSlicePrecondition(RewriterBase &rewriter,
     return rewriter.notifyMatchFailure(sliceOp, "strides are not all 1");
   }
   SmallVector<OpFoldResult> sizes = sliceOp.getMixedSizes();
-  RankedTensorType fullTensorType = sliceOp.getSourceType();
+  RankedTensorType fullTensorType = sliceOp.getDestType();
   ArrayRef<int64_t> destShape = fullTensorType.getShape();
   for (auto group : reassociations) {
     bool isFullSlice = true;
@@ -314,8 +314,14 @@ collapsableSlicePrecondition(RewriterBase &rewriter,
         isFullSlice = false;
         continue;
       }
-      // Unit dimensions are always valid.
       if (constSize.value() == 1) {
+        if (destShape[idx] == 1) {
+          continue;
+        }
+        // Unit slices are okay as long as they are the outermost sliced dims.
+        // Any other non-unit sliced dimension that is more outer than the unit
+        // slice would be invalid, so we set `isFullSlice` to false.
+        isFullSlice = false;
         continue;
       }
       // If the size is not unit, then the slice must be full so far.
