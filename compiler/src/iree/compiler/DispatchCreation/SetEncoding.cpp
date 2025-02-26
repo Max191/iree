@@ -204,6 +204,42 @@ public:
       LDBG("Not setting encoding: matmul operands with more than one use");
       return failure();
     }
+    auto isFusable = [](Value v) -> bool {
+      if (llvm::isa_and_nonnull<IREE::Util::GlobalLoadOpInterface>(
+              v.getDefiningOp())) {
+        return true;
+      }
+      auto dispatchOp = v.getDefiningOp<IREE::Flow::DispatchRegionOp>();
+      if (!dispatchOp) {
+        return false;
+      }
+      if (!llvm::hasSingleElement(dispatchOp.getBody())) {
+        return false;
+      }
+      Block &regionBlock = dispatchOp.getBody().getBlocks().front();
+      for (Operation &op : regionBlock.getOperations()) {
+        if (llvm::none_of(op.getResultTypes(),
+                          [](Type v) { return isa<ShapedType>(v); })) {
+          continue;
+        }
+        if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp,
+                tensor::EmptyOp>(op)) {
+          continue;
+        }
+        auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+        if (!linalgOp) {
+          return false;
+        }
+        if (linalgOp.getNumReductionLoops() != 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!isFusable(lhs) || !isFusable(rhs)) {
+      LDBG("Not setting encoding: matmul operands are not fusable or foldable");
+      return failure();
+    }
     Value out = outputs[0];
 
     Type lhsElemType = getContractionInputTypeWithSignedness(
