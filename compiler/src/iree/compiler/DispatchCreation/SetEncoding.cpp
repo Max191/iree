@@ -165,6 +165,52 @@ static LogicalResult isSupportedContractionOp(PatternRewriter &rewriter,
   return success();
 }
 
+static bool isWhitelistShape(linalg::LinalgOp linalgOp) {
+  auto cDims = linalg::inferContractionDims(linalgOp);
+  if (linalgOp.getStaticLoopRanges()[cDims->k.back()] != 1280 ||
+      linalgOp.getStaticLoopRanges()[cDims->m.back()] != 32768 ||
+      linalgOp.getStaticLoopRanges()[cDims->n.back()] != 10240) {
+    return false;
+  }
+  return true;
+}
+
+// static bool isFusableWhitelistShape(linalg::LinalgOp linalgOp) {
+//   return false;
+//   // auto cDims = linalg::inferContractionDims(linalgOp);
+//   // if (linalgOp.getStaticLoopRanges()[cDims->k.back()] != 5120 ||
+//   //     linalgOp.getStaticLoopRanges()[cDims->m.back()] != 32768 ||
+//   //     linalgOp.getStaticLoopRanges()[cDims->n.back()] != 1280) {
+//   //   return false;
+//   // }
+//   // return true;
+// }
+
+// static bool isFusableDispatch(IREE::Flow::DispatchRegionOp dispatchOp) {
+//   if (!llvm::hasSingleElement(dispatchOp.getBody())) {
+//     return false;
+//   }
+//   Block &regionBlock = dispatchOp.getBody().getBlocks().front();
+//   for (Operation &op : regionBlock.getOperations()) {
+//     if (llvm::none_of(op.getResultTypes(),
+//                       [](Type v) { return isa<ShapedType>(v); })) {
+//       continue;
+//     }
+//     if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp,
+//             tensor::EmptyOp, tensor::ExtractSliceOp>(op)) {
+//       continue;
+//     }
+//     auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+//     if (!linalgOp) {
+//       return false;
+//     }
+//     if (linalgOp.getNumReductionLoops() != 0) {
+//       return false;
+//     }
+//   }
+//   return true;
+// }
+
 namespace {
 
 class SetContractionOpEncoding final
@@ -204,40 +250,32 @@ public:
       LDBG("Not setting encoding: matmul operands with more than one use");
       return failure();
     }
-    auto isFusable = [](Value v) -> bool {
-      if (llvm::isa_and_nonnull<IREE::Util::GlobalLoadOpInterface>(
-              v.getDefiningOp())) {
-        return true;
-      }
-      auto dispatchOp = v.getDefiningOp<IREE::Flow::DispatchRegionOp>();
-      if (!dispatchOp) {
-        return false;
-      }
-      if (!llvm::hasSingleElement(dispatchOp.getBody())) {
-        return false;
-      }
-      Block &regionBlock = dispatchOp.getBody().getBlocks().front();
-      for (Operation &op : regionBlock.getOperations()) {
-        if (llvm::none_of(op.getResultTypes(),
-                          [](Type v) { return isa<ShapedType>(v); })) {
-          continue;
-        }
-        if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp,
-                tensor::EmptyOp>(op)) {
-          continue;
-        }
-        auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-        if (!linalgOp) {
-          return false;
-        }
-        if (linalgOp.getNumReductionLoops() != 0) {
-          return false;
-        }
-      }
-      return true;
-    };
-    if (!isFusable(lhs) || !isFusable(rhs)) {
-      LDBG("Not setting encoding: matmul operands are not fusable or foldable");
+    // auto isFusable = [&](Value v) -> bool {
+    //   if (!isFusableWhitelistShape(linalgOp)) {
+    //     return false;
+    //   }
+    //   if (auto collapseOp = v.getDefiningOp<tensor::CollapseShapeOp>()) {
+    //     auto dispatchOp = collapseOp.getSrc().getDefiningOp<IREE::Flow::DispatchRegionOp>();
+    //     if (!dispatchOp) {
+    //       return false;
+    //     }
+    //     return isFusableDispatch(dispatchOp);
+    //   }
+    //   if (llvm::isa_and_nonnull<IREE::Util::GlobalLoadOpInterface>(
+    //           v.getDefiningOp())) {
+    //     return true;
+    //   }
+    //   auto dispatchOp = v.getDefiningOp<IREE::Flow::DispatchRegionOp>();
+    //   if (!dispatchOp) {
+    //     return false;
+    //   }
+    //   return isFusableDispatch(dispatchOp);
+    // };
+    if (!isWhitelistShape(linalgOp)) {
+      // if (!isFusable(lhs) || !isFusable(rhs)) {
+      //   LDBG("Not setting encoding: matmul operands are not fusable or foldable");
+      //   return failure();
+      // }
       return failure();
     }
     Value out = outputs[0];

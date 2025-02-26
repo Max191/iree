@@ -339,6 +339,7 @@ void BlockDynamicDimensionsPass::runOnOperation() {
     };
     linalg::populateFoldReshapeOpsByExpansionPatterns(bubbleExpandShapePatterns,
                                                       controlFn);
+    // tensor::populateBubbleUpExpandShapePatterns(bubbleExpandShapePatterns);
     IREE::LinalgExt::populateFoldReshapeOpsByExpansionPatterns(
         bubbleExpandShapePatterns, controlFn);
     // Add patterns to fold the "bubbled-up" `tensor.expand_shape` operation and

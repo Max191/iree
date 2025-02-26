@@ -45,7 +45,7 @@ static bool isFusableWithSetEncoding(Operation *op) {
                       [](Type v) { return isa<ShapedType>(v); })) {
       continue;
     }
-    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(
+    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp, tensor::ExtractSliceOp>(
             op)) {
       continue;
     }
@@ -180,22 +180,60 @@ struct FuseEncodingOpsIntoDispatchRegionsPass
     mlir::FunctionOpInterface funcOp = getOperation();
     MLIRContext *context = &getContext();
 
-    // Apply some propagation.
-    // TODO(MaheshRavishankar): This logic needs to be folded into propagation.
-    {
-      RewritePatternSet propagationPatterns(context);
-      propagationPatterns.insert<SwapEncodingOpWithTensorCollapseShapeOp>(
-          context);
-      GreedyRewriteConfig config;
-      config.fold = true;
-      if (failed(applyPatternsGreedily(funcOp, std::move(propagationPatterns),
-                                       config))) {
-        funcOp.emitOpError("failed to propagate encodings");
-        return signalPassFailure();
-      }
-    }
+    // // Apply some propagation.
+    // // TODO(MaheshRavishankar): This logic needs to be folded into propagation.
+    // {
+    //   RewritePatternSet propagationPatterns(context);
+    //   propagationPatterns.insert<SwapEncodingOpWithTensorCollapseShapeOp>(
+    //       context);
+    //   GreedyRewriteConfig config;
+    //   config.fold = true;
+    //   if (failed(applyPatternsGreedily(funcOp, std::move(propagationPatterns),
+    //                                    config))) {
+    //     funcOp.emitOpError("failed to propagate encodings");
+    //     return signalPassFailure();
+    //   }
+    // }
 
     IRRewriter rewriter(context);
+
+    // SmallVector<tensor::CollapseShapeOp> collapseOps;
+    // funcOp->walk([&](tensor::CollapseShapeOp collapseOp) {
+    //   if (IREE::Flow::isNonNullAndOutsideDispatch(collapseOp)) {
+    //     collapseOps.push_back(collapseOp);
+    //   }
+    // });
+
+    // for (tensor::CollapseShapeOp collapseOp : collapseOps) {
+    //   OpOperand &operand = collapseOp.getSrcMutable();
+    //   auto producerDispatch =
+    //       operand.get().getDefiningOp<IREE::Flow::DispatchRegionOp>();
+    //   // Nothing to fuse with, so wrap the `collapseOp` in its own dispatch.
+    //   if (!producerDispatch) {
+    //     continue;
+    //   }
+
+    //   // Find producer operation inside of the dispatch region to determine if
+    //   // fusion is possible.
+    //   auto result = cast<OpResult>(operand.get());
+    //   auto dispatchReturnOp = cast<IREE::Flow::ReturnOp>(
+    //       producerDispatch.getBody().front().getTerminator());
+    //   auto producerInRegion = dyn_cast<OpResult>(
+    //       dispatchReturnOp->getOperand(result.getResultNumber()));
+    //   if (!producerInRegion) {
+    //     continue;
+    //   }
+
+    //   // Place the op in its own dispatch region if fusion is not possible.
+    //   if (!isFusableWithSetEncoding(producerInRegion.getOwner())) {
+    //     continue;
+    //   }
+    //   // Fuse the `encodingOp` into the producer dispatch region.
+    //   if (failed(moveFollowingOpIntoDispatchRegion(rewriter, collapseOp,
+    //                                                producerDispatch))) {
+    //     return signalPassFailure();
+    //   }
+    // }
 
     SmallVector<IREE::Encoding::SetEncodingOp> encodingOps;
     funcOp->walk([&](IREE::Encoding::SetEncodingOp encodingOp) {
