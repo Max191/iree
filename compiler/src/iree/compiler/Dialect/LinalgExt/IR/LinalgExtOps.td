@@ -319,6 +319,55 @@ def IREELinalgExt_GatherOp : IREELinalgExt_Op<"gather",
   }];
 }
 
+def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter",
+    [
+    //  DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
+    //  DeclareOpInterfaceMethods<LinalgFusionInterface,
+    //   ["getIndexingMapsForResults", "getIndexingMapsForOperands",
+    //    "getStaticLoopRanges"]>,
+    //  DeclareOpInterfaceMethods<TilingInterface,
+    //     ["generateScalarImplementation",
+    //      "getIterationDomain",
+    //      "getLoopIteratorTypes",
+    //      "getResultTilePosition",
+    //      "getTiledImplementation",
+    //      "getIterationDomainTileFromOperandTile",
+    //      "getTiledImplementationFromOperandTile"]>
+    ]> {
+  let summary = "Scatter operator using affine_map";
+  let description = [{
+    Scatter operator using affine_map
+  }];
+  let arguments = (ins
+      AnyRankedTensorOrMemRefType:$input,
+      AnyRankedTensorOrMemRefType:$output,
+      AffineMapAttr:$map,
+      OptionalAttr<AffineMapAttr>:$bounds_map,
+      Variadic<Index>:$map_dims,
+      Variadic<Index>:$map_symbols,
+      Variadic<Index>:$bounds_map_dims,
+      Variadic<Index>:$bounds_map_symbols,
+      Variadic<Index>:$bounds,
+      DenseI64ArrayAttr:$static_bounds
+  );
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let assemblyFormat = [{
+    $input `into` $output
+    attr-dict
+    `map` `=` $map `(` $map_dims `)` `[` $map_symbols `]`
+    (`bounds` `=` custom<DynamicIndexList>($bounds, $static_bounds)
+     `bounds_map` `=` $bounds_map^ `(` $bounds_map_dims `)` `[` $bounds_map_symbols `]`)?
+    `:` type($input) `into` type($output) (`->` type($results)^)?
+  }];
+  let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+    // Method to implement for specifying output range for
+    // DestinationStyleOpInterface
+    MutableOperandRange getDpsInitsMutable() {
+      return getOutputMutable();
+    }
+  }];
+}
+
 def IREELinalgExt_SortOp : IREELinalgExt_Op<"sort",
     [DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
      DeclareOpInterfaceMethods<TilingInterface,
