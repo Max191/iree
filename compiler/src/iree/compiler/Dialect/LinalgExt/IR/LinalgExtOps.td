@@ -319,6 +319,69 @@ def IREELinalgExt_GatherOp : IREELinalgExt_Op<"gather",
   }];
 }
 
+def IREELinalgExt_MapScatterOp : IREELinalgExt_PureOp<"map_scatter",
+    [LinalgExtInterface, DestinationStyleOpInterface,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+     DeclareOpInterfaceMethods<TilingInterface,
+        ["getIterationDomain",
+         "getLoopIteratorTypes",
+         "getResultTilePosition",
+         "getTiledImplementation",
+         "getIterationDomainTileFromOperandTile",
+         "getTiledImplementationFromOperandTile",
+         "generateScalarImplementation"]>]> {
+  let summary = "Scatter operator using affine_map";
+  let description = [{
+    Scatter operator using affine_map
+  }];
+  let arguments = (ins
+      AnyRankedTensorOrMemRefType:$input,
+      AnyRankedTensorOrMemRefType:$output
+  );
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let regions = (region AnyRegion:$transformation_region);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    attr-dict $input `into` $output
+    $transformation_region
+    type($input) `into` type($output) (`->` type($results)^)?
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$input, "Value":$output)>
+  ];
+
+  let extraClassDeclaration = [{
+    ShapedType getInputType() {
+      return cast<ShapedType>(getInput().getType());
+    }
+    int64_t getInputRank() {
+      return getInputType().getRank();
+    }
+    ShapedType getOutputType() {
+      return cast<ShapedType>(getOutput().getType());
+    }
+    int64_t getOutputRank() {
+      return getOutputType().getRank();
+    }
+
+    // Helper to apply transformations to the source index block arguments of
+    // the transformation body, and replace the uses of the previous source
+    // indices with the values returned by the builder function.
+    void insertTransformationAtStart(
+        OpBuilder &builder,
+        function_ref<SmallVector<Value>(ArrayRef<BlockArgument>)>
+            transformationBuilder,
+        int64_t numSourceIndices);
+
+    // Method to implement for specifying output range for
+    // DestinationStyleOpInterface
+    MutableOperandRange getDpsInitsMutable() {
+      return getOutputMutable();
+    }
+  }];
+}
+
 def IREELinalgExt_SortOp : IREELinalgExt_Op<"sort",
     [DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
      DeclareOpInterfaceMethods<TilingInterface,

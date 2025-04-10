@@ -13,10 +13,12 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/ADT/iterator.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -32,9 +34,11 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
@@ -315,6 +319,63 @@ GatherOp::reifyResultShapes(OpBuilder &b,
                             ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
   return cast<LinalgExtOp>(getOperation())
       .reifyResultShapes(b, reifiedReturnShapes);
+}
+
+//===----------------------------------------------------------------------===//
+// MapScatterOp
+//===----------------------------------------------------------------------===//
+
+void MapScatterOp::build(OpBuilder &builder, OperationState &state, Value input,
+                         Value output) {
+  SmallVector<Type> resultType;
+  if (isa<RankedTensorType>(output.getType())) {
+    resultType.push_back(output.getType());
+  }
+  build(builder, state, resultType, input, output);
+
+  // Add the transformation block with an identity transformation.
+  Region *region = state.regions[0].get();
+  auto inputType = cast<ShapedType>(input.getType());
+  SmallVector<Location> blockArgLocs(inputType.getRank(), state.location);
+  SmallVector<Type> indexTypes(inputType.getRank(), builder.getIndexType());
+  OpBuilder::InsertionGuard guard(builder);
+  Block *block =
+      builder.createBlock(region, region->end(), indexTypes, blockArgLocs);
+  SmallVector<Value> yieldedValues(block->getArguments());
+  Value mask = builder.create<arith::ConstantIntOp>(state.location, /*value=*/1,
+                                                    /*width=*/1);
+  yieldedValues.push_back(mask);
+  builder.create<IREE::LinalgExt::YieldOp>(state.location, yieldedValues);
+}
+
+LogicalResult MapScatterOp::verify() { return success(); }
+
+void MapScatterOp::insertTransformationAtStart(
+    OpBuilder &builder,
+    function_ref<SmallVector<Value>(ArrayRef<BlockArgument>)>
+        transformationBuilder,
+    int64_t numSourceIndices) {
+  Block &transformBody = getTransformationRegion().front();
+  SmallVector<BlockArgument> oldSourceIndices(transformBody.getArguments());
+  SmallVector<Type> indexTypes(numSourceIndices, builder.getIndexType());
+  SmallVector<Location> locs(numSourceIndices, getLoc());
+  SmallVector<BlockArgument> newSourceIndices(
+      transformBody.addArguments(indexTypes, locs));
+  OpBuilder::InsertionGuard g(builder);
+  builder.setInsertionPointToStart(&transformBody);
+  SmallVector<Value> newSourceIndicesTransformed(
+      transformationBuilder(newSourceIndices));
+  assert(oldSourceIndices.size() == newSourceIndicesTransformed.size() &&
+         "expected transformation to produce the same number of Values as the "
+         "previous number of source indices.");
+  for (auto [oldIdx, newIdx] :
+       llvm::zip_equal(oldSourceIndices, newSourceIndicesTransformed)) {
+    SmallVector<OpOperand *> uses(llvm::make_pointer_range(oldIdx.getUses()));
+    for (OpOperand *use : uses) {
+      use->set(newIdx);
+    }
+  }
+  transformBody.eraseArguments(0, oldSourceIndices.size());
 }
 
 //===----------------------------------------------------------------------===//
@@ -2005,6 +2066,7 @@ LogicalResult IREE::LinalgExt::IndexOp::verify() {
 
 DEFINE_OP_GET_EFFECTS(ScatterOp)
 DEFINE_OP_GET_EFFECTS(GatherOp)
+DEFINE_OP_GET_EFFECTS(MapScatterOp)
 DEFINE_OP_GET_EFFECTS(SortOp)
 DEFINE_OP_GET_EFFECTS(FftOp)
 DEFINE_OP_GET_EFFECTS(ScanOp)
