@@ -319,21 +319,7 @@ def IREELinalgExt_GatherOp : IREELinalgExt_Op<"gather",
   }];
 }
 
-def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter",
-    [
-    //  DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
-    //  DeclareOpInterfaceMethods<LinalgFusionInterface,
-    //   ["getIndexingMapsForResults", "getIndexingMapsForOperands",
-    //    "getStaticLoopRanges"]>,
-    //  DeclareOpInterfaceMethods<TilingInterface,
-    //     ["generateScalarImplementation",
-    //      "getIterationDomain",
-    //      "getLoopIteratorTypes",
-    //      "getResultTilePosition",
-    //      "getTiledImplementation",
-    //      "getIterationDomainTileFromOperandTile",
-    //      "getTiledImplementationFromOperandTile"]>
-    ]> {
+def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter", []> {
   let summary = "Scatter operator using affine_map";
   let description = [{
     Scatter operator using affine_map
@@ -342,9 +328,9 @@ def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter",
       AnyRankedTensorOrMemRefType:$input,
       AnyRankedTensorOrMemRefType:$output,
       AffineMapAttr:$map,
-      OptionalAttr<AffineMapAttr>:$bounds_map,
       Variadic<Index>:$map_dims,
       Variadic<Index>:$map_symbols,
+      OptionalAttr<AffineMapAttr>:$bounds_map,
       Variadic<Index>:$bounds_map_dims,
       Variadic<Index>:$bounds_map_symbols,
       Variadic<Index>:$bounds,
@@ -359,7 +345,17 @@ def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter",
      `bounds_map` `=` $bounds_map^ `(` $bounds_map_dims `)` `[` $bounds_map_symbols `]`)?
     `:` type($input) `into` type($output) (`->` type($results)^)?
   }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$input, "Value":$output)>
+  ];
+
   let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+    void replaceInputDims(ArrayRef<AffineExpr> inputDims,
+                          std::optional<unsigned int> newNumInputDims = std::nullopt,
+                          std::optional<SmallVector<Value>> newExtraDims = std::nullopt,
+                          std::optional<SmallVector<Value>> newExtraSyms = std::nullopt);
+
     // Method to implement for specifying output range for
     // DestinationStyleOpInterface
     MutableOperandRange getDpsInitsMutable() {

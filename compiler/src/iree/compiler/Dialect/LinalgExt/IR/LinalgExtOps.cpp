@@ -321,7 +321,92 @@ GatherOp::reifyResultShapes(OpBuilder &b,
 // MapScatterOp
 //===----------------------------------------------------------------------===//
 
+void MapScatterOp::build(OpBuilder &builder, OperationState &state, Value input,
+                         Value output) {
+  auto inputShapedType = cast<ShapedType>(input.getType());
+  SmallVector<Type> resultType;
+  auto outputType = output.getType();
+  if (isa<RankedTensorType>(outputType)) {
+    resultType.push_back(outputType);
+  }
+  build(builder, state, resultType, input, output,
+        builder.getMultiDimIdentityMap(inputShapedType.getRank()),
+        /*map_dims=*/ValueRange{}, /*map_symbols=*/ValueRange{},
+        /*bounds_map=*/nullptr, /*bounds_map_dims=*/ValueRange{},
+        /*bounds_map_symbols=*/ValueRange{}, /*bounds=*/ValueRange{},
+        /*static_bounds=*/{});
+}
+
 LogicalResult MapScatterOp::verify() { return success(); }
+
+void MapScatterOp::replaceInputDims(
+    ArrayRef<AffineExpr> inputDimReplacements,
+    std::optional<unsigned int> newNumInputDims,
+    std::optional<SmallVector<Value>> newExtraDims,
+    std::optional<SmallVector<Value>> newExtraSyms) {
+  int64_t inputRank = getInput().getType().getRank();
+  unsigned int newExtraDimStartPos =
+      newNumInputDims.has_value() ? newNumInputDims.value() : inputRank;
+  // `inputDimReplacements` and `this->map` may both have extra dims that are
+  // not part of the input shape dimensions. Offset the extra dims of
+  // `inputDimReplacements` by the number of extra dims in `this->map`, so there
+  // are no conflicts between the extra dim positions.
+  unsigned int numExtraDims = newExtraDims ? newExtraDims->size() : 0;
+  unsigned int numDimsInReplacements = newExtraDimStartPos + numExtraDims;
+  unsigned int numMapExtraDims = getMap().getNumDims() - inputRank;
+  SmallVector<AffineExpr> newDimsWithOffsetExtraDims = llvm::map_to_vector(
+      llvm::seq<int64_t>(numDimsInReplacements), [&](int64_t dim) {
+        int64_t dimPos =
+            dim < newExtraDimStartPos ? dim : dim + numMapExtraDims;
+        return getAffineDimExpr(dimPos, this->getContext());
+      });
+  SmallVector<AffineExpr> mapInputDimReplacements;
+  for (AffineExpr expr : inputDimReplacements) {
+    mapInputDimReplacements.push_back(
+        expr.replaceDims(newDimsWithOffsetExtraDims));
+  }
+  unsigned int numExtraSyms = newExtraSyms ? newExtraSyms->size() : 0;
+  unsigned int newMapNumSyms = getMap().getNumSymbols() + numExtraSyms;
+  AffineMap newMap = getMap().replaceDimsAndSymbols(
+      mapInputDimReplacements, {}, numMapExtraDims + numDimsInReplacements,
+      newMapNumSyms);
+  setMap(newMap);
+  if (newExtraDims) {
+    getMapDimsMutable().append(newExtraDims.value());
+  }
+  if (newExtraSyms) {
+    getMapSymbolsMutable().append(newExtraSyms.value());
+  }
+  if (!getBoundsMap().has_value()) {
+    return;
+  }
+
+  // Replacement for bounds_map is the same. There may be conflicts with extra
+  // dims, so resolve them before replacing.
+  unsigned int numBoundsMapExtraDims = getBoundsMap()->getNumDims() - inputRank;
+  for (int dim = newExtraDimStartPos; dim < newDimsWithOffsetExtraDims.size();
+       ++dim) {
+    newDimsWithOffsetExtraDims[dim] =
+        getAffineDimExpr(dim + numBoundsMapExtraDims, this->getContext());
+  }
+  SmallVector<AffineExpr> boundsMapInputDimReplacements;
+  for (AffineExpr expr : inputDimReplacements) {
+    boundsMapInputDimReplacements.push_back(
+        expr.replaceDims(newDimsWithOffsetExtraDims));
+  }
+  unsigned int newBoundsMapNumSyms =
+      getBoundsMap()->getNumSymbols() + numExtraSyms;
+  AffineMap newBoundsMap = getBoundsMap()->replaceDimsAndSymbols(
+      boundsMapInputDimReplacements, {},
+      numBoundsMapExtraDims + numDimsInReplacements, newBoundsMapNumSyms);
+  setBoundsMap(newBoundsMap);
+  if (newExtraDims) {
+    getBoundsMapDimsMutable().append(newExtraDims.value());
+  }
+  if (newExtraSyms) {
+    getBoundsMapSymbolsMutable().append(newExtraSyms.value());
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // SortOp
