@@ -65,3 +65,19 @@ void ExtractStridedMetadataOp::getAsmResultNames(
     setNameFn(getStrides().front(), "strides");
   }
 }
+
+//===----------------------------------------------------------------------===//
+// LoadFromMemrefOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult LoadFromMemrefOp::verify() {
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// StoreToMemrefOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult StoreToMemrefOp::verify() {
+  return success();
+}
