@@ -74,10 +74,24 @@ LogicalResult LoadFromMemrefOp::verify() {
   return success();
 }
 
+void LoadFromMemrefOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getSourceMutable(),
+                       SideEffects::DefaultResource::get());
+}
+
 //===----------------------------------------------------------------------===//
 // StoreToMemrefOp
 //===----------------------------------------------------------------------===//
 
 LogicalResult StoreToMemrefOp::verify() {
   return success();
+}
+
+void StoreToMemrefOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), &getTargetMutable(),
+                       SideEffects::DefaultResource::get());
 }

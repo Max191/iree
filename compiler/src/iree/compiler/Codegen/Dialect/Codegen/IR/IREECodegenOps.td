@@ -116,7 +116,8 @@ def IREECodegen_NullPointerOp :
 // LoadFrom/StoreToMemref Ops
 //===----------------------------------------------------------------------===//
 
-def IREECodegen_LoadFromMemrefOp : Op<IREECodegen_Dialect, "load_from_memref", []> {
+def IREECodegen_LoadFromMemrefOp : Op<IREECodegen_Dialect, "load_from_memref",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = [{loads a tensor from a memref}];
   let description = [{
     loads a tensor from an equally sized memref.
@@ -137,7 +138,8 @@ def IREECodegen_LoadFromMemrefOp : Op<IREECodegen_Dialect, "load_from_memref", [
   let hasVerifier = 1;
 }
 
-def IREECodegen_StoreToMemrefOp : Op<IREECodegen_Dialect, "store_to_memref", []> {
+def IREECodegen_StoreToMemrefOp : Op<IREECodegen_Dialect, "store_to_memref",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = [{stores a tensor into a memref}];
   let description = [{
     stores a tensor into an equally sized memref.
