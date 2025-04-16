@@ -1176,6 +1176,7 @@ static void buildLLVMGPUCodegenConfigurationPassPipelineImpl(
     // attributes.
     funcPassManager.addPass(createBlockDynamicDimensionsPass);
     funcPassManager.addPass(createBufferizeDispatchTensorLoadStorePass);
+    funcPassManager.addPass(createCombineLayoutTransformationPass);
     funcPassManager.addPass(createConfigTrackingCanonicalizerPass);
     funcPassManager.addPass(createCSEPass);
   }
