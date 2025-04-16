@@ -271,14 +271,29 @@ static void combineRelayoutOpChain(RewriterBase &rewriter, OpOperand &root) {
       loc, rootOp->getResult(0), relayoutDest);
   rewriter.replaceUsesWithIf(root.get(), combinedRelayoutOp.getResult(0),
                              [&](OpOperand &use) { return root == use; });
-  while (rootOp) {
+  LDBG("Created identity map_scatter:\n" << combinedRelayoutOp << "\n");
+  Operation *relayoutOp = rootOp;
+  while (relayoutOp) {
+    LDBG("Attempting to fold " << relayoutOp->getName() <<
+         " into map_scatter op:\n" << *relayoutOp << "\n");
     FailureOr<IREE::LinalgExt::MapScatterOp> maybeCombinedRelayoutOp =
-        foldIntoMapScatter(rewriter, rootOp, combinedRelayoutOp);
+        foldIntoMapScatter(rewriter, relayoutOp, combinedRelayoutOp);
     if (failed(maybeCombinedRelayoutOp)) {
+      LDBG("Failed to fold " << relayoutOp->getName() <<
+           " into map_scatter op");
       break;
     }
     combinedRelayoutOp = maybeCombinedRelayoutOp.value();
-    rootOp = combinedRelayoutOp.getInput().getDefiningOp();
+    LDBG("Successfully folded " << relayoutOp->getName() <<
+         " into map_scatter. New map_scatter op:\n" << combinedRelayoutOp <<
+         "\n");
+    relayoutOp = combinedRelayoutOp.getInput().getDefiningOp();
+  }
+  // If no relayout ops were folded into the map_scatter, then remove it, since
+  // it will just be an identity transformation.
+  if (relayoutOp == rootOp) {
+    LDBG("No relayout ops were combined. Removing identity map_scatter op.");
+    rewriter.replaceOp(combinedRelayoutOp, combinedRelayoutOp.getInput());
   }
 }
 
