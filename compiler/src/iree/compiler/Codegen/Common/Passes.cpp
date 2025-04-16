@@ -16,6 +16,7 @@ void addCommonTargetExecutablePreprocessingPasses(
   funcPassManager.addPass(createTypePropagationPass)
       .addPass(createBubbleUpOrdinalOpsPass)
       .addPass(createBufferizeCopyOnlyDispatchesPass)
+      .addPass(createBufferizeDispatchTensorLoadStorePass)
       .addPass([&]() {
         return createDecomposeSoftmaxPass(useDecomposeSoftmaxFusion);
       });
