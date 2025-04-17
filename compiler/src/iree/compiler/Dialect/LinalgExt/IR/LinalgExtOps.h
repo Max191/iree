@@ -7,6 +7,7 @@
 #ifndef IREE_COMPILER_DIALECT_LINALGEXT_IR_LINALGEXTOPS_H_
 #define IREE_COMPILER_DIALECT_LINALGEXT_IR_LINALGEXTOPS_H_
 
+// #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -20,9 +21,6 @@
 #include "mlir/Interfaces/TilingInterface.h"
 
 // clang-format off
-
-#define GET_ATTRDEF_CLASSES
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h.inc" // IWYU pragma: export
 
 #define GET_OP_CLASSES
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h.inc" // IWYU pragma: export

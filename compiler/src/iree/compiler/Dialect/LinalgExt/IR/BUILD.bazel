@@ -17,6 +17,7 @@ iree_td_library(
     name = "td_files",
     srcs = enforce_glob(
         [
+            "LinalgExtAttrs.td",
             "LinalgExtBase.td",
             "LinalgExtInterfaces.td",
             "LinalgExtOps.td",
@@ -44,6 +45,7 @@ iree_compiler_cc_library(
     name = "IR",
     srcs = [
         "AggregatedOpInterfaceImpl.cpp",
+        "LinalgExtAttrs.cpp",
         "LinalgExtAttrs.cpp.inc",
         "LinalgExtDialect.cpp",
         "LinalgExtDialect.cpp.inc",
@@ -55,6 +57,7 @@ iree_compiler_cc_library(
         "TilingInterfaceImpl.cpp",
     ],
     hdrs = [
+        "LinalgExtAttrs.h",
         "LinalgExtAttrs.h.inc",
         "LinalgExtDialect.h",
         "LinalgExtDialect.h.inc",
@@ -153,20 +156,6 @@ iree_gentbl_cc_library(
     tbl_outs = [
         (
             [
-                "--gen-attrdef-decls",
-                "--attrdefs-dialect=iree_linalg_ext",
-            ],
-            "LinalgExtAttrs.h.inc",
-        ),
-        (
-            [
-                "--gen-attrdef-defs",
-                "--attrdefs-dialect=iree_linalg_ext",
-            ],
-            "LinalgExtAttrs.cpp.inc",
-        ),
-        (
-            [
                 "--gen-typedef-decls",
                 "--typedefs-dialect=iree_linalg_ext",
             ],
@@ -182,6 +171,29 @@ iree_gentbl_cc_library(
     ],
     tblgen = "@llvm-project//mlir:mlir-tblgen",
     td_file = "LinalgExtBase.td",
+    deps = [":td_files"],
+)
+
+iree_gentbl_cc_library(
+    name = "LinalgExtAttrsGen",
+    tbl_outs = [
+        (
+            [
+                "--gen-attrdef-decls",
+                "--attrdefs-dialect=iree_linalg_ext",
+            ],
+            "LinalgExtAttrs.h.inc",
+        ),
+        (
+            [
+                "--gen-attrdef-defs",
+                "--attrdefs-dialect=iree_linalg_ext",
+            ],
+            "LinalgExtAttrs.cpp.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "LinalgExtAttrs.td",
     deps = [":td_files"],
 )
 

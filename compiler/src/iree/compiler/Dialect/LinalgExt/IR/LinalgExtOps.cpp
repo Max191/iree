@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"

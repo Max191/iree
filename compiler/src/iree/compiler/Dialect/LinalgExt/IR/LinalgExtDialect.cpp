@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -25,9 +26,6 @@
 
 using namespace mlir;
 using namespace mlir::iree_compiler::IREE::LinalgExt;
-
-#define GET_ATTRDEF_CLASSES
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.cpp.inc" // IWYU pragma: keep
 
 // Used to control inlining behavior.
 namespace {
@@ -62,10 +60,8 @@ void IREELinalgExtDialect::initialize() {
   addInterfaces<IREELinalgExtInlinerInterface>();
 
   addInterfaces<IREELinalgExtDialectOpAsmInterface>();
-  addAttributes<
-#define GET_ATTRDEF_LIST
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.cpp.inc"
-      >();
+
+  registerAttributes();
 
 #define GET_OP_LIST
   addOperations<

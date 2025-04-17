@@ -151,4 +151,39 @@ def LinalgFusionInterface : OpInterface<"LinalgFusionOpInterface"> {
   ];
 }
 
+def IREELinalgExt_IndexTransformationInterfaceAttr : AttrInterface<"IndexTransformationInterfaceAttr"> {
+  let description = [{
+    Interface used to compose index transformations on a set of indices. Index
+    transformations must be representable as an affine_map from an input set
+    of indices to an output set of indices.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns the number of indices produced by the transformation.
+      }],
+      /*retTy=*/"int64_t",
+      /*methodName=*/"getNumResultIndices",
+      /*args=*/(ins)
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns the number of indices consumed by the transformation.
+      }],
+      /*retTy=*/"int64_t",
+      /*methodName=*/"getNumInputIndices",
+      /*args=*/(ins)
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns the number of dynamic indices in the transformation.
+      }],
+      /*retTy=*/"int64_t",
+      /*methodName=*/"getNumDynamicIndices",
+      /*args=*/(ins)
+    >,
+  ];
+}
+
 #endif  // IREE_DIALECT_LINALGEXT_INTERFACES

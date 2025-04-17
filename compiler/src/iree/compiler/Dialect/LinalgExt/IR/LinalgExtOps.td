@@ -7,6 +7,7 @@
 #ifndef IREE_DIALECT_LINALGEXT_OPS
 #define IREE_DIALECT_LINALGEXT_OPS
 
+include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.td"
 include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtBase.td"
 include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.td"
 include "mlir/Dialect/Linalg/IR/LinalgInterfaces.td"

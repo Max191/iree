@@ -27,6 +27,9 @@ def IREELinalgExt_Dialect : Dialect {
     cannot be represented efficiently/directly by the Linalg dialect.
   }];
   let useDefaultAttributePrinterParser = 1;
+  let extraClassDeclaration = [{
+    void registerAttributes();
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -45,18 +48,5 @@ class RankedTensorOrScalarType<list<Type> allowedTypes> :
 
 def AnyRankedTensorOrScalarType :
   RankedTensorOrScalarType<[AnySignlessIntegerOrIndex, AnyFloat]>;
-
-//===----------------------------------------------------------------------===//
-// Enum definitions
-//===----------------------------------------------------------------------===//
-
-def IREELinalgExt_IteratorTypeEnum : EnumAttr<IREELinalgExt_Dialect,
-    IteratorType, "iterator_type"> {
-  let assemblyFormat = "`<` $value `>`";
-}
-
-def IREELinalgExt_IteratorTypeArrayAttr :
-    TypedArrayAttrBase<IREELinalgExt_IteratorTypeEnum,
-    "LinalgExt iterator type">;
 
 #endif // IREE_DIALECT_LINALGEXT_BASE

@@ -31,6 +31,7 @@ LogicalResult verifyLinalgExtOpInterface(Operation *op);
 }
 
 /// Include the generated interface declarations.
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrInterfaces.h.inc" // IWYU pragma: export
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h.inc" // IWYU pragma: export
 
 } // namespace mlir::iree_compiler::IREE::LinalgExt

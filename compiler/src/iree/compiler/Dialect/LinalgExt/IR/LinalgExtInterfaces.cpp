@@ -27,6 +27,7 @@ IREE::LinalgExt::detail::verifyLinalgExtOpInterface(Operation *op) {
 }
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.cpp.inc" // IWYU pragma: export
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrInterfaces.cpp.inc" // IWYU pragma: export
 
 template <typename Ty, typename DimOpTy>
 static void getDimValues(OpBuilder &b, Location loc, Value v, Ty t,

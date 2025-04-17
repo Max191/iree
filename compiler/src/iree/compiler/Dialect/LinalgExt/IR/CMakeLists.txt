@@ -14,6 +14,8 @@ iree_cc_library(
   NAME
     IR
   HDRS
+    "LinalgExtAttrInterfaces.h.inc"
+    "LinalgExtAttrs.h"
     "LinalgExtAttrs.h.inc"
     "LinalgExtDialect.h"
     "LinalgExtDialect.h.inc"
@@ -24,6 +26,8 @@ iree_cc_library(
     "LinalgExtTypes.h.inc"
   SRCS
     "AggregatedOpInterfaceImpl.cpp"
+    "LinalgExtAttrInterfaces.cpp.inc"
+    "LinalgExtAttrs.cpp"
     "LinalgExtAttrs.cpp.inc"
     "LinalgExtDialect.cpp"
     "LinalgExtDialect.cpp.inc"
@@ -71,6 +75,8 @@ iree_tablegen_library(
   TD_FILE
     "LinalgExtInterfaces.td"
   OUTS
+    --gen-attr-interface-decls LinalgExtAttrInterfaces.h.inc
+    --gen-attr-interface-defs LinalgExtAttrInterfaces.cpp.inc
     --gen-op-interface-decls LinalgExtInterfaces.h.inc
     --gen-op-interface-defs LinalgExtInterfaces.cpp.inc
 )
@@ -93,10 +99,18 @@ iree_tablegen_library(
   TD_FILE
     "LinalgExtBase.td"
   OUTS
-    --gen-attrdef-decls --attrdefs-dialect=iree_linalg_ext LinalgExtAttrs.h.inc
-    --gen-attrdef-defs --attrdefs-dialect=iree_linalg_ext LinalgExtAttrs.cpp.inc
     --gen-typedef-decls --typedefs-dialect=iree_linalg_ext LinalgExtTypes.h.inc
     --gen-typedef-defs --typedefs-dialect=iree_linalg_ext LinalgExtTypes.cpp.inc
+)
+
+iree_tablegen_library(
+  NAME
+    LinalgExtAttrsGen
+  TD_FILE
+    "LinalgExtAttrs.td"
+  OUTS
+    --gen-attrdef-decls --attrdefs-dialect=iree_linalg_ext LinalgExtAttrs.h.inc
+    --gen-attrdef-defs --attrdefs-dialect=iree_linalg_ext LinalgExtAttrs.cpp.inc
 )
 
 iree_tablegen_doc(
