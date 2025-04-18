@@ -6,10 +6,17 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
+#include "llvm/ADT/SmallVectorExtras.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -76,63 +83,49 @@ foldTransposeIntoMapScatter(RewriterBase &rewriter,
                             IREE::LinalgExt::MapScatterOp mapScatterOp) {
   assert(mapScatterOp.getInput() == transposeOp->getResult(0) &&
          "expected transposeOp to be the producer of mapScatterOp");
-  ShapedType inputType = mapScatterOp.getInput().getType();
-  ArrayRef<int64_t> transposePerm = transposeOp.getPermutation();
-  SmallVector<AffineExpr> newInputDims = llvm::map_to_vector(
-      llvm::seq<int64_t>(inputType.getRank()), [&](int64_t dim) {
-        return rewriter.getAffineDimExpr(transposePerm[dim]);
-      });
+  auto transposeTransformAttr = IREE::LinalgExt::TransposeIndicesAttr::get(
+      transposeOp->getContext(), transposeOp.getPermutation());
   rewriter.modifyOpInPlace(mapScatterOp, [&]() {
-    mapScatterOp.replaceInputDims(newInputDims);
+    mapScatterOp.insertTransformation(0, transposeTransformAttr);
     mapScatterOp->setOperand(0, transposeOp.getInput());
   });
   return mapScatterOp;
 }
 
 static IREE::LinalgExt::MapScatterOp
-foldExpandShapeIntoMapScatter(RewriterBase &rewriter,
-                              tensor::ExpandShapeOp expandShapeOp,
-                              IREE::LinalgExt::MapScatterOp mapScatterOp) {
-  assert(mapScatterOp.getInput() == expandShapeOp->getResult(0) &&
-         "expected expandShapeOp to be the producer of mapScatterOp");
+foldReshapeIntoMapScatter(RewriterBase &rewriter, Operation *reshapeOp,
+                          SmallVector<Value> srcDynamicDims,
+                          SmallVector<Value> resultDynamicDims,
+                          IREE::LinalgExt::MapScatterOp mapScatterOp) {
+  assert(mapScatterOp.getInput() == reshapeOp->getResult(0) &&
+         "expected reshapeOp to be the producer of mapScatterOp");
+  ArrayRef<int64_t> staticLinearizeBasis =
+      cast<ShapedType>(reshapeOp->getOperandTypes()[0]).getShape();
+  auto linearizeAttr = IREE::LinalgExt::LinearizeIndicesAttr::get(
+      reshapeOp->getContext(), staticLinearizeBasis);
+  assert(linearizeAttr.getNumDynamicIndices() == srcDynamicDims.size() &&
+         "expected number of dims in srcDynamicDims to equal the number of "
+         "dynamic dims in the reshape source operand.");
 
-  // Create some AffineExpr lists for the source and result shape of the
-  // expandShapeOp.
-  ShapedType expandSrcType = expandShapeOp.getSrcType();
-  int64_t numDims = expandSrcType.getRank();
-  SmallVector<Value> newExtraDims;
-  SmallVector<AffineExpr> expandSrcDims =
-      llvm::map_to_vector(llvm::seq<int64_t>(numDims), [&](int64_t dim) {
-        return rewriter.getAffineDimExpr(dim);
-      });
-  SmallVector<AffineExpr> expandResultDims = llvm::map_to_vector(
-      expandShapeOp.getMixedOutputShape(), [&](OpFoldResult size) {
-        auto constSize = getConstantIntValue(size);
-        if (constSize.has_value()) {
-          return rewriter.getAffineConstantExpr(constSize.value());
-        }
-        newExtraDims.push_back(cast<Value>(size));
-        return rewriter.getAffineDimExpr(numDims++);
-      });
+  ArrayRef<int64_t> staticDelinearizeBasis =
+      cast<ShapedType>(reshapeOp->getResultTypes()[0]).getShape();
+  auto delinearizeAttr = IREE::LinalgExt::DelinearizeIndicesAttr::get(
+      reshapeOp->getContext(), staticDelinearizeBasis);
+  assert(delinearizeAttr.getNumDynamicIndices() == resultDynamicDims.size() &&
+         "expected number of dims in resultDynamicDims to equal the number of "
+         "dynamic dims in the reshape result.");
 
-  // Compute the dim replacements for the AffineDimExpr corresponding to each
-  // input dimension of the mapScatterOp.
-  int64_t inputRank = mapScatterOp.getInput().getType().getRank();
-  SmallVector<AffineExpr> inputDimReplacements(inputRank);
-  SmallVector<ReassociationIndices> reassociations =
-      expandShapeOp.getReassociationIndices();
-  for (auto [groupIdx, group] : llvm::enumerate(reassociations)) {
-    AffineExpr stride = rewriter.getAffineConstantExpr(1);
-    for (int64_t dim : llvm::reverse(group)) {
-      inputDimReplacements[dim] =
-          expandSrcDims[groupIdx].floorDiv(stride) % expandResultDims[dim];
-      stride = stride * expandResultDims[dim];
-    }
-  }
+  SmallVector<Value> newCapturedDynamicIndices = srcDynamicDims;
+  newCapturedDynamicIndices.append(resultDynamicDims);
+  newCapturedDynamicIndices.append(
+      mapScatterOp.getCapturedDynamicIndices().begin(),
+      mapScatterOp.getCapturedDynamicIndices().end());
   rewriter.modifyOpInPlace(mapScatterOp, [&]() {
-    mapScatterOp.replaceInputDims(inputDimReplacements, expandSrcType.getRank(),
-                                  newExtraDims);
-    mapScatterOp->setOperand(0, expandShapeOp.getSrc());
+    mapScatterOp.insertTransformation(0, delinearizeAttr);
+    mapScatterOp.insertTransformation(0, linearizeAttr);
+    mapScatterOp.getCapturedDynamicIndicesMutable().assign(
+        newCapturedDynamicIndices);
+    mapScatterOp->setOperand(0, reshapeOp->getOperand(0));
   });
   return mapScatterOp;
 }
@@ -143,47 +136,57 @@ foldCollapseShapeIntoMapScatter(RewriterBase &rewriter,
                                 IREE::LinalgExt::MapScatterOp mapScatterOp) {
   assert(mapScatterOp.getInput() == collapseShapeOp->getResult(0) &&
          "expected collapseShapeOp to be the producer of mapScatterOp");
-
-  ShapedType collapseSrcType = collapseShapeOp.getSrcType();
-  int64_t numDims = collapseSrcType.getRank();
-  SmallVector<AffineExpr> collapseSrcDims =
-      llvm::map_to_vector(llvm::seq<int64_t>(numDims), [&](int64_t dim) {
-        return rewriter.getAffineDimExpr(dim);
-      });
+  Location loc = collapseShapeOp->getLoc();
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(collapseShapeOp);
-  SmallVector<Value> newExtraDims;
-  SmallVector<OpFoldResult> collapseSrcMixedSizes = tensor::getMixedSizes(
-      rewriter, collapseShapeOp->getLoc(), collapseShapeOp.getSrc());
-  SmallVector<AffineExpr> collapseSrcSizeDims =
-      llvm::map_to_vector(collapseSrcMixedSizes, [&](OpFoldResult size) {
-        auto constSize = getConstantIntValue(size);
-        if (constSize.has_value()) {
-          return rewriter.getAffineConstantExpr(constSize.value());
-        }
-        newExtraDims.push_back(cast<Value>(size));
-        return rewriter.getAffineDimExpr(numDims++);
-      });
+  SmallVector<OpFoldResult> mixedSrcSizes =
+      tensor::getMixedSizes(rewriter, loc, collapseShapeOp.getSrc());
+  SmallVector<Value> srcDynamicSizes;
+  std::tie(std::ignore, srcDynamicSizes) = decomposeMixedValues(mixedSrcSizes);
 
-  int64_t inputRank = mapScatterOp.getInput().getType().getRank();
-  SmallVector<AffineExpr> inputDimReplacements(inputRank);
-  SmallVector<ReassociationIndices> reassociations =
-      collapseShapeOp.getReassociationIndices();
-  for (auto [groupIdx, group] : llvm::enumerate(reassociations)) {
-    AffineExpr stride = rewriter.getAffineConstantExpr(1);
-    inputDimReplacements[groupIdx] = rewriter.getAffineConstantExpr(0);
-    for (int64_t dim : group) {
-      inputDimReplacements[groupIdx] =
-          inputDimReplacements[groupIdx] + stride * collapseSrcDims[dim];
-      stride = stride * collapseSrcSizeDims[dim];
+  auto prod = [&](ArrayRef<OpFoldResult> vals) -> OpFoldResult {
+    AffineExpr prodExpr = rewriter.getAffineConstantExpr(1);
+    for (auto [idx, ofr] : llvm::enumerate(vals)) {
+      AffineExpr d = rewriter.getAffineDimExpr(idx);
+      prodExpr = prodExpr * d;
     }
+    auto prodMap =
+        AffineMap::get(vals.size(), 0, prodExpr, rewriter.getContext());
+    return affine::makeComposedFoldedAffineApply(rewriter, loc, prodMap, vals);
+  };
+  SmallVector<OpFoldResult> mixedResultSizes;
+  for (ReassociationIndices group : collapseShapeOp.getReassociationIndices()) {
+    if (group.size() == 1) {
+      mixedResultSizes.push_back(mixedSrcSizes[group[0]]);
+      continue;
+    }
+    SmallVector<OpFoldResult> groupSizes = llvm::map_to_vector(
+        group, [&](int64_t idx) { return mixedSrcSizes[idx]; });
+    mixedResultSizes.push_back(prod(groupSizes));
   }
-  rewriter.modifyOpInPlace(mapScatterOp, [&]() {
-    mapScatterOp.replaceInputDims(inputDimReplacements,
-                                  collapseSrcType.getRank(), newExtraDims);
-    mapScatterOp->setOperand(0, collapseShapeOp.getSrc());
-  });
-  return mapScatterOp;
+  SmallVector<Value> resultDynamicSizes;
+  std::tie(std::ignore, resultDynamicSizes) =
+      decomposeMixedValues(mixedResultSizes);
+  return foldReshapeIntoMapScatter(rewriter, collapseShapeOp, srcDynamicSizes,
+                                   resultDynamicSizes, mapScatterOp);
+}
+
+static IREE::LinalgExt::MapScatterOp
+foldExpandShapeIntoMapScatter(RewriterBase &rewriter,
+                              tensor::ExpandShapeOp expandShapeOp,
+                              IREE::LinalgExt::MapScatterOp mapScatterOp) {
+  assert(mapScatterOp.getInput() == expandShapeOp->getResult(0) &&
+         "expected expandShapeOp to be the producer of mapScatterOp");
+  Location loc = expandShapeOp->getLoc();
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(expandShapeOp);
+  SmallVector<OpFoldResult> mixedSizes =
+      tensor::getMixedSizes(rewriter, loc, expandShapeOp.getSrc());
+  SmallVector<Value> srcDynamicSizes;
+  std::tie(std::ignore, srcDynamicSizes) = decomposeMixedValues(mixedSizes);
+  return foldReshapeIntoMapScatter(rewriter, expandShapeOp, srcDynamicSizes,
+                                   expandShapeOp.getOutputShape(),
+                                   mapScatterOp);
 }
 
 static FailureOr<IREE::LinalgExt::MapScatterOp>
@@ -192,25 +195,26 @@ foldExtractSliceIntoMapScatter(RewriterBase &rewriter,
                                IREE::LinalgExt::MapScatterOp mapScatterOp) {
   assert(mapScatterOp.getInput() == extractSliceOp->getResult(0) &&
          "expected extractSliceOp to be the producer of mapScatterOp");
-  if (mapScatterOp.getBoundsMap().has_value()) {
-    return rewriter.notifyMatchFailure(mapScatterOp,
-                                       "map_scatter already has bounds");
-  }
   if (extractSliceOp.getSourceType().getRank() !=
       extractSliceOp.getResultType().getRank()) {
     return rewriter.notifyMatchFailure(
         extractSliceOp, "rank reducing extract_slice op is not supported");
   }
-  OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPoint(extractSliceOp);
-  SmallVector<Value> sliceSizes = getValueOrCreateConstantIndexOp(
-      rewriter, extractSliceOp->getLoc(), extractSliceOp.getMixedSizes());
-  AffineMap boundsMap =
-      rewriter.getMultiDimIdentityMap(extractSliceOp.getResultType().getRank());
+  SmallVector<int64_t> bounds;
+  SmallVector<Value> dynamicSizes;
+  std::tie(bounds, dynamicSizes) =
+      decomposeMixedValues(extractSliceOp.getMixedSizes());
+  auto clampIndicesAttr = IREE::LinalgExt::ClampIndicesAttr::get(
+      extractSliceOp->getContext(), bounds);
+
+  SmallVector<Value> newCapturedDynamicIndices = dynamicSizes;
+  newCapturedDynamicIndices.append(
+      mapScatterOp.getCapturedDynamicIndices().begin(),
+      mapScatterOp.getCapturedDynamicIndices().end());
   rewriter.modifyOpInPlace(mapScatterOp, [&]() {
-    mapScatterOp.setBoundsMap(boundsMap);
-    mapScatterOp.getBoundsMutable().append(sliceSizes);
-    mapScatterOp.setStaticBounds(extractSliceOp.getStaticSizes());
+    mapScatterOp.insertTransformation(0, clampIndicesAttr);
+    mapScatterOp.getCapturedDynamicIndicesMutable().assign(
+        newCapturedDynamicIndices);
     mapScatterOp->setOperand(0, extractSliceOp.getSource());
   });
   return mapScatterOp;

@@ -320,7 +320,9 @@ def IREELinalgExt_GatherOp : IREELinalgExt_Op<"gather",
   }];
 }
 
-def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter", []> {
+def IREELinalgExt_MapScatterOp : IREELinalgExt_PureOp<"map_scatter",
+    [LinalgExtInterface, DestinationStyleOpInterface,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Scatter operator using affine_map";
   let description = [{
     Scatter operator using affine_map
@@ -328,34 +330,39 @@ def IREELinalgExt_MapScatterOp : IREELinalgExt_Op<"map_scatter", []> {
   let arguments = (ins
       AnyRankedTensorOrMemRefType:$input,
       AnyRankedTensorOrMemRefType:$output,
-      AffineMapAttr:$map,
-      Variadic<Index>:$map_dims,
-      Variadic<Index>:$map_symbols,
-      OptionalAttr<AffineMapAttr>:$bounds_map,
-      Variadic<Index>:$bounds_map_dims,
-      Variadic<Index>:$bounds_map_symbols,
-      Variadic<Index>:$bounds,
-      DenseI64ArrayAttr:$static_bounds
+      ArrayAttr:$transformations,
+      Variadic<Index>:$captured_dynamic_indices
   );
   let results = (outs Variadic<AnyRankedTensor>:$results);
-  let assemblyFormat = [{
-    $input `into` $output
-    attr-dict
-    `map` `=` $map `(` $map_dims `)` `[` $map_symbols `]`
-    (`bounds` `=` custom<DynamicIndexList>($bounds, $static_bounds)
-     `bounds_map` `=` $bounds_map^ `(` $bounds_map_dims `)` `[` $bounds_map_symbols `]`)?
-    `:` type($input) `into` type($output) (`->` type($results)^)?
-  }];
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$input, "Value":$output)>
   ];
 
-  let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
-    void replaceInputDims(ArrayRef<AffineExpr> inputDims,
-                          std::optional<unsigned int> newNumInputDims = std::nullopt,
-                          std::optional<SmallVector<Value>> newExtraDims = std::nullopt,
-                          std::optional<SmallVector<Value>> newExtraSyms = std::nullopt);
+  let extraClassDeclaration = [{
+    ShapedType getInputType() {
+      return cast<ShapedType>(getInput().getType());
+    }
+    int64_t getInputRank() {
+      return getInputType().getRank();
+    }
+    ShapedType getOutputType() {
+      return cast<ShapedType>(getOutput().getType());
+    }
+    int64_t getOutputRank() {
+      return getOutputType().getRank();
+    }
+
+    SmallVector<IndexTransformationInterfaceAttr> getIndexTransformationArray() {
+      SmallVector<IndexTransformationInterfaceAttr> transformations(
+          getTransformations().getAsRange<IndexTransformationInterfaceAttr>());
+      return transformations;
+    }
+
+    void insertTransformation(int64_t position,
+                              IndexTransformationInterfaceAttr transformation);
 
     // Method to implement for specifying output range for
     // DestinationStyleOpInterface

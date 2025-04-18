@@ -8,6 +8,7 @@
 #define IREE_COMPILER_DIALECT_LINALGEXT_IR_LINALGEXTOPS_H_
 
 // #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"

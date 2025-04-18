@@ -322,90 +322,150 @@ GatherOp::reifyResultShapes(OpBuilder &b,
 // MapScatterOp
 //===----------------------------------------------------------------------===//
 
-void MapScatterOp::build(OpBuilder &builder, OperationState &state, Value input,
-                         Value output) {
-  auto inputShapedType = cast<ShapedType>(input.getType());
-  SmallVector<Type> resultType;
-  auto outputType = output.getType();
-  if (isa<RankedTensorType>(outputType)) {
-    resultType.push_back(outputType);
-  }
-  build(builder, state, resultType, input, output,
-        builder.getMultiDimIdentityMap(inputShapedType.getRank()),
-        /*map_dims=*/ValueRange{}, /*map_symbols=*/ValueRange{},
-        /*bounds_map=*/nullptr, /*bounds_map_dims=*/ValueRange{},
-        /*bounds_map_symbols=*/ValueRange{}, /*bounds=*/ValueRange{},
-        /*static_bounds=*/{});
+void MapScatterOp::insertTransformation(
+    int64_t position, IndexTransformationInterfaceAttr transformation) {
+  llvm::dbgs() << "getTransformationsAttr: " << getTransformationsAttr()
+               << "\n";
+  SmallVector<Attribute> transformations(getTransformationsAttr().getValue());
+  transformations.insert(transformations.begin() + position, transformation);
+  setTransformationsAttr(ArrayAttr::get(getContext(), transformations));
 }
 
-LogicalResult MapScatterOp::verify() { return success(); }
+void MapScatterOp::build(OpBuilder &builder, OperationState &state, Value input,
+                         Value output) {
+  SmallVector<Type> resultType;
+  if (isa<RankedTensorType>(output.getType()))
+    resultType.push_back(output.getType());
+  auto transformations = builder.getArrayAttr({});
+  build(builder, state, resultType, input, output, transformations,
+        /*captured_dynamic_values=*/ValueRange{});
+}
 
-void MapScatterOp::replaceInputDims(
-    ArrayRef<AffineExpr> inputDimReplacements,
-    std::optional<unsigned int> newNumInputDims,
-    std::optional<SmallVector<Value>> newExtraDims,
-    std::optional<SmallVector<Value>> newExtraSyms) {
-  int64_t inputRank = getInput().getType().getRank();
-  unsigned int newExtraDimStartPos =
-      newNumInputDims.has_value() ? newNumInputDims.value() : inputRank;
-  // `inputDimReplacements` and `this->map` may both have extra dims that are
-  // not part of the input shape dimensions. Offset the extra dims of
-  // `inputDimReplacements` by the number of extra dims in `this->map`, so there
-  // are no conflicts between the extra dim positions.
-  unsigned int numExtraDims = newExtraDims ? newExtraDims->size() : 0;
-  unsigned int numDimsInReplacements = newExtraDimStartPos + numExtraDims;
-  unsigned int numMapExtraDims = getMap().getNumDims() - inputRank;
-  SmallVector<AffineExpr> newDimsWithOffsetExtraDims = llvm::map_to_vector(
-      llvm::seq<int64_t>(numDimsInReplacements), [&](int64_t dim) {
-        int64_t dimPos =
-            dim < newExtraDimStartPos ? dim : dim + numMapExtraDims;
-        return getAffineDimExpr(dimPos, this->getContext());
-      });
-  SmallVector<AffineExpr> mapInputDimReplacements;
-  for (AffineExpr expr : inputDimReplacements) {
-    mapInputDimReplacements.push_back(
-        expr.replaceDims(newDimsWithOffsetExtraDims));
+LogicalResult MapScatterOp::verify() {
+  SmallVector<IndexTransformationInterfaceAttr> transformations =
+      getIndexTransformationArray();
+  int64_t transformationRank = getInputRank();
+  for (IndexTransformationInterfaceAttr transformation : transformations) {
+    if (transformation.getNumInputIndices() != transformationRank) {
+      llvm::dbgs() << "wrong num input indices\n";
+      return failure();
+    }
+    transformationRank = transformation.getNumResultIndices();
   }
-  unsigned int numExtraSyms = newExtraSyms ? newExtraSyms->size() : 0;
-  unsigned int newMapNumSyms = getMap().getNumSymbols() + numExtraSyms;
-  AffineMap newMap = getMap().replaceDimsAndSymbols(
-      mapInputDimReplacements, {}, numMapExtraDims + numDimsInReplacements,
-      newMapNumSyms);
-  setMap(newMap);
-  if (newExtraDims) {
-    getMapDimsMutable().append(newExtraDims.value());
+  if (getOutputRank() != transformationRank) {
+    llvm::dbgs() << "wrong getOutputRank\n";
+    return failure();
   }
-  if (newExtraSyms) {
-    getMapSymbolsMutable().append(newExtraSyms.value());
-  }
-  if (!getBoundsMap().has_value()) {
-    return;
-  }
+  return success();
+}
 
-  // Replacement for bounds_map is the same. There may be conflicts with extra
-  // dims, so resolve them before replacing.
-  unsigned int numBoundsMapExtraDims = getBoundsMap()->getNumDims() - inputRank;
-  for (int dim = newExtraDimStartPos; dim < newDimsWithOffsetExtraDims.size();
-       ++dim) {
-    newDimsWithOffsetExtraDims[dim] =
-        getAffineDimExpr(dim + numBoundsMapExtraDims, this->getContext());
+ParseResult MapScatterOp::parse(OpAsmParser &parser, OperationState &result) {
+  OpAsmParser::UnresolvedOperand inputOperand, outputOperand;
+  if (failed(parser.parseOperand(inputOperand)) ||
+      failed(parser.parseKeyword("into")) ||
+      failed(parser.parseOperand(outputOperand))) {
+    return failure();
   }
-  SmallVector<AffineExpr> boundsMapInputDimReplacements;
-  for (AffineExpr expr : inputDimReplacements) {
-    boundsMapInputDimReplacements.push_back(
-        expr.replaceDims(newDimsWithOffsetExtraDims));
+  SmallVector<OpAsmParser::UnresolvedOperand> capturedDynamicDimOperands;
+  SmallVector<Attribute> transformations;
+  if (succeeded(parser.parseOptionalKeyword("transformations"))) {
+    if (failed(parser.parseEqual()) || failed(parser.parseLSquare())) {
+      return failure();
+    }
+    ParseResult transformationListResult =
+        parser.parseCommaSeparatedList([&]() {
+          Attribute attr;
+          if (failed(parser.parseAttribute(attr))) {
+            return failure();
+          }
+          auto transformationAttr =
+              dyn_cast<IndexTransformationInterfaceAttr>(attr);
+          if (!transformationAttr) {
+            return failure();
+          }
+          transformations.push_back(transformationAttr);
+          SmallVector<OpAsmParser::UnresolvedOperand> dynamicDims;
+          if (failed(parser.parseOperandList(
+                  dynamicDims, transformationAttr.getNumDynamicIndices(),
+                  OpAsmParser::Delimiter::Braces))) {
+            return failure();
+          }
+          capturedDynamicDimOperands.append(dynamicDims.begin(),
+                                            dynamicDims.end());
+          return success();
+        });
+    if (failed(transformationListResult)) {
+      return failure();
+    }
   }
-  unsigned int newBoundsMapNumSyms =
-      getBoundsMap()->getNumSymbols() + numExtraSyms;
-  AffineMap newBoundsMap = getBoundsMap()->replaceDimsAndSymbols(
-      boundsMapInputDimReplacements, {},
-      numBoundsMapExtraDims + numDimsInReplacements, newBoundsMapNumSyms);
-  setBoundsMap(newBoundsMap);
-  if (newExtraDims) {
-    getBoundsMapDimsMutable().append(newExtraDims.value());
+  result.addAttribute("transformations",
+                      parser.getBuilder().getArrayAttr(transformations));
+
+  Type inputType, outputType;
+  SmallVector<Type> resultTypes;
+  SMLoc typesLoc;
+  if (parser.parseOptionalAttrDict(result.attributes) ||
+      parser.getCurrentLocation(&typesLoc) || parser.parseColon() ||
+      parser.parseType(inputType) ||
+      parser.parseKeywordType("into", outputType) ||
+      failed(parser.parseOptionalArrowTypeList(resultTypes))) {
+    return failure();
   }
-  if (newExtraSyms) {
-    getBoundsMapSymbolsMutable().append(newExtraSyms.value());
+  if (!llvm::isa<MemRefType, RankedTensorType>(inputType))
+    return parser.emitError(typesLoc,
+                            "requires memref or ranked tensor input type");
+  if (!llvm::isa<MemRefType, RankedTensorType>(outputType))
+    return parser.emitError(typesLoc,
+                            "requires memref or ranked tensor output type");
+
+  if (resultTypes.size() > 1) {
+    return parser.emitError(typesLoc, "requires at most 1 result type");
+  }
+  if (!llvm::all_of(resultTypes, llvm::IsaPred<RankedTensorType>)) {
+    return parser.emitError(typesLoc, "requires ranked tensor result type");
+  }
+  result.addTypes({resultTypes});
+
+  if (failed(parser.resolveOperand(inputOperand, inputType, result.operands)) ||
+      failed(
+          parser.resolveOperand(outputOperand, outputType, result.operands))) {
+    return failure();
+  }
+  if (failed(parser.resolveOperands(capturedDynamicDimOperands,
+                                    parser.getBuilder().getIndexType(),
+                                    result.operands))) {
+    return failure();
+  }
+  return success();
+}
+
+void MapScatterOp::print(OpAsmPrinter &p) {
+  SmallVector<StringRef, 1> elidedAttrs = {getTransformationsAttrName()};
+  p << " " << getInput() << " into " << getOutput();
+  if (!getTransformations().empty()) {
+    SmallVector<Value> capturedDynIndices = getCapturedDynamicIndices();
+    int capturedDynIndicesIdx = 0;
+    p << " transformations = [";
+    llvm::interleaveComma(getTransformations(), p, [&](Attribute attr) {
+      auto transformation = cast<IndexTransformationInterfaceAttr>(attr);
+      p << transformation;
+      int numDynamicIndices = transformation.getNumDynamicIndices();
+      if (numDynamicIndices > 0) {
+        ArrayRef<Value> dynamicIndices(capturedDynIndices.begin() +
+                                           capturedDynIndicesIdx,
+                                       numDynamicIndices);
+        p << "{";
+        llvm::interleaveComma(dynamicIndices, p);
+        p << "}";
+        capturedDynIndicesIdx += numDynamicIndices;
+      }
+    });
+    p << "]";
+  }
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+  p << " : " << getInput().getType() << " into " << getOutput().getType();
+  if (getNumResults() > 0) {
+    p << " -> " << getResultTypes();
   }
 }
 
