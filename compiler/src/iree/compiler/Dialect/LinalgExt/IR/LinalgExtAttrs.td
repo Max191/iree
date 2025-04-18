@@ -49,8 +49,71 @@ def IREELinalgExt_TransposeIndicesAttr : AttrDef<IREELinalgExt_Dialect, "Transpo
     ArrayRefParameter<"int64_t", "permutation">:$permutation
   );
 
-  let assemblyFormat = "`<` $permutation `>`";
+  let assemblyFormat = "custom<DynamicI64ArrayAttr>($permutation)";
   let genVerifyDecl = 1;
+}
+
+def IREELinalgExt_LinearizeIndicesAttr : AttrDef<IREELinalgExt_Dialect, "LinearizeIndices", [
+  DeclareAttrInterfaceMethods<IREELinalgExt_IndexTransformationInterfaceAttr, [
+    "getNumResultIndices",
+    "getNumInputIndices",
+    "getNumDynamicIndices",
+  ]>
+]> {
+  let mnemonic = "linearize_indices";
+  let cppNamespace = "::mlir::iree_compiler::IREE::LinalgExt";
+
+  let description = [{
+    Attribute describing a linearization of a set of indices with a given basis.
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"int64_t", "basis">:$basis
+  );
+
+  let assemblyFormat = "custom<DynamicI64ArrayAttr>($basis)";
+}
+
+def IREELinalgExt_DelinearizeIndicesAttr : AttrDef<IREELinalgExt_Dialect, "DelinearizeIndices", [
+  DeclareAttrInterfaceMethods<IREELinalgExt_IndexTransformationInterfaceAttr, [
+    "getNumResultIndices",
+    "getNumInputIndices",
+    "getNumDynamicIndices",
+  ]>
+]> {
+  let mnemonic = "delinearize_indices";
+  let cppNamespace = "::mlir::iree_compiler::IREE::LinalgExt";
+
+  let description = [{
+    Attribute describing a delinearization of an index with a given basis.
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"int64_t", "basis">:$basis
+  );
+
+  let assemblyFormat = "custom<DynamicI64ArrayAttr>($basis)";
+}
+
+def IREELinalgExt_ClampIndicesAttr : AttrDef<IREELinalgExt_Dialect, "ClampIndices", [
+  DeclareAttrInterfaceMethods<IREELinalgExt_IndexTransformationInterfaceAttr, [
+    "getNumResultIndices",
+    "getNumInputIndices",
+    "getNumDynamicIndices",
+  ]>
+]> {
+  let mnemonic = "clamp_indices";
+  let cppNamespace = "::mlir::iree_compiler::IREE::LinalgExt";
+
+  let description = [{
+    Attribute describing upper bounds to clamp a set of indices.
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"int64_t", "bounds">:$bounds
+  );
+
+  let assemblyFormat = "custom<DynamicI64ArrayAttr>($bounds)";
 }
 
 #endif // IREE_COMPILER_DIALECT_LINALGEXT_LINALGEXTATTRS

@@ -9,6 +9,14 @@
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 
+namespace mlir::iree_compiler::IREE::LinalgExt {
+
+ParseResult parseDynamicI64ArrayAttr(AsmParser &p,
+                                     SmallVector<int64_t> &array);
+void printDynamicI64ArrayAttr(AsmPrinter &p, ArrayRef<int64_t> attrs);
+
+} // namespace mlir::iree_compiler::IREE::LinalgExt
+
 // clang-format off
 #define GET_ATTRDEF_CLASSES
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h.inc"

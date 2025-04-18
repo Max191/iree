@@ -33,7 +33,7 @@
 namespace mlir::iree_compiler::IREE::LinalgExt {
 
 //===----------------------------------------------------------------------===//
-// Index Transformation Attributes
+// TransposeIndicesAttr
 //===----------------------------------------------------------------------===//
 
 int64_t TransposeIndicesAttr::getNumResultIndices() const {
@@ -55,6 +55,93 @@ TransposeIndicesAttr::verify(function_ref<mlir::InFlightDiagnostic()> emitError,
     return emitError() << "expected valid permutation";
   }
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LinearizeIndicesAttr
+//===----------------------------------------------------------------------===//
+
+int64_t LinearizeIndicesAttr::getNumResultIndices() const {
+  return 1;
+}
+
+int64_t LinearizeIndicesAttr::getNumInputIndices() const {
+  return getBasis().size();
+}
+
+int64_t LinearizeIndicesAttr::getNumDynamicIndices() const {
+  return llvm::count_if(getBasis(),
+      [](int64_t dim) { return ShapedType::isDynamic(dim); });
+}
+
+//===----------------------------------------------------------------------===//
+// DelinearizeIndicesAttr
+//===----------------------------------------------------------------------===//
+
+int64_t DelinearizeIndicesAttr::getNumResultIndices() const {
+  return getBasis().size();
+}
+
+int64_t DelinearizeIndicesAttr::getNumInputIndices() const {
+  return 1;
+}
+
+int64_t DelinearizeIndicesAttr::getNumDynamicIndices() const {
+  return llvm::count_if(getBasis(),
+      [](int64_t dim) { return ShapedType::isDynamic(dim); });
+}
+
+//===----------------------------------------------------------------------===//
+// ClampIndicesAttr
+//===----------------------------------------------------------------------===//
+
+int64_t ClampIndicesAttr::getNumResultIndices() const {
+  return getBounds().size();
+}
+
+int64_t ClampIndicesAttr::getNumInputIndices() const {
+  return getBounds().size();
+}
+
+int64_t ClampIndicesAttr::getNumDynamicIndices() const {
+  return llvm::count_if(getBounds(),
+      [](int64_t dim) { return ShapedType::isDynamic(dim); });
+}
+
+//===----------------------------------------------------------------------===//
+// custom<DynamicI64ArrayAttr>
+//===----------------------------------------------------------------------===//
+
+ParseResult parseDynamicI64ArrayAttr(AsmParser &p,
+                                     SmallVector<int64_t> &array) {
+  if (failed(p.parseLSquare()))
+    return failure();
+  if (failed(p.parseCommaSeparatedList([&] {
+        int64_t value = ShapedType::kDynamic;
+        if (failed(p.parseOptionalQuestion()) &&
+            failed(p.parseInteger(value))) {
+          return failure();
+        }
+        array.push_back(value);
+        return success();
+      }))) {
+    return failure();
+  }
+  if (failed(p.parseRSquare()))
+    return failure();
+  return success();
+}
+
+void printDynamicI64ArrayAttr(AsmPrinter &p, ArrayRef<int64_t> attrs) {
+  p << "[";
+  llvm::interleaveComma(attrs, p, [&](int64_t value) {
+    if (ShapedType::isDynamic(value)) {
+      p << "?";
+    } else {
+      p << value;
+    }
+  });
+  p << "]";
 }
 
 //===----------------------------------------------------------------------===//
