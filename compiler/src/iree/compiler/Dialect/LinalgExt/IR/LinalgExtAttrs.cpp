@@ -109,6 +109,23 @@ int64_t ClampIndicesAttr::getNumDynamicIndices() const {
 }
 
 //===----------------------------------------------------------------------===//
+// AddIndicesAttr
+//===----------------------------------------------------------------------===//
+
+int64_t AddIndicesAttr::getNumResultIndices() const {
+  return getValues().size();
+}
+
+int64_t AddIndicesAttr::getNumInputIndices() const {
+  return getValues().size();
+}
+
+int64_t AddIndicesAttr::getNumDynamicIndices() const {
+  return llvm::count_if(getValues(),
+                        [](int64_t dim) { return ShapedType::isDynamic(dim); });
+}
+
+//===----------------------------------------------------------------------===//
 // custom<DynamicI64ArrayAttr>
 //===----------------------------------------------------------------------===//
 

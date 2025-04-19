@@ -322,7 +322,14 @@ def IREELinalgExt_GatherOp : IREELinalgExt_Op<"gather",
 
 def IREELinalgExt_MapScatterOp : IREELinalgExt_PureOp<"map_scatter",
     [LinalgExtInterface, DestinationStyleOpInterface,
-     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+     DeclareOpInterfaceMethods<TilingInterface,
+        ["getIterationDomain",
+         "getLoopIteratorTypes",
+         "getResultTilePosition",
+         "getTiledImplementation",
+         "getIterationDomainTileFromOperandTile",
+         "getTiledImplementationFromOperandTile"]>]> {
   let summary = "Scatter operator using affine_map";
   let description = [{
     Scatter operator using affine_map

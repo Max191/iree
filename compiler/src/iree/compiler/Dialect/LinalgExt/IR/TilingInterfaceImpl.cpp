@@ -4,7 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <tuple>
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtAttrs.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -437,6 +439,120 @@ LogicalResult GatherOp::generateScalarImplementation(OpBuilder &b, Location loc,
       loc, bvm.lookupOrDefault(block.getTerminator()->getOperand(0)),
       getOutput(), ivs);
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// MapScatterOp
+//===----------------------------------------------------------------------===//
+
+SmallVector<utils::IteratorType> MapScatterOp::getLoopIteratorTypes() {
+  SmallVector<utils::IteratorType> iteratorTypes(getInputRank(),
+                                                 utils::IteratorType::parallel);
+  return iteratorTypes;
+}
+
+SmallVector<Range> MapScatterOp::getIterationDomain(OpBuilder &builder) {
+  Location loc = getLoc();
+  OpFoldResult zero = builder.getIndexAttr(0);
+  OpFoldResult one = builder.getIndexAttr(1);
+  SmallVector<Range> ranges;
+  for (auto dim : llvm::seq<int64_t>(0, getInputRank())) {
+    OpFoldResult ub = getDim(builder, loc, getInput(), dim);
+    ranges.push_back(Range{zero, ub, one});
+  }
+  return ranges;
+}
+
+FailureOr<TilingResult>
+MapScatterOp::getTiledImplementation(OpBuilder &builder,
+                                     ArrayRef<OpFoldResult> offsets,
+                                     ArrayRef<OpFoldResult> sizes) {
+  assert(offsets.size() >= 1 && sizes.size() >= 1);
+  Location loc = getLoc();
+  SmallVector<Operation *> slices;
+
+  // Slice of the updates.
+  auto oneAttr = builder.getI64IntegerAttr(1);
+  SmallVector<OpFoldResult> inputStrides(getInputRank(), oneAttr);
+  Operation *inputSlice =
+      getSlice(builder, loc, getInput(), offsets, sizes, inputStrides);
+  if (!inputSlice) {
+    return emitOpError("failed to get input slice");
+  }
+  Value tiledInput = inputSlice->getResult(0);
+  slices.push_back(inputSlice);
+
+  // Slice of the output.
+  SmallVector<OpFoldResult> outputOffsets, outputSizes;
+  if (failed(getResultTilePosition(builder, 0, offsets, sizes, outputOffsets,
+                                   outputSizes))) {
+    return {};
+  }
+  SmallVector<OpFoldResult> outputStrides(getOutputRank(), oneAttr);
+  Operation *outputSlice = getSlice(builder, loc, getOutput(), outputOffsets,
+                                    outputSizes, outputStrides);
+  if (!outputSlice) {
+    return emitOpError("failed to get original tensor slice");
+  }
+  Value tiledOutput = outputSlice->getResult(0);
+  slices.push_back(outputSlice);
+
+  SmallVector<Type> resultTypes;
+  if (getNumResults()) {
+    resultTypes.push_back(tiledOutput.getType());
+  }
+
+  SmallVector<Value> newOperands = {tiledInput, tiledOutput};
+  SmallVector<int64_t> staticOffsets;
+  dispatchIndexOpFoldResults(offsets, newOperands, staticOffsets);
+  newOperands.append(getCapturedDynamicIndices().begin(),
+                     getCapturedDynamicIndices().end());
+  auto addTransform = AddIndicesAttr::get(getContext(), staticOffsets);
+  Operation *tiledOp =
+      mlir::clone(builder, getOperation(), resultTypes, newOperands);
+  auto tiledMapScatterOp = cast<MapScatterOp>(tiledOp);
+  tiledMapScatterOp.insertTransformation(0, addTransform);
+  return TilingResult{
+      {tiledOp}, SmallVector<Value>(tiledOp->getResults()), slices};
+}
+
+LogicalResult MapScatterOp::getResultTilePosition(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  auto zeroAttr = builder.getI64IntegerAttr(0);
+  resultOffsets = SmallVector<OpFoldResult>(getOutputRank(), zeroAttr);
+  for (auto dim : llvm::seq<int64_t>(getOutputRank())) {
+    resultSizes.push_back(getDim(builder, getLoc(), getOutput(), dim));
+  }
+  return success();
+}
+
+/// Method to return the position of the result tile computed by the tiled
+/// operation.
+LogicalResult MapScatterOp::getIterationDomainTileFromOperandTile(
+    OpBuilder &b, unsigned operandNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    SmallVectorImpl<OpFoldResult> &iterDomainOffsets,
+    SmallVectorImpl<OpFoldResult> &iterDomainSizes) {
+  // The iteration domain is defined in terms of the |input|, so simply
+  // use the given offsets/sizes.
+  iterDomainOffsets.assign(offsets.begin(), offsets.end());
+  iterDomainSizes.assign(sizes.begin(), sizes.end());
+  return success();
+}
+
+/// Method to generate the tiled implementation of an operation from the tile
+/// of the operand.
+FailureOr<TilingResult> MapScatterOp::getTiledImplementationFromOperandTile(
+    OpBuilder &b, unsigned operandNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes) {
+  SmallVector<OpFoldResult> mappedOffsets, mappedSizes;
+  if (failed(getIterationDomainTileFromOperandTile(
+          b, operandNumber, offsets, sizes, mappedOffsets, mappedSizes))) {
+    return failure();
+  }
+  return getTiledImplementation(b, mappedOffsets, mappedSizes);
 }
 
 //===----------------------------------------------------------------------===//

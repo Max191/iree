@@ -116,4 +116,25 @@ def IREELinalgExt_ClampIndicesAttr : AttrDef<IREELinalgExt_Dialect, "ClampIndice
   let assemblyFormat = "custom<DynamicI64ArrayAttr>($bounds)";
 }
 
+def IREELinalgExt_AddIndicesAttr : AttrDef<IREELinalgExt_Dialect, "AddIndices", [
+  DeclareAttrInterfaceMethods<IREELinalgExt_IndexTransformationInterfaceAttr, [
+    "getNumResultIndices",
+    "getNumInputIndices",
+    "getNumDynamicIndices",
+  ]>
+]> {
+  let mnemonic = "add_indices";
+  let cppNamespace = "::mlir::iree_compiler::IREE::LinalgExt";
+
+  let description = [{
+    Attribute describing addition of index values to a set of indices.
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"int64_t", "values">:$values
+  );
+
+  let assemblyFormat = "custom<DynamicI64ArrayAttr>($values)";
+}
+
 #endif // IREE_COMPILER_DIALECT_LINALGEXT_LINALGEXTATTRS
