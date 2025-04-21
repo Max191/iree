@@ -329,7 +329,8 @@ def IREELinalgExt_MapScatterOp : IREELinalgExt_PureOp<"map_scatter",
          "getResultTilePosition",
          "getTiledImplementation",
          "getIterationDomainTileFromOperandTile",
-         "getTiledImplementationFromOperandTile"]>]> {
+         "getTiledImplementationFromOperandTile",
+         "generateScalarImplementation"]>]> {
   let summary = "Scatter operator using affine_map";
   let description = [{
     Scatter operator using affine_map

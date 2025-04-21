@@ -13,6 +13,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -20,6 +21,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/OpDefinition.h"
 
 #define DEBUG_TYPE "linalg-ext-tiling"
@@ -553,6 +555,29 @@ FailureOr<TilingResult> MapScatterOp::getTiledImplementationFromOperandTile(
     return failure();
   }
   return getTiledImplementation(b, mappedOffsets, mappedSizes);
+}
+
+LogicalResult MapScatterOp::generateScalarImplementation(OpBuilder &b,
+                                                         Location loc,
+                                                         ValueRange ivs) {
+  Value input = b.create<memref::LoadOp>(loc, getInput(), ivs);
+  SmallVector<OpFoldResult> storeIndices(ivs);
+
+  SmallVector<Value> capturedDynamicValues(getCapturedDynamicIndices());
+  auto capturedDynamicValuesIter = capturedDynamicValues.begin();
+  for (IndexTransformationInterfaceAttr transformAttr :
+       getIndexTransformationArray()) {
+    ArrayRef<Value> dynamicValues(capturedDynamicValuesIter,
+                                  transformAttr.getNumDynamicIndices());
+    capturedDynamicValuesIter += transformAttr.getNumDynamicIndices();
+    storeIndices =
+        transformAttr.transformIndices(b, loc, storeIndices, dynamicValues);
+  }
+
+  SmallVector<Value> storeIndexValues =
+      getValueOrCreateConstantIndexOp(b, loc, storeIndices);
+  b.create<memref::StoreOp>(loc, input, getOutput(), storeIndexValues);
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

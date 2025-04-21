@@ -36,6 +36,7 @@ def IREELinalgExt_TransposeIndicesAttr : AttrDef<IREELinalgExt_Dialect, "Transpo
     "getNumResultIndices",
     "getNumInputIndices",
     "getNumDynamicIndices",
+    "transformIndices",
   ]>
 ]> {
   let mnemonic = "transpose_indices";
@@ -58,6 +59,7 @@ def IREELinalgExt_LinearizeIndicesAttr : AttrDef<IREELinalgExt_Dialect, "Lineari
     "getNumResultIndices",
     "getNumInputIndices",
     "getNumDynamicIndices",
+    "transformIndices",
   ]>
 ]> {
   let mnemonic = "linearize_indices";
@@ -79,6 +81,7 @@ def IREELinalgExt_DelinearizeIndicesAttr : AttrDef<IREELinalgExt_Dialect, "Delin
     "getNumResultIndices",
     "getNumInputIndices",
     "getNumDynamicIndices",
+    "transformIndices",
   ]>
 ]> {
   let mnemonic = "delinearize_indices";
@@ -100,6 +103,7 @@ def IREELinalgExt_ClampIndicesAttr : AttrDef<IREELinalgExt_Dialect, "ClampIndice
     "getNumResultIndices",
     "getNumInputIndices",
     "getNumDynamicIndices",
+    "transformIndices",
   ]>
 ]> {
   let mnemonic = "clamp_indices";
@@ -121,6 +125,7 @@ def IREELinalgExt_AddIndicesAttr : AttrDef<IREELinalgExt_Dialect, "AddIndices", 
     "getNumResultIndices",
     "getNumInputIndices",
     "getNumDynamicIndices",
+    "transformIndices",
   ]>
 ]> {
   let mnemonic = "add_indices";

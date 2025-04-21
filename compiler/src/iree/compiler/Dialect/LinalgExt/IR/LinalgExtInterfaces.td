@@ -183,6 +183,17 @@ def IREELinalgExt_IndexTransformationInterfaceAttr : AttrInterface<"IndexTransfo
       /*methodName=*/"getNumDynamicIndices",
       /*args=*/(ins)
     >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns the number of dynamic indices in the transformation.
+      }],
+      /*retTy=*/"SmallVector<OpFoldResult>",
+      /*methodName=*/"transformIndices",
+      /*args=*/(ins "OpBuilder&":$b,
+                    "Location":$loc,
+                    "ArrayRef<OpFoldResult>":$indices,
+                    "ArrayRef<Value>":$dynamicValues)
+    >,
   ];
 }
 

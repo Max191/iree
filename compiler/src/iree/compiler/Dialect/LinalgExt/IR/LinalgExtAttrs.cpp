@@ -11,8 +11,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/SourceMgr.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -57,6 +60,13 @@ TransposeIndicesAttr::verify(function_ref<mlir::InFlightDiagnostic()> emitError,
   return success();
 }
 
+SmallVector<OpFoldResult>
+TransposeIndicesAttr::transformIndices(OpBuilder &b, Location loc,
+                                       ArrayRef<OpFoldResult> indices,
+                                       ArrayRef<Value> dynamicValues) const {
+  return applyPermutation(indices, getPermutation());
+}
+
 //===----------------------------------------------------------------------===//
 // LinearizeIndicesAttr
 //===----------------------------------------------------------------------===//
@@ -72,6 +82,19 @@ int64_t LinearizeIndicesAttr::getNumInputIndices() const {
 int64_t LinearizeIndicesAttr::getNumDynamicIndices() const {
   return llvm::count_if(getBasis(),
       [](int64_t dim) { return ShapedType::isDynamic(dim); });
+}
+
+SmallVector<OpFoldResult>
+LinearizeIndicesAttr::transformIndices(OpBuilder &b, Location loc,
+                                       ArrayRef<OpFoldResult> indices,
+                                       ArrayRef<Value> dynamicValues) const {
+  SmallVector<Value> indexValues =
+      getValueOrCreateConstantIndexOp(b, loc, indices);
+  SmallVector<OpFoldResult> mixedBasis =
+      getMixedValues(getBasis(), dynamicValues, getContext());
+  auto linearizeOp =
+      b.create<affine::AffineLinearizeIndexOp>(loc, indexValues, mixedBasis);
+  return linearizeOp->getResults();
 }
 
 //===----------------------------------------------------------------------===//
@@ -91,6 +114,19 @@ int64_t DelinearizeIndicesAttr::getNumDynamicIndices() const {
       [](int64_t dim) { return ShapedType::isDynamic(dim); });
 }
 
+SmallVector<OpFoldResult>
+DelinearizeIndicesAttr::transformIndices(OpBuilder &b, Location loc,
+                                         ArrayRef<OpFoldResult> indices,
+                                         ArrayRef<Value> dynamicValues) const {
+  assert(indices.size() == 1 && "expected only a single index");
+  Value index = getValueOrCreateConstantIndexOp(b, loc, indices[0]);
+  SmallVector<OpFoldResult> mixedBasis =
+      getMixedValues(getBasis(), dynamicValues, getContext());
+  auto delinearizeOp =
+      b.create<affine::AffineDelinearizeIndexOp>(loc, index, mixedBasis);
+  return delinearizeOp->getResults();
+}
+
 //===----------------------------------------------------------------------===//
 // ClampIndicesAttr
 //===----------------------------------------------------------------------===//
@@ -108,6 +144,13 @@ int64_t ClampIndicesAttr::getNumDynamicIndices() const {
       [](int64_t dim) { return ShapedType::isDynamic(dim); });
 }
 
+SmallVector<OpFoldResult>
+ClampIndicesAttr::transformIndices(OpBuilder &b, Location loc,
+                                   ArrayRef<OpFoldResult> indices,
+                                   ArrayRef<Value> dynamicValues) const {
+  return SmallVector<OpFoldResult>(indices);
+}
+
 //===----------------------------------------------------------------------===//
 // AddIndicesAttr
 //===----------------------------------------------------------------------===//
@@ -123,6 +166,22 @@ int64_t AddIndicesAttr::getNumInputIndices() const {
 int64_t AddIndicesAttr::getNumDynamicIndices() const {
   return llvm::count_if(getValues(),
                         [](int64_t dim) { return ShapedType::isDynamic(dim); });
+}
+
+SmallVector<OpFoldResult>
+AddIndicesAttr::transformIndices(OpBuilder &b, Location loc,
+                                 ArrayRef<OpFoldResult> indices,
+                                 ArrayRef<Value> dynamicValues) const {
+  SmallVector<OpFoldResult> mixedValues =
+      getMixedValues(getValues(), dynamicValues, getContext());
+  AffineMap addMap = AffineMap::get(
+      2, 0, {b.getAffineDimExpr(0) + b.getAffineDimExpr(1)}, getContext());
+  SmallVector<OpFoldResult> transformedIndices;
+  for (auto [index, value] : llvm::zip_equal(indices, mixedValues)) {
+    transformedIndices.push_back(
+        affine::makeComposedFoldedAffineApply(b, loc, addMap, {index, value}));
+  }
+  return transformedIndices;
 }
 
 //===----------------------------------------------------------------------===//
