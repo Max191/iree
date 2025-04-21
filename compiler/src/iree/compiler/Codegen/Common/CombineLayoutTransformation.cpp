@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
@@ -253,30 +254,14 @@ foldIntoMapScatter(RewriterBase &rewriter, Operation *op,
 /// into a single iree_linalg_ext.map_scatter op. An identity map_scatter op
 /// is inserted before the root, and then the producers of the map_scatter op
 /// are folded into the map_scatter until an unsupported op is reached.
-static void combineRelayoutOpChain(RewriterBase &rewriter, OpOperand &root) {
-  Operation *rootOp = root.get().getDefiningOp();
-  if (!rootOp) {
-    return;
+static IREE::LinalgExt::MapScatterOp
+combineRelayoutOpChain(RewriterBase &rewriter,
+                       IREE::LinalgExt::MapScatterOp mapScatterOp) {
+  Operation *relayoutOp = mapScatterOp.getInput().getDefiningOp();
+  if (!relayoutOp) {
+    return mapScatterOp;
   }
-  auto rootTensorType = dyn_cast<RankedTensorType>(root.get().getType());
-  if (!rootTensorType) {
-    return;
-  }
-  Location loc = rootOp->getLoc();
-  OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPointAfterValue(root.get());
-  auto relayoutDest =
-      rewriter
-          .create<tensor::EmptyOp>(
-              loc, tensor::getMixedSizes(rewriter, loc, root.get()),
-              rootTensorType.getElementType())
-          .getResult();
-  auto combinedRelayoutOp = rewriter.create<IREE::LinalgExt::MapScatterOp>(
-      loc, rootOp->getResult(0), relayoutDest);
-  rewriter.replaceUsesWithIf(root.get(), combinedRelayoutOp.getResult(0),
-                             [&](OpOperand &use) { return root == use; });
-  LDBG("Created identity map_scatter:\n" << combinedRelayoutOp << "\n");
-  Operation *relayoutOp = rootOp;
+  IREE::LinalgExt::MapScatterOp combinedRelayoutOp = mapScatterOp;
   while (relayoutOp) {
     LDBG("Attempting to fold " << relayoutOp->getName() <<
          " into map_scatter op:\n" << *relayoutOp << "\n");
@@ -293,12 +278,27 @@ static void combineRelayoutOpChain(RewriterBase &rewriter, OpOperand &root) {
          "\n");
     relayoutOp = combinedRelayoutOp.getInput().getDefiningOp();
   }
-  // If no relayout ops were folded into the map_scatter, then remove it, since
-  // it will just be an identity transformation.
-  if (relayoutOp == rootOp) {
-    LDBG("No relayout ops were combined. Removing identity map_scatter op.");
-    rewriter.replaceOp(combinedRelayoutOp, combinedRelayoutOp.getInput());
-  }
+  return combinedRelayoutOp;
+}
+
+static IREE::LinalgExt::MapScatterOp
+insertIdentityMapScatter(RewriterBase &rewriter,
+                         IREE::Codegen::StoreToMemrefOp storeOp) {
+  Location loc = storeOp->getLoc();
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(storeOp);
+  auto mapScatterDest =
+      rewriter
+          .create<tensor::EmptyOp>(
+              loc, memref::getMixedSizes(rewriter, loc, storeOp.getTarget()),
+              storeOp.getValue().getType().getElementType())
+          .getResult();
+  auto mapScatterOp = rewriter.create<IREE::LinalgExt::MapScatterOp>(
+      loc, storeOp.getValue(), mapScatterDest);
+  rewriter.modifyOpInPlace(
+      storeOp, [&]() { storeOp->setOperand(0, mapScatterOp.getResult(0)); });
+  LDBG("Created identity map_scatter:\n" << mapScatterOp << "\n");
+  return mapScatterOp;
 }
 
 namespace {
@@ -322,7 +322,17 @@ struct CombineLayoutTransformationPass final
     SmallVector<IREE::Codegen::StoreToMemrefOp> dispatchResults(
         funcOp.getFunctionBody().getOps<IREE::Codegen::StoreToMemrefOp>());
     for (IREE::Codegen::StoreToMemrefOp dispatchResult : dispatchResults) {
-      combineRelayoutOpChain(rewriter, dispatchResult.getValueMutable());
+      IREE::LinalgExt::MapScatterOp mapScatterOp =
+          insertIdentityMapScatter(rewriter, dispatchResult);
+      IREE::LinalgExt::MapScatterOp combinedRelayoutOp =
+          combineRelayoutOpChain(rewriter, mapScatterOp);
+      // If no relayout ops were folded into the map_scatter, then remove it,
+      // since it will just be an identity transformation.
+      if (combinedRelayoutOp.getTransformations().empty()) {
+        LDBG(
+            "No relayout ops were combined. Removing identity map_scatter op.");
+        rewriter.replaceOp(combinedRelayoutOp, combinedRelayoutOp.getInput());
+      }
     }
 
     // Cleanup any tensor.dim ops that may be present after relayout
