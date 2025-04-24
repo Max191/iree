@@ -330,15 +330,15 @@ struct StoreToMemrefOpInterface
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
                           const BufferizationOptions &options) const {
     auto storeOp = cast<IREE::Codegen::StoreToMemrefOp>(op);
-    auto maybeBuffer =
-        getBuffer(rewriter, storeOp->getOpOperand(0).get(), options);
+    FailureOr<Value> maybeBuffer =
+        getBuffer(rewriter, storeOp.getValue(), options);
     if (failed(maybeBuffer))
       return failure();
     Value srcMemref = *maybeBuffer;
 
     // If everything bufferized inplace, no copy is needed. We wrote to the
     // target buffer already. The copy folds away in that case.
-    if (failed(options.createMemCpy(rewriter, storeOp->getLoc(), srcMemref,
+    if (failed(options.createMemCpy(rewriter, storeOp.getLoc(), srcMemref,
                                     storeOp.getTarget())))
       return failure();
 
@@ -779,22 +779,14 @@ void registerBufferizationInterfaces(DialectRegistry &registry) {
         IREE::TensorExt::DispatchTensorStoreOp::attachInterface<
             DispatchTensorStoreOpSubsetInsertionInterface>(*ctx);
       });
-  registry.addExtension(+[](MLIRContext *ctx,
-                            IREE::Codegen::IREECodegenDialect *dialect) {
-    // LoadFromMemrefOp
-    IREE::Codegen::LoadFromMemrefOp::attachInterface<LoadFromMemrefOpInterface>(
-        *ctx);
-    IREE::Codegen::LoadFromMemrefOp::attachInterface<
-        LoadFromMemrefOpSubsetInterface>(*ctx);
-
-    // StoreToMemrefOp
-    IREE::Codegen::StoreToMemrefOp::attachInterface<StoreToMemrefOpInterface>(
-        *ctx);
-    IREE::Codegen::StoreToMemrefOp::attachInterface<
-        StoreToMemrefOpSubsetInterface>(*ctx);
-    IREE::Codegen::StoreToMemrefOp::attachInterface<
-        StoreToMemrefOpSubsetInsertionInterface>(*ctx);
-  });
+  registry.addExtension(
+      +[](MLIRContext *ctx, IREE::Codegen::IREECodegenDialect *dialect) {
+        IREE::Codegen::LoadFromMemrefOp::attachInterface<
+            LoadFromMemrefOpInterface, LoadFromMemrefOpSubsetInterface>(*ctx);
+        IREE::Codegen::StoreToMemrefOp::attachInterface<
+            StoreToMemrefOpInterface, StoreToMemrefOpSubsetInterface,
+            StoreToMemrefOpSubsetInsertionInterface>(*ctx);
+      });
   registry.addExtension(+[](MLIRContext *ctx,
                             IREE::LinalgExt::IREELinalgExtDialect *dialect) {
     IREE::LinalgExt::FftOp::attachInterface<
