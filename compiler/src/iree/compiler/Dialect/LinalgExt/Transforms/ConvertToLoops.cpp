@@ -16,6 +16,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/TilingInterface.h"
@@ -59,7 +60,37 @@ static LogicalResult lowerToLoops(OpBuilder &builder,
                                   TilingInterface tilableOp) {
   SmallVector<Range> loopBounds = tilableOp.getIterationDomain(builder);
   SmallVector<Value> ivs;
-  return lowerToLoopsImpl(builder, tilableOp, loopBounds, 0, ivs);
+  bool shouldUnrollLoopNest = isa<MapScatterOp>(tilableOp);
+  if (failed(lowerToLoopsImpl(builder, tilableOp, loopBounds, 0, ivs))) {
+    return failure();
+  }
+  if (!shouldUnrollLoopNest) {
+    return success();
+  }
+  SmallVector<scf::ForOp> loops;
+  for (Value iv : ivs) {
+    auto ivBbarg = dyn_cast<BlockArgument>(iv);
+    if (!ivBbarg) {
+      return failure();
+    }
+    auto loop = dyn_cast<scf::ForOp>(ivBbarg.getOwner()->getParentOp());
+    if (!loop) {
+      return failure();
+    }
+    loops.push_back(loop);
+  }
+  for (auto loop : llvm::reverse(loops)) {
+    std::optional<int64_t> ub = getConstantIntValue(loop.getUpperBound());
+    if (!ub.has_value() || ub.value() == 1) {
+      continue;
+    }
+    builder.setInsertionPoint(loop);
+    if (failed(mlir::loopUnrollByFactor(loop, ub.value()))) {
+      loop.emitOpError("failed to unroll loop");
+      return failure();
+    }
+  }
+  return success();
 }
 
 /// Pattern rewriter hook to lower a `TiledOpInterface` to loops.
