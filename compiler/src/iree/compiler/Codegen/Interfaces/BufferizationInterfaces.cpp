@@ -13,6 +13,7 @@
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
@@ -28,6 +29,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Interfaces/ParallelCombiningInterfaces.h"
 #include "mlir/Interfaces/SubsetOpInterface.h"
 #include "mlir/Support/LLVM.h"
 
@@ -342,6 +344,56 @@ struct LinalgExtOpInterface
                           bufferization::BufferizationState &state) const {
     return bufferizeLinalgExtOp(
         rewriter, cast<IREE::LinalgExt::LinalgExtOp>(op), options, state);
+  }
+};
+
+/// Bufferization of ops that implement the LinalgExtOp interface. Replace with
+/// a new op that operates entirely on memrefs.
+struct ParallelMapScatterOpInterface
+    : public BufferizableOpInterface::ExternalModel<
+          ParallelMapScatterOpInterface,
+          IREE::LinalgExt::ParallelMapScatterOp> {
+
+  bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
+                              const AnalysisState &state) const {
+    auto parallelMapScatter = cast<IREE::LinalgExt::ParallelMapScatterOp>(op);
+    return opOperand == parallelMapScatter.getInputMutable();
+  }
+
+  bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
+                               const AnalysisState &state) const {
+    auto parallelMapScatter = cast<IREE::LinalgExt::ParallelMapScatterOp>(op);
+    return opOperand == parallelMapScatter.getOutputMutable();
+  }
+
+  bufferization::AliasingValueList
+  getAliasingValues(Operation *op, OpOperand &opOperand,
+                    const AnalysisState &state) const {
+    return {};
+  }
+
+  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
+    // Bufferize the op outside of the parallel combining terminator.
+    Operation *parallelCombiningParent =
+        op->getParentOfType<ParallelCombiningOpInterface>();
+    if (parallelCombiningParent) {
+      rewriter.setInsertionPoint(parallelCombiningParent);
+    }
+    auto parallelMapScatter = cast<IREE::LinalgExt::ParallelMapScatterOp>(op);
+    FailureOr<Value> inputBuffer =
+        getBuffer(rewriter, parallelMapScatter.getInput(), options, state);
+    FailureOr<Value> outputBuffer =
+        getBuffer(rewriter, parallelMapScatter.getOutput(), options, state);
+    if (failed(inputBuffer) || failed(outputBuffer)) {
+      return failure();
+    }
+    IREE::LinalgExt::MapScatterOp::createWithTransformationRegion(
+        rewriter, op->getLoc(), &parallelMapScatter.getTransformationRegion(),
+        *inputBuffer, *outputBuffer);
+    rewriter.eraseOp(op);
+    return success();
   }
 };
 
@@ -726,6 +778,8 @@ void registerBufferizationInterfaces(DialectRegistry &registry) {
         LinalgExtOpInterface<IREE::LinalgExt::AttentionOp>>(*ctx);
     IREE::LinalgExt::MapScatterOp::attachInterface<
         LinalgExtOpInterface<IREE::LinalgExt::MapScatterOp>>(*ctx);
+    IREE::LinalgExt::ParallelMapScatterOp::attachInterface<
+        ParallelMapScatterOpInterface>(*ctx);
   });
   registry.insert<linalg::LinalgDialect>();
   registry.addExtension(+[](MLIRContext *ctx, linalg::LinalgDialect *dialect) {

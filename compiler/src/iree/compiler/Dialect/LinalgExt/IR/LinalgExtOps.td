@@ -13,6 +13,7 @@ include "mlir/Dialect/Linalg/IR/LinalgInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ParallelCombiningInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/TilingInterface.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
@@ -398,6 +399,11 @@ def IREELinalgExt_MapScatterOp : IREELinalgExt_PureOp<"map_scatter",
     static MapScatterOp createIdentityMapScatter(OpBuilder &builder,
                                                  Location loc, Value input,
                                                  Value output);
+
+    // Creates a MapScatterOp, taking an existing transformation region.
+    static MapScatterOp createWithTransformationRegion(
+        OpBuilder &builder, Location loc, Region *region, Value input,
+        Value output);
 
     // Method to implement for specifying output range for
     // DestinationStyleOpInterface
@@ -1857,6 +1863,71 @@ def IREELinalgExt_CustomOp : IREELinalgExt_Op<"custom_op", [
     MutableOperandRange getDpsInitsMutable() {
       return getOutputsMutable();
     }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Parallel Insertion Ops
+//===----------------------------------------------------------------------===//
+
+def IREECodegen_ParallelMapScatterOp : Op<IREELinalgExt_Dialect, "parallel_map_scatter",
+    [DeclareOpInterfaceMethods<InParallelOpInterface>,
+     SingleBlockImplicitTerminator<"::mlir::iree_compiler::IREE::LinalgExt::YieldOp">]> {
+  let summary = [{Parallel insertion version of iree_linalg_ext.map_scatter.}];
+  let description = [{
+    Takes two operands, `input` and `output`, and stores every element of
+    `input` to a unique location in `output`. The semantics of this op are
+    the same as the tensor semantics of the iree_linalg_ext.map_scatter op,
+    except that the op does not directly produce a result. Instead, the op
+    is tied to a parent `ParallelIterationOpInterface`s result, and the combined
+    tensor produced by the parallel execution of this op will produce this
+    tied result. Having conflicting inserts (writing to the same output
+    location) across parallel instances of this op is considered undefined
+    behavior, and is expected not to happen.
+  }];
+  let arguments = (ins
+      AnyRankedTensor:$input,
+      AnyRankedTensor:$output
+  );
+  let regions = (region AnyRegion:$transformation_region);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    attr-dict $input `into` $output
+    $transformation_region
+    `:` type($input) `into` type($output)
+  }];
+
+  let extraClassDeclaration = [{
+    ShapedType getInputType() {
+      return cast<ShapedType>(getInput().getType());
+    }
+    int64_t getInputRank() {
+      return getInputType().getRank();
+    }
+    ShapedType getOutputType() {
+      return cast<ShapedType>(getOutput().getType());
+    }
+    int64_t getOutputRank() {
+      return getOutputType().getRank();
+    }
+
+    // Helper to apply transformations to the source index block arguments of
+    // the transformation body, and replace the uses of the previous source
+    // indices with the values returned by `transformationBuilder`. The argument
+    // to `transformationBuilder` function will be an ArrayRef of the new block
+    // arguments, the number of which is determined by `numSourceIndices`. The
+    // `transformationBuilder` should return the replacements for the old block
+    // arguments.
+    void insertTransformationAtStart(
+        OpBuilder &builder,
+        function_ref<SmallVector<Value>(ArrayRef<BlockArgument>)>
+            transformationBuilder,
+        int64_t numSourceIndices);
+
+    // Creates a ParallelMapScatterOp, taking an existing transformation region.
+    static ParallelMapScatterOp createWithTransformationRegion(
+        OpBuilder &builder, Location loc, Region *region, Value input,
+        Value output);
   }];
 }
 

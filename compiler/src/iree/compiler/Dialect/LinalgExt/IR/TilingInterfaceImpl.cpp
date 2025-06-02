@@ -518,12 +518,13 @@ LogicalResult MapScatterOp::getIterationDomainTileFromOperandTile(
 FailureOr<TilingResult> MapScatterOp::getTiledImplementationFromOperandTile(
     OpBuilder &b, unsigned operandNumber, ArrayRef<OpFoldResult> offsets,
     ArrayRef<OpFoldResult> sizes) {
-  SmallVector<OpFoldResult> mappedOffsets, mappedSizes;
-  if (failed(getIterationDomainTileFromOperandTile(
-          b, operandNumber, offsets, sizes, mappedOffsets, mappedSizes))) {
-    return failure();
-  }
-  return getTiledImplementation(b, mappedOffsets, mappedSizes);
+  // SmallVector<OpFoldResult> mappedOffsets, mappedSizes;
+  // if (failed(getIterationDomainTileFromOperandTile(
+  //         b, operandNumber, offsets, sizes, mappedOffsets, mappedSizes))) {
+  //   return failure();
+  // }
+  // return getTiledImplementation(b, mappedOffsets, mappedSizes);
+  return failure();
 }
 
 /// The body of the transformation_region is inlined, and the yielded indices

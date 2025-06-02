@@ -12,12 +12,15 @@
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
+#include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
@@ -280,6 +283,9 @@ struct FuseTilableForallConsumers final
     if (!dpsOp) {
       return failure();
     }
+    if (isa<IREE::LinalgExt::MapScatterOp>(tilableOp)) {
+      return failure();
+    }
 
     tensor::ParallelInsertSliceOp producerSlice;
     LoopLikeOpInterface sliceOwner;
@@ -367,6 +373,146 @@ struct FuseExtractSliceConsumers final
   }
 };
 
+template <typename MapScatterOpTy>
+static FailureOr<Value>
+fuseMapScatterIntoProducerForall(RewriterBase &rewriter, scf::ForallOp forallOp,
+                                 MapScatterOpTy mapScatterOp) {
+  auto forallResult = cast<OpResult>(mapScatterOp.getInput());
+  auto parallelIterationOp = cast<ParallelIterationOpInterface>(*forallOp);
+  SmallVector<Operation *> updatingOps =
+      parallelIterationOp.getUpdatingOps(forallResult);
+  for (Operation *op : updatingOps) {
+    auto parallelInsertSliceOp = dyn_cast<tensor::ParallelInsertSliceOp>(op);
+    if (!parallelInsertSliceOp) {
+      return rewriter.notifyMatchFailure(
+          op, "updating ops are not all parallel_insert_slice ops");
+    }
+    if (!areAllConstantIntValue(parallelInsertSliceOp.getMixedStrides(), 1)) {
+      return rewriter.notifyMatchFailure(
+          op, "parallel_insert_slice op has non-unit strides");
+    }
+  }
+  // The tied output argument will be replaced with the map_scatter output, and
+  // the only users of the new block argument will be the ParallelMapScatterOp.
+  // Replace all uses now, and save the tied output block arg to use as the
+  // ParallelMapScatterOp output.
+  int64_t resultIdx = forallResult.getResultNumber();
+  BlockArgument resultTiedArg = forallOp.getRegionOutArgs()[resultIdx];
+  rewriter.replaceAllUsesWith(resultTiedArg, forallOp.getOutputs()[resultIdx]);
+  for (Operation *op : updatingOps) {
+    // Start by getting the tiled implementation of the map_scatter op. Then
+    // use its transformation body to create a ParallelMapScatterOp to replace
+    // it.
+    auto parallelInsertSliceOp = cast<tensor::ParallelInsertSliceOp>(op);
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(parallelInsertSliceOp);
+    Location loc = parallelInsertSliceOp.getLoc();
+    SmallVector<OpFoldResult> offsets = parallelInsertSliceOp.getMixedOffsets();
+    SmallVector<OpFoldResult> sizes = parallelInsertSliceOp.getMixedSizes();
+    IREE::LinalgExt::ParallelMapScatterOp parallelMapScatterOp =
+        IREE::LinalgExt::ParallelMapScatterOp::createWithTransformationRegion(
+            rewriter, loc, &mapScatterOp.getTransformationRegion(),
+            parallelInsertSliceOp.getSource(), resultTiedArg);
+    auto indexTransformBuilder =
+        [&](ArrayRef<BlockArgument> srcIndices) -> SmallVector<Value> {
+      SmallVector<OpFoldResult> offsetIndices;
+      auto addMap = AffineMap::get(
+          2, 0, {rewriter.getAffineDimExpr(0) + rewriter.getAffineDimExpr(1)});
+      for (auto [srcIdx, offset] : llvm::zip_equal(srcIndices, offsets)) {
+        offsetIndices.push_back(affine::makeComposedFoldedAffineApply(
+            rewriter, loc, addMap, {OpFoldResult(srcIdx), offset}));
+      }
+      return getValueOrCreateConstantIndexOp(rewriter, loc, offsetIndices);
+    };
+    parallelMapScatterOp.insertTransformationAtStart(
+        rewriter, indexTransformBuilder, offsets.size());
+    rewriter.eraseOp(parallelInsertSliceOp);
+  }
+
+  // Clone the forall op with the extracted init operand to replace the
+  // original forall op.
+  Location loc = forallOp.getLoc();
+  rewriter.setInsertionPoint(forallOp);
+  SmallVector<Value> newForallOutputs(forallOp.getOutputs());
+  newForallOutputs[resultIdx] = mapScatterOp.getOutput();
+
+  scf::ForallOp newForallOp = rewriter.create<scf::ForallOp>(
+      loc, forallOp.getMixedLowerBound(), forallOp.getMixedUpperBound(),
+      forallOp.getMixedStep(), newForallOutputs, forallOp.getMappingAttr());
+
+  SmallVector<Value> argReplacements(newForallOp.getInductionVars());
+  argReplacements.append(newForallOp.getRegionIterArgs().begin(),
+                         newForallOp.getRegionIterArgs().end());
+  newForallOp.getTerminator()->erase();
+  rewriter.mergeBlocks(forallOp.getBody(), newForallOp.getBody(),
+                       argReplacements);
+
+  rewriter.replaceOp(forallOp, newForallOp);
+  if (mapScatterOp->getNumResults() > 0) {
+    rewriter.replaceOp(mapScatterOp, newForallOp.getResult(resultIdx));
+  }
+  return newForallOp.getResult(resultIdx);
+}
+
+struct FuseMapScatterConsumer final
+    : OpRewritePattern<IREE::LinalgExt::MapScatterOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(IREE::LinalgExt::MapScatterOp mapScatterOp,
+                                PatternRewriter &rewriter) const override {
+    auto forallOp = mapScatterOp.getInput().getDefiningOp<scf::ForallOp>();
+    if (!forallOp) {
+      return rewriter.notifyMatchFailure(mapScatterOp, "no forall op producer");
+    }
+    if (!mapScatterOp.getInput().hasOneUse()) {
+      return rewriter.notifyMatchFailure(mapScatterOp,
+                                         "map_scatter input has multiple uses");
+    }
+
+    if (failed(fuseMapScatterIntoProducerForall(rewriter, forallOp,
+                                                mapScatterOp))) {
+      return failure();
+    }
+    return success();
+  }
+};
+
+struct FuseParallelMapScatterConsumer final
+    : OpRewritePattern<IREE::LinalgExt::ParallelMapScatterOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult
+  matchAndRewrite(IREE::LinalgExt::ParallelMapScatterOp parallelMapScatterOp,
+                  PatternRewriter &rewriter) const override {
+    auto forallOp =
+        parallelMapScatterOp.getInput().getDefiningOp<scf::ForallOp>();
+    if (!forallOp) {
+      return rewriter.notifyMatchFailure(parallelMapScatterOp,
+                                         "no forall op producer");
+    }
+    if (!parallelMapScatterOp.getInput().hasOneUse()) {
+      return rewriter.notifyMatchFailure(parallelMapScatterOp,
+                                         "map_scatter input has multiple uses");
+    }
+
+    FailureOr<Value> scatterResult = fuseMapScatterIntoProducerForall(
+        rewriter, forallOp, parallelMapScatterOp);
+    if (failed(scatterResult)) {
+      return failure();
+    }
+
+    int64_t sliceRank = parallelMapScatterOp.getOutputRank();
+    Location loc = parallelMapScatterOp.getLoc();
+    SmallVector<OpFoldResult> offsets(sliceRank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> strides(sliceRank, rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> sizes =
+        tensor::getMixedSizes(rewriter, loc, parallelMapScatterOp.getOutput());
+    rewriter.setInsertionPoint(parallelMapScatterOp);
+    rewriter.replaceOpWithNewOp<tensor::ParallelInsertSliceOp>(
+        parallelMapScatterOp, *scatterResult, parallelMapScatterOp.getOutput(),
+        offsets, sizes, strides);
+    return success();
+  }
+};
+
 void GPUFuseAndHoistParallelLoopsPass::runOnOperation() {
   MLIRContext *context = &getContext();
 
@@ -394,6 +540,7 @@ void GPUFuseAndHoistParallelLoopsPass::runOnOperation() {
                                 /*benefit=*/1);
     }
     patterns.add<FuseTilableForallConsumers>(context);
+    // patterns.add<FuseMapScatterConsumer>(context);
     populateForallLoopHoistingPattern(patterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       return signalPassFailure();
@@ -413,6 +560,8 @@ void GPUFuseAndHoistParallelLoopsPass::runOnOperation() {
     patterns.add<FuseTilableForallConsumers>(context);
     patterns.add<FuseCollapseShapeConsumers>(context);
     patterns.add<FuseExtractSliceConsumers>(context);
+    patterns.add<FuseMapScatterConsumer>(context);
+    patterns.add<FuseParallelMapScatterConsumer>(context);
     populateSwapExtractWithExpandPattern(patterns);
     tensor::populateFoldTensorEmptyPatterns(patterns);
     scf::ForallOp::getCanonicalizationPatterns(patterns, context);

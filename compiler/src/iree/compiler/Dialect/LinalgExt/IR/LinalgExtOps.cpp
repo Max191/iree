@@ -31,6 +31,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -463,6 +464,22 @@ MapScatterOp MapScatterOp::createIdentityMapScatter(OpBuilder &builder,
   return mapScatterOp;
 }
 
+MapScatterOp MapScatterOp::createWithTransformationRegion(OpBuilder &builder,
+                                                          Location loc,
+                                                          Region *region,
+                                                          Value input,
+                                                          Value output) {
+  SmallVector<Type> resultType;
+  if (isa<RankedTensorType>(output.getType())) {
+    resultType.push_back(output.getType());
+  }
+  auto mapScatterOp =
+      builder.create<MapScatterOp>(loc, resultType, input, output);
+  IRMapping mapper;
+  region->cloneInto(&mapScatterOp.getTransformationRegion(), mapper);
+  return mapScatterOp;
+}
+
 LogicalResult MapScatterOp::verify() {
   if (getInputType().getElementType() != getOutputType().getElementType()) {
     return emitOpError("expected input and output element types to match");
@@ -495,15 +512,14 @@ LogicalResult MapScatterOp::verify() {
   return success();
 }
 
-void MapScatterOp::insertTransformationAtStart(
-    OpBuilder &builder,
+static void insertTransformationAtStart(
+    OpBuilder &builder, Location loc,
     function_ref<SmallVector<Value>(ArrayRef<BlockArgument>)>
         transformationBuilder,
-    int64_t numSourceIndices) {
-  Block &transformBody = getTransformationRegion().front();
+    int64_t numSourceIndices, Block &transformBody) {
   SmallVector<BlockArgument> oldSourceIndices(transformBody.getArguments());
   SmallVector<Type> indexTypes(numSourceIndices, builder.getIndexType());
-  SmallVector<Location> locs(numSourceIndices, getLoc());
+  SmallVector<Location> locs(numSourceIndices, loc);
 
   // Create the new block arguments for the new source indices, and transform
   // them using the callback.
@@ -529,6 +545,17 @@ void MapScatterOp::insertTransformationAtStart(
   transformBody.eraseArguments(0, oldSourceIndices.size());
 }
 
+void MapScatterOp::insertTransformationAtStart(
+    OpBuilder &builder,
+    function_ref<SmallVector<Value>(ArrayRef<BlockArgument>)>
+        transformationBuilder,
+    int64_t numSourceIndices) {
+  Block &transformBody = getTransformationRegion().front();
+  IREE::LinalgExt::insertTransformationAtStart(builder, getLoc(),
+                                               transformationBuilder,
+                                               numSourceIndices, transformBody);
+}
+
 bool MapScatterOp::isIdentity() {
   if (getInputType() != getOutputType()) {
     return false;
@@ -552,6 +579,70 @@ bool MapScatterOp::isIdentity() {
     }
   }
   return true;
+}
+
+//===----------------------------------------------------------------------===//
+// ParallelMapScatterOp
+//===----------------------------------------------------------------------===//
+
+ParallelMapScatterOp ParallelMapScatterOp::createWithTransformationRegion(
+    OpBuilder &builder, Location loc, Region *region, Value input,
+    Value output) {
+  auto mapScatterOp = builder.create<ParallelMapScatterOp>(loc, input, output);
+  IRMapping mapper;
+  region->cloneInto(&mapScatterOp.getTransformationRegion(), mapper);
+  return mapScatterOp;
+}
+
+LogicalResult ParallelMapScatterOp::verify() {
+  if (getInputType().getElementType() != getOutputType().getElementType()) {
+    return emitOpError("expected input and output element types to match");
+  }
+  Region &transformRegion = getTransformationRegion();
+  Block &transformBody = transformRegion.getBlocks().front();
+  if (transformBody.getNumArguments() != getInputRank()) {
+    return emitOpError("expected number of block arguments to be equal "
+                       "to the input rank");
+  }
+  if (!llvm::all_of(transformBody.getArgumentTypes(),
+                    llvm::IsaPred<IndexType>)) {
+    return emitOpError("expected block arguments to be index types");
+  }
+  auto yieldOp = cast<IREE::LinalgExt::YieldOp>(transformBody.getTerminator());
+  if (yieldOp->getNumOperands() != getOutputRank() + 1) {
+    return yieldOp.emitOpError("expected transformation_region to yield a "
+                               "value for each output dimension and a mask");
+  }
+  for (int operandIdx = 0; operandIdx < getOutputRank(); ++operandIdx) {
+    if (!isa<IndexType>(yieldOp.getOperandTypes()[operandIdx])) {
+      return yieldOp.emitOpError("expected yielded indices to be index types");
+    }
+  }
+  auto maskType =
+      dyn_cast<IntegerType>(yieldOp.getOperandTypes()[getOutputRank()]);
+  if (!maskType || maskType.getIntOrFloatBitWidth() != 1) {
+    return yieldOp.emitOpError("expected yielded mask to be i1 type");
+  }
+  return success();
+}
+
+void ParallelMapScatterOp::insertTransformationAtStart(
+    OpBuilder &builder,
+    function_ref<SmallVector<Value>(ArrayRef<BlockArgument>)>
+        transformationBuilder,
+    int64_t numSourceIndices) {
+  Block &transformBody = getTransformationRegion().front();
+  IREE::LinalgExt::insertTransformationAtStart(builder, getLoc(),
+                                               transformationBuilder,
+                                               numSourceIndices, transformBody);
+}
+
+MutableOperandRange ParallelMapScatterOp::getUpdatedDestinations() {
+  return getOutputMutable();
+}
+
+Operation *ParallelMapScatterOp::getIteratingParent() {
+  return getOperation()->getParentOfType<scf::ForallOp>();
 }
 
 //===----------------------------------------------------------------------===//
