@@ -985,6 +985,32 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   return SmallVector<Value>({loopNest.results[0]});
 }
 
+// //===----------------------------------------------------------------------===//
+// // MapScatterOp
+// //===----------------------------------------------------------------------===//
+
+// FailureOr<SmallVector<Value>>
+// MapScatterOp::decomposeOperation(OpBuilder &builder) {
+//   if (!isa<VectorType>(getInputType())) {
+//     return failure();
+//   }
+//   // 1. Vectorize index transformation ops into an index vector.
+//   //   - Create linalg.generic ins() outs(%empty), and vectorize it.
+//   //   - Generate an N-D vector of linearized indices.
+//   // 2. Create mask with vectorized index transformation ops.
+//   //   - Maybe as a second result of the vectorized generic op.
+//   int64_t flatVectorSize = std::reduce(
+//       inputType.getShape().begin(), inputType.getShape().end(), 1,
+//       std::multiplies<int64_t>());
+//   SmallVector<int64_t> storeIndices =
+//       llvm::to_vector(llvm::seq<int64_t>(flatVectorSize));
+//   Value init = builder.create<tensor::EmptyOp>()
+
+//   // 3. Flatten the output memref with memref.collapse_shape.
+//   // 4. Create `vector.scatter %flat_output[%c0, %c0,
+//   ...][%index_vec][%mask_vec][%input_vec]` return {};
+// }
+
 //===----------------------------------------------------------------------===//
 // CustomOp
 //===----------------------------------------------------------------------===//

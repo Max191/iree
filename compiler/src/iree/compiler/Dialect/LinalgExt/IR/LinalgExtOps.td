@@ -329,6 +329,7 @@ def IREELinalgExt_MapScatterOp : IREELinalgExt_PureOp<"map_scatter",
          "getIterationDomainTileFromOperandTile",
          "getTiledImplementationFromOperandTile",
          "generateScalarImplementation"]>,
+    //  DeclareOpInterfaceMethods<AggregatedOpInterface, ["decomposeOperation"]>,
      SingleBlockImplicitTerminator<"::mlir::iree_compiler::IREE::LinalgExt::YieldOp">]> {
   let summary = [{Scatter with a mapping from source indices to result indices.}];
   let description = [{

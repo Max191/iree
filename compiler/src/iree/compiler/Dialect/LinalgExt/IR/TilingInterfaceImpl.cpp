@@ -10,6 +10,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -476,11 +477,14 @@ MapScatterOp::getTiledImplementation(OpBuilder &builder,
   auto indexTransformBuilder =
       [&](ArrayRef<BlockArgument> srcIndices) -> SmallVector<Value> {
     SmallVector<OpFoldResult> offsetIndices;
-    auto addMap = AffineMap::get(
-        2, 0, {builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1)});
+    // auto addMap = AffineMap::get(
+    //     2, 0, {builder.getAffineDimExpr(0) + builder.getAffineDimExpr(1)});
     for (auto [srcIdx, offset] : llvm::zip_equal(srcIndices, offsets)) {
-      offsetIndices.push_back(affine::makeComposedFoldedAffineApply(
-          builder, loc, addMap, {OpFoldResult(srcIdx), offset}));
+      // offsetIndices.push_back(affine::makeComposedFoldedAffineApply(
+      //     builder, loc, addMap, {OpFoldResult(srcIdx), offset}));
+      Value offsetIdx = builder.create<arith::AddIOp>(
+          loc, srcIdx, getValueOrCreateConstantIndexOp(builder, loc, offset));
+      offsetIndices.push_back(offsetIdx);
     }
     return getValueOrCreateConstantIndexOp(builder, loc, offsetIndices);
   };

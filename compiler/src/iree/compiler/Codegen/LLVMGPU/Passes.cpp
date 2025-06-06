@@ -271,8 +271,6 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
   options.foldCastIntoContract = true;
   options.enableVectorMasking = enableMasking;
   funcPassManager.addPass(createGenericVectorizationPass(options));
-  funcPassManager.addPass(
-      IREE::LinalgExt::createVectorizeIREELinalgExtOpsPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
   // Run subset hoisting to convert iter_args to vectors.
@@ -937,6 +935,8 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createOptimizeTensorInsertExtractSlicesPass());
 
   // Linalg -> Vector
+  funcPassManager.addPass(
+      IREE::LinalgExt::createVectorizeIREELinalgExtOpsPass());
   addGPUVectorizationPasses(funcPassManager);
 
   // Allocate tensors for copies to shared memory.
@@ -956,6 +956,7 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
 
   // Vector SIMD -> Vector SIMT
   funcPassManager.addPass(createLLVMGPUVectorDistributePass());
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeMapScatterPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 
