@@ -11,6 +11,8 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
+#include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/ADT/bit.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
@@ -484,6 +486,70 @@ struct DropScatterUnitIndexDepth final : public OpRewritePattern<ScatterOp> {
 
     rewriter.modifyOpInPlace(scatterOp, [&]() {
       scatterOp.setOperand(ScatterOp::kIndicesOpNum, collapseOp.getResult());
+    });
+    return success();
+  }
+};
+
+struct DropMapScatterUnitDims final : public OpRewritePattern<MapScatterOp> {
+  using OpRewritePattern<MapScatterOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(MapScatterOp mapScatterOp,
+                                PatternRewriter &rewriter) const override {
+    auto inputType = dyn_cast<RankedTensorType>(mapScatterOp.getInputType());
+    if (!inputType) {
+      return failure();
+    }
+    if (llvm::none_of(inputType.getShape(),
+                      [](int64_t size) { return size == 1; })) {
+      return failure();
+    }
+    // SmallVector<ReassociationIndices> reassociations = {{}};
+    // bool groupHasNonUnitDim = false;
+    // for (auto [dim, size] : llvm::enumerate(inputType.getShape())) {
+    //   if (size == 1) {
+    //     reassociations.back().push_back(dim);
+    //     continue;
+    //   }
+    //   if (groupHasNonUnitDim) {
+    //     reassociations.push_back(SmallVector<int64_t>(1, dim));
+    //     continue;
+    //   }
+    //   reassociations.back().push_back(dim);
+    //   groupHasNonUnitDim = true;
+    // }
+    // Location loc = mapScatterOp.getLoc();
+    // auto collapseOp = rewriter.create<tensor::CollapseShapeOp>(
+    //     loc, mapScatterOp.getInput(), reassociations);
+    Location loc = mapScatterOp.getLoc();
+    SmallVector<int64_t> newShape = llvm::filter_to_vector(
+        inputType.getShape(), [](int64_t size) { return size != 1; });
+    RankedTensorType newInputType = inputType.clone(newShape);
+    SmallVector<OpFoldResult> sizes =
+        tensor::getMixedSizes(rewriter, loc, mapScatterOp.getInput());
+    SmallVector<OpFoldResult> offsets(sizes.size(), rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> strides(sizes.size(), rewriter.getIndexAttr(1));
+    auto extractOp = rewriter.create<tensor::ExtractSliceOp>(
+        loc, newInputType, mapScatterOp.getInput(), offsets, sizes, strides);
+
+    auto unitFoldingBuilder = [&](ArrayRef<BlockArgument> nonUnitIndices) {
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      int nonUnitArgIdx = 0;
+      SmallVector<Value> replacementValues;
+      for (int64_t dim = 0; dim < inputType.getRank(); ++dim) {
+        if (inputType.getDimSize(dim) == 1) {
+          replacementValues.push_back(zero);
+          continue;
+        }
+        replacementValues.push_back(nonUnitIndices[nonUnitArgIdx++]);
+      }
+      return replacementValues;
+    };
+    int numNonUnitDims = llvm::count_if(inputType.getShape(),
+                                        [](int64_t size) { return size == 1; });
+    rewriter.modifyOpInPlace(mapScatterOp, [&]() {
+      mapScatterOp.getInputMutable().assign(extractOp.getResult());
+      mapScatterOp.insertTransformationAtStart(rewriter, unitFoldingBuilder,
+                                               numNonUnitDims);
     });
     return success();
   }
@@ -1016,7 +1082,8 @@ SmallVector<unsigned> defaultControlDropUnitDims(Operation *op) {
 
 void populateFoldUnitExtentDimsPatterns(
     RewritePatternSet &patterns, const linalg::ControlDropUnitDims &options) {
-  patterns.add<DropScatterUnitIndexDepth>(patterns.getContext());
+  patterns.add<DropScatterUnitIndexDepth, DropMapScatterUnitDims>(
+      patterns.getContext());
   patterns.add<DropGatherUnitDims, DropScatterUnitDims>(patterns.getContext(),
                                                         options);
 }
