@@ -149,7 +149,7 @@ chooseDataTiledMMAAttr(TypeRange eTypes, TargetAttr target,
   //    == wgp.getVgprSpaceBits()
   float c2 = sizeInBits(intrinsicC);
   float c1 = intrinsicsK * (sizeInBits(intrinsicA) + sizeInBits(intrinsicB));
-  float c0 = -*wgp.getVgprSpaceBits(); // negative by construction.
+  float c0 = -*wgp.getVgprSpaceBits() / 2; // negative by construction.
   // Now the equation to solve is: c2 * x^2 + c1 * x + c0 == 0.
   float discriminant = c1 * c1 - 4 * c0 * c2; // positive, because c0 < 0.
   // x = unique positive solution.
