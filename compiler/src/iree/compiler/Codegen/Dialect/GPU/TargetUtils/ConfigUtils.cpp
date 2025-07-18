@@ -106,7 +106,7 @@ LogicalResult setDataTiledMultiMmaLoweringConfig(
   // is already what we want.
   SmallVector<NamedAttribute, 1> pipelineAttrs;
   auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
-      context, /*prefetchSharedMemory=*/false,
+      context, /*prefetchSharedMemory=*/true,
       /*no_reduce_shared_memory_bank_conflicts=*/true,
       /*use_igemm_convolution=*/false,
       /*reorder_workgroups_strategy=*/std::nullopt);
