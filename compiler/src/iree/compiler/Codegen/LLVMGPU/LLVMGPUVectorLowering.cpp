@@ -163,6 +163,7 @@ struct LLVMGPUVectorLoweringPass final
               vector::VectorContractLowering::OuterProduct);
       vector::populateVectorTransferPermutationMapLoweringPatterns(
           contractLoweringPatterns);
+      vector::populateFlattenVectorTransferPatterns(contractLoweringPatterns);
       vector::TransposeOp::getCanonicalizationPatterns(contractLoweringPatterns,
                                                        funcOp.getContext());
       vector::populateVectorBroadcastLoweringPatterns(contractLoweringPatterns);
