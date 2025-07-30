@@ -90,7 +90,8 @@ struct FuseEncodingOpsIntoDispatchRegionsPass
     for (IREE::Encoding::SetEncodingOp encodingOp : encodingOps) {
       OpOperand &operand = encodingOp.getSourceMutable();
       std::optional<std::pair<OpResult, SmallVector<Operation *>>>
-          producerChain = getProducerDispatchValueAndOpChain(operand.get());
+          producerChain = getProducerDispatchValueAndOpChain(
+              operand.get(), /*allowMultiResult=*/true, /*allowMultiUse=*/true);
       // Nothing to fuse with, so wrap the `encodingOp` in its own dispatch.
       if (!producerChain) {
         continue;

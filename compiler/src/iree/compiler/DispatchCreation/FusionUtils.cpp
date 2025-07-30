@@ -121,7 +121,8 @@ bool areFusableAsElementwiseOps(MLIRContext *context, OpOperand *fusedOperand,
 }
 
 std::optional<std::pair<OpResult, SmallVector<Operation *>>>
-getProducerDispatchValueAndOpChain(Value operand) {
+getProducerDispatchValueAndOpChain(Value operand, bool allowMultiResult,
+                                   bool allowMultiUse) {
   auto operandType = dyn_cast<RankedTensorType>(operand.getType());
   if (!operandType || operandType.getRank() == 0) {
     return std::nullopt;
@@ -160,10 +161,10 @@ getProducerDispatchValueAndOpChain(Value operand) {
   // dispatch before the producer dispatch.
   if (!producerDispatch ||
       !llvm::hasSingleElement(producerDispatch.getBody()) ||
-      producerDispatch->getNumResults() != 1) {
+      (!allowMultiResult && producerDispatch->getNumResults() != 1)) {
     return std::nullopt;
   }
-  if (!llvm::hasSingleElement(producerValue.getUses())) {
+  if (!allowMultiUse && !llvm::hasSingleElement(producerValue.getUses())) {
     return std::nullopt;
   }
   return std::make_pair(producerValue, opChain);

@@ -31,6 +31,7 @@ bool areFusableAsElementwiseOps(MLIRContext *context, OpOperand *operand,
 /// dispatch. Returns std::nullopt if the dispatch or any ops in the chain have
 /// multiple uses.
 std::optional<std::pair<OpResult, SmallVector<Operation *>>>
-getProducerDispatchValueAndOpChain(Value operand);
+getProducerDispatchValueAndOpChain(Value operand, bool allowMultiResult = false,
+                                   bool allowMultiUse = false);
 
 } // namespace mlir::iree_compiler::DispatchCreation
