@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler::IREE::LinalgExt {
 
@@ -172,6 +173,57 @@ static LogicalResult decomposeMapScatter(MapScatterOp mapScatterOp,
   return success();
 }
 
+struct FoldMapScatterUnitDimsPattern final
+    : OpRewritePattern<IREE::LinalgExt::MapScatterOp> {
+  using OpRewritePattern<IREE::LinalgExt::MapScatterOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(IREE::LinalgExt::MapScatterOp mapScatterOp,
+                                PatternRewriter &rewriter) const override {
+    if (!mapScatterOp.isVectorized()) {
+      return rewriter.notifyMatchFailure(mapScatterOp,
+                                         "map_scatter is not vectorized");
+    }
+    auto inputType = cast<VectorType>(mapScatterOp.getInputType());
+    SmallVector<int64_t> newShape;
+    SetVector<unsigned> unitDims;
+    for (unsigned i = 0; i < inputType.getRank(); ++i) {
+      if (inputType.getDimSize(i) == 1) {
+        unitDims.insert(i);
+        continue;
+      }
+      newShape.push_back(inputType.getDimSize(i));
+    }
+    if (unitDims.empty()) {
+      return rewriter.notifyMatchFailure(mapScatterOp,
+                                         "map_scatter has no unit dims");
+    }
+    auto newInputType = VectorType::get(newShape, inputType.getElementType());
+    Location loc = mapScatterOp.getLoc();
+    rewriter.setInsertionPoint(mapScatterOp);
+    auto newInput = rewriter.create<vector::ShapeCastOp>(
+        loc, newInputType, mapScatterOp.getInput());
+    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto transformBuilder = [&](ArrayRef<BlockArgument> newArgs) {
+      SmallVector<Value> replacements;
+      unsigned newInputIdx = 0;
+      for (unsigned origInputIdx = 0; origInputIdx < inputType.getRank();
+           ++origInputIdx) {
+        if (unitDims.contains(origInputIdx)) {
+          replacements.push_back(zero);
+          continue;
+        }
+        replacements.push_back(newArgs[newInputIdx++]);
+      }
+      return replacements;
+    };
+    rewriter.modifyOpInPlace(mapScatterOp, [&]() {
+      mapScatterOp.getInputMutable().assign(newInput);
+      mapScatterOp.insertTransformationAtStart(rewriter, transformBuilder,
+                                               newInputType.getRank());
+    });
+    return success();
+  }
+};
+
 namespace {
 struct DecomposeMapScatterPass final
     : impl::DecomposeMapScatterPassBase<DecomposeMapScatterPass> {
@@ -181,6 +233,12 @@ struct DecomposeMapScatterPass final
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     auto funcOp = getOperation();
+
+    RewritePatternSet patterns(context);
+    patterns.add<FoldMapScatterUnitDimsPattern>(context);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+      return signalPassFailure();
+    }
 
     // Decomposition is only supported for map_scatter ops that are both
     // vectorized and bufferized. Bufferization is a requirement because
