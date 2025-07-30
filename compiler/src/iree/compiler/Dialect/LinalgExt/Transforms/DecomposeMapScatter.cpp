@@ -119,8 +119,8 @@ static LogicalResult decomposeMapScatter(MapScatterOp mapScatterOp,
       genericOp.getBody()->getOps<affine::AffineDelinearizeIndexOp>());
   for (auto delinearizeOp : delinearizeOps) {
     rewriter.setInsertionPoint(delinearizeOp);
-    if (failed(
-            affine::lowerAffineDelinearizeIndexOp(rewriter, delinearizeOp))) {
+    if (failed(affine::lowerAffineDelinearizeIndexOp(rewriter, delinearizeOp,
+                                                     /*positiveIndex=*/true))) {
       return rewriter.notifyMatchFailure(
           delinearizeOp, "failed to lower affine.delinearize_index op");
     }
