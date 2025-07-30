@@ -11,6 +11,7 @@
 #include "iree/compiler/DispatchCreation/FusionUtils.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Dominance.h"
@@ -48,13 +49,17 @@ static bool isFusableWithSetEncoding(Operation *op) {
     if (llvm::none_of(op.getResultTypes(), llvm::IsaPred<ShapedType>)) {
       continue;
     }
-    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp>(
+    if (isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::EmptyOp,
+            IREE::Encoding::SetEncodingOp, IREE::Encoding::UnsetEncodingOp>(
             op)) {
       continue;
     }
     auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
     if (!linalgOp) {
       return false;
+    }
+    if (linalg::isaContractionOpInterface(linalgOp)) {
+      continue;
     }
     if (linalgOp.getNumReductionLoops() != 0) {
       return false;
