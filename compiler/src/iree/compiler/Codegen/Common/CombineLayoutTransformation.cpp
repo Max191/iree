@@ -584,6 +584,7 @@ struct CombineLayoutTransformationPass final
       RewritePatternSet patterns(context);
 
       populateFuseTilableForallConsumersPattern(patterns);
+      populateCombineRelayoutOpPatterns(patterns);
       scf::ForallOp::getCanonicalizationPatterns(patterns, context);
       tensor::populateFoldTensorEmptyPatterns(patterns);
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
