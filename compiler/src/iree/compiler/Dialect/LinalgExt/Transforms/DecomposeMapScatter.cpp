@@ -40,8 +40,37 @@ static LogicalResult decomposeMapScatter(MapScatterOp mapScatterOp,
   Location loc = mapScatterOp.getLoc();
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(mapScatterOp);
-  Value flatOutputBuffer = rewriter.create<memref::CollapseShapeOp>(
-      loc, mapScatterOp.getOutput(), reassociations);
+  auto extractStridedMetadataOp =
+      rewriter.create<memref::ExtractStridedMetadataOp>(
+          loc, mapScatterOp.getOutput());
+  std::pair<SmallVector<int64_t>, int64_t> stridesAndOffset =
+      outputType.getStridesAndOffset();
+  OpFoldResult offset = ShapedType::isDynamic(stridesAndOffset.second)
+                            ? OpFoldResult(extractStridedMetadataOp.getOffset())
+                            : rewriter.getIndexAttr(stridesAndOffset.second);
+  OpFoldResult stride =
+      ShapedType::isDynamic(stridesAndOffset.first.back())
+          ? OpFoldResult(extractStridedMetadataOp.getStrides().back())
+          : rewriter.getIndexAttr(stridesAndOffset.first.back());
+  SmallVector<OpFoldResult> sizes;
+  for (auto [staticSize, dynamicSize] : llvm::zip_equal(
+           outputType.getShape(), extractStridedMetadataOp.getSizes())) {
+    if (ShapedType::isDynamic(staticSize)) {
+      sizes.push_back(dynamicSize);
+    } else {
+      sizes.push_back(rewriter.getIndexAttr(staticSize));
+    }
+  }
+  AffineExpr prodExpr = rewriter.getAffineConstantExpr(1);
+  for (int i = 0; i < sizes.size(); ++i) {
+    prodExpr = prodExpr * rewriter.getAffineDimExpr(i);
+  }
+  OpFoldResult size =
+      affine::makeComposedFoldedAffineApply(rewriter, loc, prodExpr, sizes);
+  MemRefType collapsedType =
+      memref::CollapseShapeOp::computeCollapsedType(outputType, reassociations);
+  Value flatOutputBuffer = rewriter.create<memref::ReinterpretCastOp>(
+      loc, collapsedType, mapScatterOp.getOutput(), offset, size, stride);
 
   auto idxInit = rewriter.create<tensor::EmptyOp>(loc, inputType.getShape(),
                                                   rewriter.getIndexType());
