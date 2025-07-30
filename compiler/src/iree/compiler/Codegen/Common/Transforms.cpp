@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 
@@ -64,6 +65,19 @@ struct FuseTilableForallConsumers final
         return rewriter.notifyMatchFailure(tilableOp,
                                            "unimplemented: Cannot fuse op with "
                                            "multiple uses of producer loop");
+      }
+    }
+
+    llvm::SetVector<Operation *> slice;
+    BackwardSliceOptions options;
+    DominanceInfo domInfo;
+    options.filter = [&](Operation *op) {
+      return domInfo.properlyDominates(sliceOwner, op);
+    };
+    options.inclusive = true;
+    if (succeeded(getBackwardSlice(tilableOp, &slice, options))) {
+      for (Operation *op : llvm::reverse(slice)) {
+        rewriter.moveOpAfter(op, sliceOwner);
       }
     }
 
