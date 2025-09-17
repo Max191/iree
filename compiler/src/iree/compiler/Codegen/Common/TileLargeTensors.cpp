@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -50,12 +51,13 @@ int64_t getLargestFactorLessThan(int64_t val, int64_t upperBound) {
 /// If tiling fails this returns silently (tiling is best effort). Later
 /// verification steps will throw an error if distribution does not occur.
 static void tileToMaxVectorSize(RewriterBase &rewriter,
-                                linalg::LinalgOp linalgOp,
+                                TilingInterface tilingInterfaceOp,
+                                ArrayRef<int64_t> bounds,
                                 int64_t maxVectorSize) {
   assert(maxVectorSize >= 1 && "maximum vector size must be at least 1");
-  SmallVector<int64_t> staticTileSizes = linalgOp.getStaticLoopRanges();
+  SmallVector<int64_t> staticTileSizes(bounds);
   SmallVector<utils::IteratorType> iteratorTypes =
-      linalgOp.getIteratorTypesArray();
+      tilingInterfaceOp.getLoopIteratorTypes();
 
   // Collect the total statically known parallel iterations of the linalg op.
   // We expect this to be the minimum required vector size for the op
@@ -110,11 +112,11 @@ static void tileToMaxVectorSize(RewriterBase &rewriter,
   }
 
   // Check if nothing to do.
-  if (staticTileSizes == linalgOp.getStaticLoopRanges()) {
+  if (staticTileSizes == bounds) {
     return;
   }
 
-  rewriter.setInsertionPoint(linalgOp);
+  rewriter.setInsertionPoint(tilingInterfaceOp);
   SmallVector<OpFoldResult> tileSizes =
       getAsIndexOpFoldResult(rewriter.getContext(), staticTileSizes);
 
@@ -139,21 +141,21 @@ static void tileToMaxVectorSize(RewriterBase &rewriter,
   tileAndFuseOptions.setFusionControlFn(controlFn);
 
   FailureOr<scf::SCFTileAndFuseResult> tiledResults =
-      scf::tileConsumerAndFuseProducersUsingSCF(
-          rewriter, cast<TilingInterface>(&*linalgOp), tileAndFuseOptions);
+      scf::tileConsumerAndFuseProducersUsingSCF(rewriter, tilingInterfaceOp,
+                                                tileAndFuseOptions);
   if (failed(tiledResults)) {
     return;
   }
 
   // Perform the replacement of the tiling root.
-  for (OpResult res : linalgOp->getResults()) {
+  for (OpResult res : tilingInterfaceOp->getResults()) {
     if (auto replacement = tiledResults->replacements.lookup(res)) {
       rewriter.replaceAllUsesWith(res, replacement);
     }
   }
 
-  if (linalgOp->use_empty()) {
-    rewriter.eraseOp(linalgOp);
+  if (tilingInterfaceOp->use_empty()) {
+    rewriter.eraseOp(tilingInterfaceOp);
   }
 }
 
@@ -192,8 +194,15 @@ static void processRegion(RewriterBase &rewriter, Region *region,
         if (linalgOp.getNumParallelLoops() == 0) {
           continue;
         }
-        tileToMaxVectorSize(rewriter, linalgOp, maxVectorSize);
+        SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+        tileToMaxVectorSize(rewriter, cast<TilingInterface>(&*linalgOp), bounds,
+                            maxVectorSize);
         continue;
+      }
+
+      if (auto mapScatterOp = dyn_cast<IREE::LinalgExt::MapScatterOp>(op)) {
+        ArrayRef<int64_t> bounds = mapScatterOp.getInputType().getShape();
+        tileToMaxVectorSize(rewriter, mapScatterOp, bounds, maxVectorSize / 4);
       }
 
       // Else recursively process all nested operations.
