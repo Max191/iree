@@ -49,7 +49,8 @@ LogicalResult setDataTiledMultiMmaLoweringConfig(
   if (!multiMmaOp) {
     return failure();
   }
-  auto dataTiledMmaAttr = dyn_cast<DataTiledMMAAttr>(multiMmaOp.getKind());
+  auto dataTiledMmaAttr =
+      dyn_cast<DataTiledMMAInterfaceAttr>(multiMmaOp.getKind());
   if (!dataTiledMmaAttr) {
     return failure();
   }
@@ -61,22 +62,28 @@ LogicalResult setDataTiledMultiMmaLoweringConfig(
   // subgroup unrolling factors, since the non-unrolled inner kernel takes a
   // single subgroup.
   const int64_t targetSubgroupSize = dataTiledMmaAttr.getSubgroupSize();
-  int64_t flatWorkgroupSize = targetSubgroupSize *
-                              dataTiledMmaAttr.getSubgroupsM() *
-                              dataTiledMmaAttr.getSubgroupsN();
+  int64_t flatWorkgroupSize = dataTiledMmaAttr.getFlatWorkgroupSize();
   std::array<int64_t, 3> workgroupSize{flatWorkgroupSize, 1, 1};
 
   // Set all workgroup and reduction tile sizes to 1, since the data tiled
   // kernel has the scope of an entire workgroup, and the reduction tiling is
   // already baked into the "opaque" data tiled inner layout of the inner_tiled.
   SmallVector<AffineMap> indexingMaps = multiMmaOp.getIndexingMapsArray();
-  mlir::linalg::ContractionDimensions contractionDims =
-      mlir::linalg::inferContractionDims(indexingMaps).value();
+  SmallVector<unsigned> kDims;
+  FailureOr<mlir::linalg::ContractionDimensions> contractionDims =
+      mlir::linalg::inferContractionDims(indexingMaps);
+  if (succeeded(contractionDims)) {
+    kDims.assign(contractionDims->k);
+  } else {
+    IREE::LinalgExt::ScaledContractionDimensions scaledContractionDims =
+        IREE::LinalgExt::inferScaledContractionDims(indexingMaps).value();
+    kDims.assign(scaledContractionDims.k);
+  }
 
   int64_t iterationRank = indexingMaps.front().getNumDims();
   SmallVector<int64_t> workgroupTileSizes(iterationRank, 1);
   SmallVector<int64_t> reductionTileSizes(iterationRank, 0);
-  for (int64_t kDim : contractionDims.k) {
+  for (int64_t kDim : kDims) {
     workgroupTileSizes[kDim] = 0;
     reductionTileSizes[kDim] = ukernelConfig ? 0 : 1;
   }

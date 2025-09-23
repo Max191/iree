@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/Dialect/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Encoding/Utils/Utils.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/InterleavedRange.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -44,7 +45,11 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
 }
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, TileSwizzle::Dim dim) {
-  return os << dim.size << "(" << dim.kind << ")";
+  if (dim.size == dim.distributionSize) {
+    return os << dim.size << "(" << dim.kind << ")";
+  }
+  return os << dim.size << "|" << dim.distributionSize << "(" << dim.kind
+            << ")";
 }
 
 static llvm::raw_ostream &
@@ -302,28 +307,99 @@ getExpandedTileShape(const TileSwizzle::ExpandShapeType &expandShape) {
   return result;
 }
 
-FailureOr<MaterializeEncodingInfo>
-getEncodingInfoForMatmul(Encoding::EncodingAttr encoding, TileMxNxK tileMxNxK) {
-  MaterializeEncodingInfo encodingInfo;
+FailureOr<EncodingContractionLikeDimInfo>
+getEncodingContractionLikeDims(Encoding::EncodingAttr encoding) {
+  // The following expects M, N, K, and Batch sizes of at most 1 for now
+  EncodingContractionLikeDimInfo dimInfo;
   FailureOr<linalg::ContractionDimensions> cDims =
       Encoding::getEncodingContractionDims(encoding);
   if (failed(cDims)) {
-    return failure();
+    FailureOr<IREE::LinalgExt::ScaledContractionDimensions> scaledCDims =
+        Encoding::getEncodingScaledContractionDims(encoding);
+    if (failed(scaledCDims)) {
+      return failure();
+    }
+    assert(scaledCDims->m.size() <= 1 && scaledCDims->n.size() <= 1 &&
+           scaledCDims->k.size() == 1 && scaledCDims->batch.size() <= 1 &&
+           scaledCDims->kB.size() == 1 &&
+           "Expected at most one M, N, K, Kb, and Batch dimension");
+    int64_t operandIdx = encoding.getOperandIndex().getInt();
+    bool isLhs = operandIdx == IREE::Encoding::SCALED_MATMUL_LHS;
+    bool isRhs = operandIdx == IREE::Encoding::SCALED_MATMUL_RHS;
+    bool isLhsScales = operandIdx == IREE::Encoding::SCALED_MATMUL_LHS_SCALES;
+    bool isRhsScales = operandIdx == IREE::Encoding::SCALED_MATMUL_RHS_SCALES;
+    bool isResult = operandIdx == IREE::Encoding::SCALED_MATMUL_RESULT;
+    if (!scaledCDims->batch.empty()) {
+      dimInfo.batchDim = {/*shouldHaveDim=*/true,
+                          encoding.mapDimToOperandIndex(scaledCDims->batch[0])};
+    }
+    if (!scaledCDims->m.empty()) {
+      dimInfo.mDim = {/*shouldHaveDim=*/isLhs || isResult,
+                      encoding.mapDimToOperandIndex(scaledCDims->m[0])};
+    }
+    if (!scaledCDims->n.empty()) {
+      dimInfo.nDim = {/*shouldHaveDim=*/isRhs || isResult,
+                      encoding.mapDimToOperandIndex(scaledCDims->n[0])};
+    }
+    dimInfo.kDim = {/*shouldHaveDim=*/isLhs || isRhs || isLhsScales ||
+                        isRhsScales,
+                    encoding.mapDimToOperandIndex(scaledCDims->k[0])};
+    dimInfo.kBDim = {/*shouldHaveDim=*/isLhs || isRhs,
+                     encoding.mapDimToOperandIndex(scaledCDims->kB[0])};
+    return dimInfo;
   }
-  // The following expects M, N, K, and Batch sizes of at most 1 for now
   assert(cDims->m.size() <= 1 && cDims->n.size() <= 1 && cDims->k.size() == 1 &&
          cDims->batch.size() <= 1 &&
-         "Expected at most one M, N, K, and Batch dimension");
-  std::optional<unsigned> batchDim =
-      cDims->batch.empty() ? std::nullopt
-                           : encoding.mapDimToOperandIndex(cDims->batch[0]);
-  std::optional<unsigned> mDim =
-      cDims->m.empty() ? std::nullopt
-                       : encoding.mapDimToOperandIndex(cDims->m[0]);
-  std::optional<unsigned> nDim =
-      cDims->n.empty() ? std::nullopt
-                       : encoding.mapDimToOperandIndex(cDims->n[0]);
-  std::optional<unsigned> kDim = encoding.mapDimToOperandIndex(cDims->k[0]);
+         "Expected at most one M, N, K, Kb, and Batch dimension");
+  int64_t operandIdx = encoding.getOperandIndex().getInt();
+  bool isLhs = operandIdx == IREE::Encoding::MATMUL_LHS;
+  bool isRhs = operandIdx == IREE::Encoding::MATMUL_RHS;
+  bool isResult = operandIdx == IREE::Encoding::MATMUL_RESULT;
+  if (!cDims->batch.empty()) {
+    dimInfo.batchDim = {/*shouldHaveDim=*/true,
+                        encoding.mapDimToOperandIndex(cDims->batch[0])};
+  }
+  if (!cDims->m.empty()) {
+    dimInfo.mDim = {/*shouldHaveDim=*/isLhs || isResult,
+                    encoding.mapDimToOperandIndex(cDims->m[0])};
+  }
+  if (!cDims->n.empty()) {
+    dimInfo.nDim = {/*shouldHaveDim=*/isRhs || isResult,
+                    encoding.mapDimToOperandIndex(cDims->n[0])};
+  }
+  dimInfo.kDim = {/*shouldHaveDim=*/isLhs || isRhs,
+                  encoding.mapDimToOperandIndex(cDims->k[0])};
+  return dimInfo;
+}
+
+FailureOr<MaterializeEncodingInfo>
+getEncodingInfoForMatmul(Encoding::EncodingAttr encoding, TileMxNxK tileMxNxK) {
+  FailureOr<EncodingContractionLikeDimInfo> maybeDimInfo =
+      getEncodingContractionLikeDims(encoding);
+  if (failed(maybeDimInfo)) {
+    return failure();
+  }
+  std::optional<unsigned> batchDim = maybeDimInfo->batchDim.operandIdx;
+  std::optional<unsigned> mDim = maybeDimInfo->mDim.operandIdx;
+  std::optional<unsigned> nDim = maybeDimInfo->nDim.operandIdx;
+  std::optional<unsigned> kDim = maybeDimInfo->kDim.operandIdx;
+  std::optional<unsigned> kBDim = maybeDimInfo->kBDim.operandIdx;
+  // if (dims->batchDim.has_value()) {
+  //   batchDim = dims->batchDim.value().operandIdx;
+  // }
+  // if (dims->mDim.has_value()) {
+  //   mDim = dims->mDim.value().operandIdx;
+  // }
+  // if (dims->nDim.has_value()) {
+  //   nDim = dims->nDim.value().operandIdx;
+  // }
+  // if (dims->kDim.has_value()) {
+  //   kDim = dims->kDim.value().operandIdx;
+  // }
+  // if (dims->kBDim.has_value()) {
+  //   kBDim = dims->kBDim.value().operandIdx;
+  // }
+  MaterializeEncodingInfo encodingInfo;
   if (batchDim.has_value()) {
     encodingInfo.outerDimsPerm.push_back(batchDim.value());
   }
@@ -341,6 +417,11 @@ getEncodingInfoForMatmul(Encoding::EncodingAttr encoding, TileMxNxK tileMxNxK) {
     encodingInfo.outerDimsPerm.push_back(kDim.value());
     encodingInfo.innerDimsPos.push_back(kDim.value());
     encodingInfo.innerTileSizes.push_back(tileMxNxK.K);
+  }
+  if (kBDim.has_value()) {
+    encodingInfo.outerDimsPerm.push_back(kBDim.value());
+    encodingInfo.innerDimsPos.push_back(kBDim.value());
+    encodingInfo.innerTileSizes.push_back(tileMxNxK.KB);
   }
   return encodingInfo;
 }

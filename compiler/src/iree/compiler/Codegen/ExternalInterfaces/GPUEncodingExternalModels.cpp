@@ -40,6 +40,8 @@
 #include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
 #include "iree/compiler/Dialect/Encoding/Utils/Utils.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
+#include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
@@ -57,6 +59,27 @@ using IREE::Codegen::MaterializeEncodingInfo;
 using IREE::Codegen::TileMxNxK;
 
 namespace {
+
+/// Chooses a ScaledMMAAttr that supports the given element types. Currently
+/// just selects the first ScaledMMAAttr that is compatible with the given
+/// element types.
+/// TODO(#21923): This is a placeholder for now. We want a better heuristic
+/// in the future.
+static ScaledMMAAttr chooseScaledIntrinsicMMAAttr(TypeRange eTypes,
+                                                  TargetWgpAttr wgp) {
+  ScaledMMAAttr candidateMma;
+  for (ScaledMMAAttr mma : wgp.getScaledMma()) {
+    // Filter out intrinsics that don't match the element types of this matmul.
+    if (mma.getLhsElemType() != eTypes[0] ||
+        mma.getRhsElemType() != eTypes[1] ||
+        mma.getAccElemType() != eTypes[4]) {
+      continue;
+    }
+    candidateMma = mma;
+    break;
+  }
+  return candidateMma;
+}
 
 static MMAAttr chooseIntrinsicMMAAttr(TypeRange eTypes, TargetWgpAttr wgp) {
   MMAAttr candidateMma;
@@ -81,7 +104,7 @@ static MMAAttr chooseIntrinsicMMAAttr(TypeRange eTypes, TargetWgpAttr wgp) {
   return candidateMma;
 }
 
-static DataTiledMMAAttr
+static DataTiledMMAInterfaceAttr
 chooseDataTiledMMAAttr(TypeRange eTypes, TargetAttr target,
                        IREE::Encoding::EncodingAttr encoding,
                        GPUEncodingResolverAttr resolver) {
@@ -111,10 +134,52 @@ chooseDataTiledMMAAttr(TypeRange eTypes, TargetAttr target,
   }
 
   //
-  // Step 1: select a MMAIntrinsic.
+  // Step 1: select a MMAIntrinsic and compute the LHS and RHS vector sizes.
   //
-  MMAAttr intrinsicMma = chooseIntrinsicMMAAttr(eTypes, wgp);
-  if (!intrinsicMma) {
+  auto sizeInBits = [](VectorType type) -> int {
+    return type.getElementTypeBitWidth() * type.getNumElements();
+  };
+  int64_t intrinsicSizeBitsLHS = 0;
+  int64_t intrinsicSizeBitsRHS = 0;
+  int64_t intrinsicSizeBitsACC = 0;
+  int64_t intrinsicMSize = 0;
+  int64_t intrinsicNSize = 0;
+  Attribute intrinsicAttr;
+  switch (encoding.getOpType().getValue()) {
+  case IREE::Encoding::EncodingOpType::matmul: {
+    MMAAttr intrinsicMma = chooseIntrinsicMMAAttr(eTypes, wgp);
+    if (!intrinsicMma) {
+      return {};
+    }
+    auto [intrinsicA, intrinsicB, intrinsicC] =
+        intrinsicMma.getABCVectorTypes();
+    intrinsicSizeBitsLHS = sizeInBits(intrinsicA);
+    intrinsicSizeBitsRHS = sizeInBits(intrinsicB);
+    intrinsicSizeBitsACC = sizeInBits(intrinsicC);
+    intrinsicMSize = getMSize(intrinsicMma.getIntrinsic());
+    intrinsicNSize = getNSize(intrinsicMma.getIntrinsic());
+    intrinsicAttr = intrinsicMma;
+    break;
+  }
+  case IREE::Encoding::EncodingOpType::scaled_matmul: {
+    ScaledMMAAttr intrinsicScaledMma =
+        chooseScaledIntrinsicMMAAttr(eTypes, wgp);
+    if (!intrinsicScaledMma) {
+      return {};
+    }
+    SmallVector<VectorType> vectorTypes;
+    intrinsicScaledMma.getDistributedTileTypes(vectorTypes);
+    intrinsicSizeBitsLHS =
+        sizeInBits(vectorTypes[0]) + sizeInBits(vectorTypes[1]);
+    intrinsicSizeBitsRHS =
+        sizeInBits(vectorTypes[2]) + sizeInBits(vectorTypes[3]);
+    intrinsicSizeBitsACC = sizeInBits(vectorTypes[4]);
+    intrinsicMSize = getMSize(intrinsicScaledMma.getIntrinsic());
+    intrinsicNSize = getNSize(intrinsicScaledMma.getIntrinsic());
+    intrinsicAttr = intrinsicScaledMma;
+    break;
+  }
+  default:
     return {};
   }
 
@@ -122,20 +187,16 @@ chooseDataTiledMMAAttr(TypeRange eTypes, TargetAttr target,
   // Step 2: Select the unrolling factors for the generic case where there is no
   //         narrow dimension.
   //
-
-  auto sizeInBits = [](VectorType type) -> int {
-    return type.getElementTypeBitWidth() * type.getNumElements();
-  };
-
-  auto [intrinsicA, intrinsicB, intrinsicC] = intrinsicMma.getABCVectorTypes();
   // The intrinsicsK factor serves to allow loads from the A and B matrices to
   // use the target ISA's vector loads. For instance, if the ISA has 128-bit
   // loads and each intrinsic consumes only 32 bits from A and B, then we want
   // to set intrinsicsK=4 to turn 4 separate 32-bit loads into one 128-bit load.
-  int intrinsicLoadBits =
-      std::min(sizeInBits(intrinsicA), sizeInBits(intrinsicB));
-  const int intrinsicsK =
+  int intrinsicLoadBits = std::min(intrinsicSizeBitsLHS, intrinsicSizeBitsRHS);
+  int intrinsicsK =
       std::max(1, *wgp.getMaxLoadInstructionBits() / intrinsicLoadBits);
+  if (auto scaledMmaAttr = dyn_cast<ScaledMMAAttr>(intrinsicAttr)) {
+    intrinsicsK *= scaledMmaAttr.getScalesVectorSize();
+  }
 
   // The total amount of unrolling along the M and N dimensions is normally
   // limited only by the number of available registers, since larger M and N
@@ -162,8 +223,8 @@ chooseDataTiledMMAAttr(TypeRange eTypes, TargetAttr target,
   //       x^2 * sizeInBits(intrinsicC)
   //     + x   * intrinsicsK * (sizeInBits(intrinsicA) + sizeInBits(intrinsicB))
   //    == wgp.getVgprSpaceBits()
-  float c2 = sizeInBits(intrinsicC);
-  float c1 = intrinsicsK * (sizeInBits(intrinsicA) + sizeInBits(intrinsicB));
+  float c2 = intrinsicSizeBitsACC;
+  float c1 = intrinsicsK * (intrinsicSizeBitsLHS + intrinsicSizeBitsRHS);
   float c0 = -*wgp.getVgprSpaceBits(); // negative by construction.
   // Now the equation to solve is: c2 * x^2 + c1 * x + c0 == 0.
   float discriminant = c1 * c1 - 4 * c0 * c2; // positive, because c0 < 0.
@@ -227,30 +288,33 @@ chooseDataTiledMMAAttr(TypeRange eTypes, TargetAttr target,
   IREE::Encoding::MatmulNarrowDim narrowDim =
       IREE::Encoding::getPo2MatmulNarrowDim(encoding);
   if (narrowDim.isM()) {
-    intrinsicsM =
-        std::min(intrinsicsM,
-                 static_cast<int>(llvm::divideCeil(
-                     narrowDim.size, getMSize(intrinsicMma.getIntrinsic()))));
+    intrinsicsM = std::min(intrinsicsM, static_cast<int>(llvm::divideCeil(
+                                            narrowDim.size, intrinsicMSize)));
   }
   if (narrowDim.isN()) {
     std::swap(intrinsicsM, intrinsicsN);
     std::swap(subgroupsM, subgroupsN);
     assert(subgroupsN == 1);
-    intrinsicsN =
-        std::min(intrinsicsN,
-                 static_cast<int>(llvm::divideCeil(
-                     narrowDim.size, getNSize(intrinsicMma.getIntrinsic()))));
+    intrinsicsN = std::min(intrinsicsN, static_cast<int>(llvm::divideCeil(
+                                            narrowDim.size, intrinsicNSize)));
   }
 
-  return DataTiledMMAAttr::get(ctx, intrinsicMma.getIntrinsic(), intrinsicsM,
-                               subgroupsM, intrinsicsN, subgroupsN,
-                               intrinsicsK);
+  if (auto intrinsicMma = dyn_cast<MMAAttr>(intrinsicAttr)) {
+    return DataTiledMMAAttr::get(ctx, intrinsicMma.getIntrinsic(), intrinsicsM,
+                                 subgroupsM, intrinsicsN, subgroupsN,
+                                 intrinsicsK);
+  }
+  auto intrinsicScaledMma = cast<ScaledMMAAttr>(intrinsicAttr);
+  return DataTiledScaledMMAAttr::get(
+      ctx, intrinsicScaledMma.getIntrinsic(),
+      intrinsicScaledMma.getLhsElemType(), intrinsicScaledMma.getRhsElemType(),
+      intrinsicScaledMma.getAccElemType(), intrinsicsM, subgroupsM, intrinsicsN,
+      subgroupsN, intrinsicsK);
 }
 
-static Operation *
-lowerContractionOpToMultiMmaOp(OpBuilder &builder, linalg::LinalgOp linalgOp,
-                               ValueRange operands,
-                               GPUEncodingResolverAttr resolver) {
+static Operation *lowerContractionOrScaledContractionOpToInnerTiledOp(
+    OpBuilder &builder, linalg::LinalgOp linalgOp, ValueRange operands,
+    GPUEncodingResolverAttr resolver) {
   IREE::GPU::TargetAttr targetAttr =
       getGPUTargetAttr(resolver.getConfiguration());
   if (!targetAttr) {
@@ -259,76 +323,340 @@ lowerContractionOpToMultiMmaOp(OpBuilder &builder, linalg::LinalgOp linalgOp,
   if (!linalgOp.hasPureTensorSemantics()) {
     return nullptr;
   }
-  if (!linalg::isaContractionOpInterface(linalgOp)) {
-    return nullptr;
-  }
-  FailureOr<linalg::ContractionDimensions> contractionDims =
-      linalg::inferContractionDims(linalgOp);
-  if (failed(contractionDims)) {
+  if (!linalg::isaContractionOpInterface(linalgOp) &&
+      !IREE::LinalgExt::isaScaledContractionOpInterface(linalgOp)) {
     return nullptr;
   }
 
-  auto inputs = linalgOp.getDpsInputOperands();
-  auto outputs = linalgOp.getDpsInits();
+  SmallVector<Value> inputs = linalgOp.getDpsInputs();
+  SmallVector<Value> outputs = linalgOp.getDpsInits();
 
-  auto lhsType = cast<RankedTensorType>(inputs[0]->get().getType());
-  auto rhsType = cast<RankedTensorType>(inputs[1]->get().getType());
-  auto resultType = cast<RankedTensorType>(outputs[0].getType());
-  auto lhsEncoding = IREE::Encoding::getEncodingAttr(lhsType);
-  auto rhsEncoding = IREE::Encoding::getEncodingAttr(rhsType);
-  auto resultEncoding = IREE::Encoding::getEncodingAttr(resultType);
-  if (!lhsEncoding || !rhsEncoding || !resultEncoding) {
+  SmallVector<IREE::Encoding::EncodingAttr> operandEncodings;
+  // Return false if the operand has no encoding.
+  auto appendEncodingIfPresent = [&](Value operand) -> bool {
+    auto type = cast<RankedTensorType>(operand.getType());
+    auto encoding = IREE::Encoding::getEncodingAttr(type);
+    if (!encoding) {
+      return false;
+    }
+    operandEncodings.push_back(encoding);
+    return true;
+  };
+  if (!llvm::all_of(llvm::concat<Value>(inputs, outputs),
+                    appendEncodingIfPresent)) {
     return nullptr;
   }
 
-  if (lhsEncoding.getOperandIndex().getValue() != IREE::Encoding::MATMUL_LHS ||
-      rhsEncoding.getOperandIndex().getValue() != IREE::Encoding::MATMUL_RHS ||
-      resultEncoding.getOperandIndex().getValue() !=
-          IREE::Encoding::MATMUL_RESULT) {
+  auto checkEncodingIndex = [&](int64_t idx, int64_t expectedIdx) -> bool {
+    return operandEncodings[idx].getOperandIndex().getInt() == expectedIdx;
+  };
+  switch (operandEncodings[0].getOpType().getValue()) {
+  case IREE::Encoding::EncodingOpType::matmul: {
+    if (!checkEncodingIndex(0, IREE::Encoding::MATMUL_LHS) ||
+        !checkEncodingIndex(1, IREE::Encoding::MATMUL_RHS) ||
+        !checkEncodingIndex(2, IREE::Encoding::MATMUL_RESULT)) {
+      return nullptr;
+    }
+    break;
+  }
+  case IREE::Encoding::EncodingOpType::scaled_matmul: {
+    if (!checkEncodingIndex(0, IREE::Encoding::SCALED_MATMUL_LHS) ||
+        !checkEncodingIndex(1, IREE::Encoding::SCALED_MATMUL_RHS) ||
+        !checkEncodingIndex(2, IREE::Encoding::SCALED_MATMUL_LHS_SCALES) ||
+        !checkEncodingIndex(3, IREE::Encoding::SCALED_MATMUL_RHS_SCALES) ||
+        !checkEncodingIndex(4, IREE::Encoding::SCALED_MATMUL_RESULT)) {
+      return nullptr;
+    }
+    break;
+  }
+  default:
     return nullptr;
   }
 
-  IREE::GPU::DataTiledMMAAttr mma =
+  IREE::Encoding::EncodingAttr resultEncoding = operandEncodings.back();
+  IREE::GPU::DataTiledMMAInterfaceAttr dataTiledAttr =
       chooseDataTiledMMAAttr(resultEncoding.getElementTypesArray(), targetAttr,
                              resultEncoding, resolver);
-  if (!mma) {
+  if (!dataTiledAttr) {
     LDBG() << "expect encodings on operand types";
     return nullptr;
   }
-  LDBG() << "Target MMA: " << mma;
 
-  MLIRContext *ctx = builder.getContext();
   SmallVector<AffineExpr> lhsExprs, rhsExprs, accExprs;
-  int baseIdx = contractionDims->batch.empty() ? 0 : 1;
-  if (baseIdx) {
-    AffineExpr bExpr = builder.getAffineDimExpr(0);
+  Codegen::EncodingContractionLikeDimInfo cDimInfo =
+      Codegen::getEncodingContractionLikeDims(resultEncoding).value();
+  int numDims = 0;
+  AffineExpr bExpr = builder.getAffineDimExpr(numDims);
+  if (cDimInfo.batchDim.operandIdx.has_value()) {
     lhsExprs.push_back(bExpr);
     rhsExprs.push_back(bExpr);
     accExprs.push_back(bExpr);
+    ++numDims;
   }
-  AffineExpr mExpr = builder.getAffineDimExpr(baseIdx + 0);
-  AffineExpr nExpr = builder.getAffineDimExpr(baseIdx + 1);
-  AffineExpr kExpr = builder.getAffineDimExpr(baseIdx + 2);
+  AffineExpr mExpr = builder.getAffineDimExpr(numDims++);
+  AffineExpr nExpr = builder.getAffineDimExpr(numDims++);
+  AffineExpr kExpr = builder.getAffineDimExpr(numDims++);
 
   // The outer dims are all in row-major order after relayout.
   lhsExprs.append({mExpr, kExpr});
   rhsExprs.append({nExpr, kExpr});
   accExprs.append({mExpr, nExpr});
-  int64_t numDims = baseIdx + 3;
-  auto lhsMap = AffineMap::get(numDims, 0, lhsExprs, ctx);
-  auto rhsMap = AffineMap::get(numDims, 0, rhsExprs, ctx);
-  auto accMap = AffineMap::get(numDims, 0, accExprs, ctx);
-
+  SmallVector<AffineMap> indexingMaps;
+  MLIRContext *ctx = builder.getContext();
+  Location loc = linalgOp.getLoc();
   SmallVector<utils::IteratorType> iteratorTypes =
       linalgOp.getIteratorTypesArray();
-
-  Location loc = linalgOp.getLoc();
-  Operation *mmaOp = Codegen::InnerTiledOp::create(
-      builder, loc, operands.take_front(inputs.size()),
-      operands.take_back(outputs.size()),
-      ArrayRef<AffineMap>{lhsMap, rhsMap, accMap}, iteratorTypes, mma);
-  return mmaOp;
+  switch (resultEncoding.getOpType().getValue()) {
+  case IREE::Encoding::EncodingOpType::matmul: {
+    indexingMaps.push_back(AffineMap::get(numDims, 0, lhsExprs, ctx));
+    indexingMaps.push_back(AffineMap::get(numDims, 0, rhsExprs, ctx));
+    indexingMaps.push_back(AffineMap::get(numDims, 0, accExprs, ctx));
+    return Codegen::InnerTiledOp::create(
+        builder, loc, operands.take_front(inputs.size()),
+        operands.take_back(outputs.size()), indexingMaps, iteratorTypes,
+        cast<IREE::GPU::DataTiledMMAAttr>(dataTiledAttr));
+  }
+  case IREE::Encoding::EncodingOpType::scaled_matmul: {
+    SmallVector<AffineExpr> lhsScalesExprs, rhsScalesExprs;
+    if (cDimInfo.batchDim.operandIdx.has_value()) {
+      lhsScalesExprs.push_back(bExpr);
+      rhsScalesExprs.push_back(bExpr);
+    }
+    AffineExpr kbExpr = builder.getAffineDimExpr(numDims++);
+    lhsExprs.append({kbExpr});
+    rhsExprs.append({kbExpr});
+    lhsScalesExprs.append({mExpr, kExpr});
+    rhsScalesExprs.append({nExpr, kExpr});
+    indexingMaps.push_back(AffineMap::get(numDims, 0, lhsExprs, ctx));
+    indexingMaps.push_back(AffineMap::get(numDims, 0, rhsExprs, ctx));
+    indexingMaps.push_back(AffineMap::get(numDims, 0, lhsScalesExprs, ctx));
+    indexingMaps.push_back(AffineMap::get(numDims, 0, rhsScalesExprs, ctx));
+    indexingMaps.push_back(AffineMap::get(numDims, 0, accExprs, ctx));
+    return Codegen::InnerTiledOp::create(
+        builder, loc, operands.take_front(inputs.size()),
+        operands.take_back(outputs.size()), indexingMaps, iteratorTypes,
+        cast<IREE::GPU::DataTiledScaledMMAAttr>(dataTiledAttr));
+  }
+  default: {
+    assert(false && "unexpected encoding op type");
+    return nullptr;
+  }
+  }
 }
+
+// /// Lower a scaled contraction op to the data tiled layout. This lowering
+// does
+// /// not introduce an iree_codegen.inner_tiled op because we do not pack the
+// /// LHR or RHS operands.
+// /// TODO(#21923): This is naive a placeholder lowering. It should generate an
+// /// inner_tiled op based on the selected ScaledMMAAttr.
+// static Operation *lowerScaledContractionOpToDataTiledOp(
+//     OpBuilder &builder, linalg::LinalgOp linalgOp, ValueRange operands,
+//     GPUEncodingResolverAttr resolverAttr) {
+//   IREE::GPU::TargetAttr targetAttr =
+//       getGPUTargetAttr(resolverAttr.getConfiguration());
+//   if (!targetAttr) {
+//     return nullptr;
+//   }
+//   if (!linalgOp.hasPureTensorSemantics()) {
+//     return nullptr;
+//   }
+//   auto genericOp = dyn_cast<linalg::GenericOp>(linalgOp.getOperation());
+//   if (!genericOp) {
+//     return nullptr;
+//   }
+//   if (!IREE::LinalgExt::isaScaledContractionOpInterface(genericOp)) {
+//     return nullptr;
+//   }
+//   FailureOr<IREE::LinalgExt::ScaledContractionDimensions> contractionDims =
+//       IREE::LinalgExt::inferScaledContractionDims(genericOp);
+//   if (failed(contractionDims)) {
+//     return nullptr;
+//   }
+
+//   SmallVector<OpOperand *> inputs = genericOp.getDpsInputOperands();
+//   OperandRange outputs = genericOp.getDpsInits();
+
+//   auto lhsType = cast<RankedTensorType>(inputs[0]->get().getType());
+//   auto rhsType = cast<RankedTensorType>(inputs[1]->get().getType());
+//   auto lhsScalesType = cast<RankedTensorType>(inputs[2]->get().getType());
+//   auto rhsScalesType = cast<RankedTensorType>(inputs[3]->get().getType());
+//   auto resultType = cast<RankedTensorType>(outputs[0].getType());
+//   auto lhsEncoding = IREE::Encoding::getEncodingAttr(lhsType);
+//   auto rhsEncoding = IREE::Encoding::getEncodingAttr(rhsType);
+//   auto lhsScalesEncoding = IREE::Encoding::getEncodingAttr(lhsScalesType);
+//   auto rhsScalesEncoding = IREE::Encoding::getEncodingAttr(rhsScalesType);
+//   auto resultEncoding = IREE::Encoding::getEncodingAttr(resultType);
+//   if (!lhsEncoding || !rhsEncoding || !lhsScalesEncoding ||
+//       !rhsScalesEncoding || !resultEncoding) {
+//     return nullptr;
+//   }
+
+//   if (lhsEncoding.getOperandIndex().getValue() !=
+//           IREE::Encoding::SCALED_MATMUL_LHS ||
+//       rhsEncoding.getOperandIndex().getValue() !=
+//           IREE::Encoding::SCALED_MATMUL_RHS ||
+//       lhsScalesEncoding.getOperandIndex().getValue() !=
+//           IREE::Encoding::SCALED_MATMUL_LHS_SCALES ||
+//       rhsScalesEncoding.getOperandIndex().getValue() !=
+//           IREE::Encoding::SCALED_MATMUL_RHS_SCALES ||
+//       resultEncoding.getOperandIndex().getValue() !=
+//           IREE::Encoding::SCALED_MATMUL_RESULT) {
+//     return nullptr;
+//   }
+
+//   // One extra dim for packing the kBDim, and 2 extra dims for packing and
+//   // swizzling the kDim.
+//   int64_t originalRank = genericOp.getStaticLoopRanges().size();
+//   int64_t convertedRank = originalRank + 3;
+//   SmallVector<utils::IteratorType> convertedIteratorTypes =
+//       genericOp.getIteratorTypesArray();
+//   convertedIteratorTypes.append(3, utils::IteratorType::reduction);
+//   SmallVector<AffineMap> convertedMaps;
+//   AffineExpr kInnerCrossIntrinsic = builder.getAffineDimExpr(originalRank);
+//   AffineExpr kInnerInternal = builder.getAffineDimExpr(originalRank + 1);
+//   AffineExpr kBInner = builder.getAffineDimExpr(originalRank + 2);
+//   for (auto [idx, map] : llvm::enumerate(genericOp.getIndexingMapsArray())) {
+//     // Only the reduction dimensions are tiled/swizzled. The result operand
+//     // remains unchanged.
+//     SmallVector<AffineExpr> results(map.getResults());
+//     if (idx == IREE::Encoding::SCALED_MATMUL_LHS ||
+//         idx == IREE::Encoding::SCALED_MATMUL_RHS) {
+//       results.append({kInnerCrossIntrinsic, kInnerInternal, kBInner});
+//     } else if (idx == IREE::Encoding::SCALED_MATMUL_LHS_SCALES ||
+//                idx == IREE::Encoding::SCALED_MATMUL_RHS_SCALES) {
+//       // The kDim tile has been swizzled so that the crossIntrinsic dimension
+//       is
+//       // innermost.
+//       results.append({kInnerInternal, kInnerCrossIntrinsic});
+//     }
+//     convertedMaps.push_back(
+//         AffineMap::get(convertedRank, 0, results, builder.getContext()));
+//   }
+//   SmallVector<Value> convertedInputOperands(operands);
+//   SmallVector<Value> convertedOutputOperands(
+//       {convertedInputOperands.pop_back_val()});
+//   Type convertedResultType = convertedOutputOperands[0].getType();
+//   // TODO(#21923): We should directly create an inner_tiled op, but we
+//   currently
+//   // do not materialize the packed layout for the LHS, RHS, or ACC operands,
+//   so
+//   // we can't lower directly to the inner_tiled op. Fix this once we have
+//   packed
+//   // layouts for all operands.
+//   auto convertedScaledContraction = linalg::GenericOp::create(
+//       builder, genericOp.getLoc(), TypeRange{convertedResultType},
+//       convertedInputOperands, convertedOutputOperands, convertedMaps,
+//       convertedIteratorTypes, /*bodyBuilder=*/nullptr,
+//       linalg::getPrunedAttributeList(genericOp));
+//   convertedScaledContraction.getRegion().takeBody(genericOp->getRegion(0));
+//   return convertedScaledContraction;
+// }
+
+// /// Gets the MaterializeEncodingInfo for a scaled matmul encoding. Currently,
+// /// this only packs the scales into a layout where scales for 4 consecutive
+// /// MFMA instructions can be loaded into a single 32 bit register.
+// /// TODO(#21923): This is a placeholder layout implementation. We should also
+// be
+// /// packing the LHS and RHS operands.
+// static MaterializeEncodingInfo
+// getScaledMatmulPackedLayoutEncodingInfo(IREE::Encoding::EncodingAttr
+// encoding,
+//                                         DictionaryAttr config) {
+//   MaterializeEncodingInfo info;
+//   SmallVector<AffineMap> maps = encoding.getRootMaps();
+//   FailureOr<IREE::LinalgExt::ScaledContractionDimensions> cDims =
+//       IREE::LinalgExt::inferScaledContractionDims(maps);
+//   if (failed(cDims) || cDims->k.size() != 1 || cDims->kB.size() != 1) {
+//     return info;
+//   }
+//   IREE::GPU::TargetAttr gpuAttr = getGPUTargetAttr(config);
+//   if (!gpuAttr) {
+//     return info;
+//   }
+//   SmallVector<Type> elementTypes = encoding.getElementTypesArray();
+//   if (elementTypes.size() != 5) {
+//     return info;
+//   }
+//   if (elementTypes[2].getIntOrFloatBitWidth() !=
+//       elementTypes[3].getIntOrFloatBitWidth()) {
+//     return info;
+//   }
+//   ScaledMMAAttr mmaAttr =
+//       chooseScaledIntrinsicMMAAttr(elementTypes, gpuAttr.getWgp());
+//   if (!mmaAttr) {
+//     return info;
+//   }
+//   unsigned kDim = cDims->k.front();
+//   std::optional<int64_t> operandKDim = encoding.mapDimToOperandIndex(kDim);
+//   if (!operandKDim.has_value()) {
+//     return info;
+//   }
+
+//   // Scales are packed into a vector of 4 scales, and a selector is used to
+//   // indicate which scale is used. For performance, we want to be able to
+//   load
+//   // the scales for multiple instructions at once into a single 32 bit
+//   register,
+//   // and use the same register for a series of MFMA instructions. However,
+//   based
+//   // on the row-major layout of the scales, consecutive scale elements will
+//   be
+//   // loaded by separate threads cooperating on the same instruction within a
+//   // subgroup. Instead, we want consecutive scale elements to be loaded by a
+//   // single thread, so we need to swizzle the inner K tile such that an outer
+//   // dimension of the `scalesVectorSize` becomes innermost.
+//   unsigned scalesVectorSize = mmaAttr.getScalesVectorSize();
+//   int64_t kIntrSize, kBIntrSize;
+//   std::tie(std::ignore, std::ignore, kIntrSize, kBIntrSize) =
+//       mmaAttr.getScaledMNKShape();
+//   info.innerTileSizes = {scalesVectorSize * kIntrSize};
+//   info.innerDimsPos = {operandKDim.value()};
+//   AffineMap operandMap = encoding.getLastMapForOperandIndex();
+//   info.outerDimsPerm =
+//       llvm::to_vector(llvm::seq<int64_t>(operandMap.getNumResults()));
+//   // Start building the swizzle for the first inner tile dim. For scales, the
+//   // row major layout is [scalesVectorSize, kIntrSize]. We want to swizzle to
+//   // [kIntrSize, scalesVectorSize].
+//   Codegen::TileSwizzle swizzle;
+//   Codegen::TileSwizzle::ExpandShapeType expandShape;
+//   auto internal = Codegen::TileSwizzle::Dim::Kind::Internal;
+//   auto crossIntrinsic = Codegen::TileSwizzle::Dim::Kind::CrossIntrinsic;
+//   expandShape.push_back(Codegen::TileSwizzle::ExpandShapeDimVectorType(
+//       {Codegen::TileSwizzle::Dim(crossIntrinsic, scalesVectorSize),
+//        Codegen::TileSwizzle::Dim(internal, kIntrSize)}));
+//   swizzle.expandShape = expandShape;
+//   // Only scales will have a permutation, which is adjusted below. We want to
+//   // avoid complicated layout transformations on the LHS and RHS for
+//   simplicity,
+//   // and we do not need to swizzle the LHS or RHS to get good contiguous
+//   vector
+//   // loads, since the block dimension is typically already innermost.
+//   swizzle.permutation = SmallVector<int64_t>({0, 1});
+
+//   // If there is a kBDim, add an inner tile dim for it. Only the LHS and RHS
+//   // will have the kBDim.
+//   unsigned kBDim = cDims->kB.front();
+//   std::optional<int64_t> operandKBDim = encoding.mapDimToOperandIndex(kBDim);
+//   if (operandKBDim.has_value()) {
+//     info.innerDimsPos.push_back(operandKBDim.value());
+//     info.innerTileSizes.push_back(mmaAttr.getBlockSize());
+//     swizzle.permutation.push_back(2);
+//     swizzle.expandShape.push_back(
+//         Codegen::TileSwizzle::ExpandShapeDimVectorType(
+//             {Codegen::TileSwizzle::Dim(crossIntrinsic,
+//                                        mmaAttr.getBlockSize())}));
+//   }
+//   int64_t encodingOperandIdx = encoding.getOperandIndex().getInt();
+//   if (encodingOperandIdx == IREE::Encoding::SCALED_MATMUL_LHS_SCALES ||
+//       encodingOperandIdx == IREE::Encoding::SCALED_MATMUL_RHS_SCALES) {
+//     // Permute the kDim tile to put the crossIntrinsic innermost.
+//     swizzle.permutation[0] = 1;
+//     swizzle.permutation[1] = 0;
+//   }
+//   info.swizzle = swizzle;
+//   return info;
+// }
 
 struct GPUEncodingPackedLayoutMaterializerAttr
     : public PackedLayoutMaterializerAttrExternalModelBase<
@@ -355,7 +683,7 @@ struct GPUEncodingPackedLayoutMaterializerAttr
       return info;
     }
 
-    DataTiledMMAAttr mma = chooseDataTiledMMAAttr(
+    DataTiledMMAInterfaceAttr mma = chooseDataTiledMMAAttr(
         encoding.getElementTypesArray(), gpuAttr, encoding, resolver);
     if (!mma) {
       return info;
@@ -363,18 +691,15 @@ struct GPUEncodingPackedLayoutMaterializerAttr
 
     // Map the matmul TileMxNxK to an actual tile shape for the tensor at hand,
     // based on its operand index in the matmul.
-    TileMxNxK innerTile;
-    std::tie(innerTile.M, innerTile.N, innerTile.K) = mma.getMNKShape();
+    TileMxNxK innerTile = mma.getTileMNK();
     FailureOr<MaterializeEncodingInfo> maybeEncodingInfo =
         getEncodingInfoForMatmul(encoding, innerTile);
     if (failed(maybeEncodingInfo)) {
       return info;
     }
     info = std::move(maybeEncodingInfo.value());
-    auto fragment = static_cast<IREE::GPU::MMAFragment>(
-        encoding.getOperandIndex().getInt());
     FailureOr<IREE::Codegen::TileSwizzle> maybeSwizzle =
-        getEncodingSwizzle(encoding, mma, fragment);
+        getEncodingSwizzle(encoding, mma, encoding.getOperandIndex().getInt());
     if (failed(maybeSwizzle)) {
       return info;
     }
@@ -394,8 +719,8 @@ struct GPUEncodingResolverMaterializerAttr
     if (!linalgOp) {
       return nullptr;
     }
-    return lowerContractionOpToMultiMmaOp(b, linalgOp, convertedOperands,
-                                          resolverAttr);
+    return lowerContractionOrScaledContractionOpToInnerTiledOp(
+        b, linalgOp, convertedOperands, resolverAttr);
   }
 };
 
