@@ -32,11 +32,17 @@ getExpandedShape(SmallVector<ReassociationIndices> reIndices,
                  SmallVectorImpl<int64_t> &expandedShape,
                  SmallVectorImpl<int64_t> &totalInnerSizes) {
   auto destType = dyn_cast<ShapedType>(dest.getType());
-  if (!destType)
+  if (!destType) {
+    llvm::dbgs()
+        << "getExpandedShape: Failure - destType is not a ShapedType\n";
     return failure();
+  }
   // TODO (nirvedhmeshram): Support rank reducing parallel_insert_slice.
-  if (reIndices.size() != destType.getShape().size())
+  if (reIndices.size() != destType.getShape().size()) {
+    llvm::dbgs() << "getExpandedShape: Failure - reassociation count does not "
+                    "match destType rank\n";
     return failure();
+  }
   // Iterator to insert outer sizes.
   auto outerShapeIdx = 0;
   for (auto [reassociations, destSize] :
@@ -51,19 +57,27 @@ getExpandedShape(SmallVector<ReassociationIndices> reIndices,
     // Dynamic destination dims that are expanded are currently unsupported but
     // this support can be added if needed.
     if (ShapedType::isDynamic(destSize)) {
+      llvm::dbgs() << "getExpandedShape: Failure - dynamic destSize with "
+                      "expansion unsupported\n";
       return failure();
     }
     int64_t totalInnerSize = 1;
     for (int64_t reasociation : llvm::drop_begin(reassociations)) {
       int64_t expandedInnerSize = sliceStaticSizes[reasociation];
       // It is not safe to do this pattern if inner dimensions are dynamic.
-      if (ShapedType::isDynamic(expandedInnerSize))
+      if (ShapedType::isDynamic(expandedInnerSize)) {
+        llvm::dbgs()
+            << "getExpandedShape: Failure - dynamic expandedInnerSize\n";
         return failure();
+      }
       expandedShape.push_back(expandedInnerSize);
       totalInnerSize *= expandedInnerSize;
     }
-    if (destSize % totalInnerSize != 0)
+    if (destSize % totalInnerSize != 0) {
+      llvm::dbgs() << "getExpandedShape: Failure - destSize not divisible by "
+                      "totalInnerSize\n";
       return failure();
+    }
     totalInnerSizes.push_back(totalInnerSize);
     // insert the outer size in front of any inner sizes.
     expandedShape.insert(expandedShape.begin() + outerShapeIdx,
@@ -186,12 +200,17 @@ struct ExpandDestinationForallOp final
     auto collapseOp =
         parallelInsertOp.getSource().getDefiningOp<tensor::CollapseShapeOp>();
     // No collapse op to hoist out.
-    if (!collapseOp)
+    if (!collapseOp) {
+      llvm::dbgs() << "[ExpandDestinationForallOp] No collapse op to hoist "
+                      "out, returning failure\n";
       return failure();
+    }
 
     // Ignore trivially foldable collapse ops.
     if (collapseOp.getSrcType().getRank() ==
         collapseOp.getResultType().getRank()) {
+      llvm::dbgs() << "[ExpandDestinationForallOp] Trivially foldable collapse "
+                      "op (same rank), returning failure\n";
       return failure();
     }
 
@@ -203,8 +222,11 @@ struct ExpandDestinationForallOp final
     int64_t tiedResultIdx = tiedResult.getResultNumber();
 
     auto forallOp = dyn_cast<scf::ForallOp>(tiedResult.getOwner());
-    if (!forallOp)
+    if (!forallOp) {
+      llvm::dbgs() << "[ExpandDestinationForallOp] Could not find enclosing "
+                      "scf.forall op, returning failure\n";
       return failure();
+    }
 
     SmallVector<int64_t> expandedDestShape;
     SmallVector<int64_t> totalInnerSizes;
@@ -216,6 +238,8 @@ struct ExpandDestinationForallOp final
     if (failed(getExpandedShape(reIndices, collapseOp.getSrcType().getShape(),
                                 insertDest, expandedDestShape,
                                 totalInnerSizes))) {
+      llvm::dbgs() << "[ExpandDestinationForallOp] Failed to get expanded "
+                      "shape, returning failure\n";
       return failure();
     }
 
@@ -230,18 +254,26 @@ struct ExpandDestinationForallOp final
         continue;
       auto storeToBufferOp =
           dyn_cast<IREE::Codegen::StoreToBufferOp>(foralluser);
-      if (!storeToBufferOp)
+      if (!storeToBufferOp) {
+        llvm::dbgs() << "[ExpandDestinationForallOp] Non-store-to-buffer user "
+                        "found, returning failure\n";
         return failure();
+      }
       MemRefType bufferType = storeToBufferOp.getBuffer().getType();
       if (failed(memref::ExpandShapeOp::computeExpandedType(
-              bufferType, expandedDestShape, reIndices)))
+              bufferType, expandedDestShape, reIndices))) {
+        llvm::dbgs() << "[ExpandDestinationForallOp] Failed to compute "
+                        "expanded type for buffer, returning failure\n";
         return failure();
+      }
     }
 
     // This allows us to assume that the extract/inserts in the loop are
     // disjoint and makes the application of this pattern safe.
     if (!forallOpHasMappingType<IREE::Codegen::WorkgroupMappingAttr>(
             forallOp)) {
+      llvm::dbgs() << "[ExpandDestinationForallOp] Forall op lacks workgroup "
+                      "mapping type, returning failure\n";
       return failure();
     }
 
@@ -251,6 +283,8 @@ struct ExpandDestinationForallOp final
     if (failed(verifyAndCollectExpandableUsers(
             insertDest, collapseOp.getReassociationIndices(), parallelInsertOp,
             expandableUsers))) {
+      llvm::dbgs() << "[ExpandDestinationForallOp] Failed to verify/collect "
+                      "expandable users, returning failure\n";
       return failure();
     }
 
@@ -419,6 +453,7 @@ void PropagateReshapesByExpansionPass::runOnOperation() {
                                               context);
   tensor::CollapseShapeOp::getCanonicalizationPatterns(
       bubbleExpandShapePatterns, context);
+  populateSwapExtractWithCollapsePattern(bubbleExpandShapePatterns);
   tensor::EmptyOp::getCanonicalizationPatterns(bubbleExpandShapePatterns,
                                                context);
   tensor::ExpandShapeOp::getCanonicalizationPatterns(bubbleExpandShapePatterns,

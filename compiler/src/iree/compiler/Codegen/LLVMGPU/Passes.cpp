@@ -553,9 +553,10 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(
       IREE::LinalgExt::createVectorizeIREELinalgExtOpsPass());
   funcPassManager.addPass(IREE::GPU::createVectorizeIREEGPUOpsPass());
-  addGPUVectorizationPasses(funcPassManager, /*vectorizeCopies=*/false,
-                            /*enableMasking=*/true,
-                            /*foldIdentitySlices=*/true);
+  addGPUVectorizationPasses(
+      funcPassManager, /*vectorizeCopies=*/pipelineOptions.useIgemmConvolution,
+      /*enableMasking=*/true,
+      /*foldIdentitySlices=*/true);
   funcPassManager.addPass(createCleanupBufferAllocViewPass());
   funcPassManager.addPass(createGPUCombineValueBarriersPass());
 

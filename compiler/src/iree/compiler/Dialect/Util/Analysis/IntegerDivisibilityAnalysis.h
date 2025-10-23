@@ -35,6 +35,16 @@ public:
   visitOperation(Operation *op,
                  ArrayRef<const IntegerDivisibilityLattice *> operands,
                  ArrayRef<IntegerDivisibilityLattice *> results) override;
+
+  /// Visit block arguments or operation results of an operation with region
+  /// control-flow for which values are not defined by region control-flow. This
+  /// function calls `InferIntRangeInterface` to provide values for block
+  /// arguments or tries to reduce the range on loop induction variables with
+  /// known bounds.
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor,
+      ArrayRef<IntegerDivisibilityLattice *> argLattices,
+      unsigned firstIndex) override;
 };
 
 } // namespace mlir::iree_compiler::IREE::Util

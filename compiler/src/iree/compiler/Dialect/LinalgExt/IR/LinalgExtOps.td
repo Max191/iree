@@ -1288,7 +1288,8 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
                        DenseI64ArrayAttr:$m_pos,
                        DenseI64ArrayAttr:$k_pos,
                        DenseI64ArrayAttr:$input_k_perm,
-                       DenseI64ArrayAttr:$output_perm);
+                       DenseI64ArrayAttr:$output_perm,
+                       OptionalAttr<DenseI64ArrayAttr>:$vectorization_hint);
 
   let results = (outs Variadic<AnyShaped>:$results);
   let hasFolder = 1;
@@ -1309,6 +1310,7 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     `k_pos` `=` $k_pos
     `input_k_perm` `=` $input_k_perm
     `output_perm` `=` $output_perm
+    (`vectorization_hint` `=` $vectorization_hint^)?
     `ins` `(` $input `:` type($input) `)`
     `outs` `(` $output `:` type($output) `)`
     (`->` type($results)^)?
@@ -1363,6 +1365,14 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     // channel and filter loop dims), but otherwise omits mappings for the K
     // dims.
     SmallVector<SmallVector<int64_t>> getInputToOutputDimVectorizationMap();
+
+    // Returns the permutation of output dimensions to match the ordering of the
+    // input dimensions.
+    SmallVector<int64_t> getOutputToInputDimOrderPerm();
+
+    // Returns the permutation of input dimensions to match the ordering of the
+    // output dimensions.
+    SmallVector<int64_t> getInputToOutputDimOrderPerm();
 
     // Return op metadata.
     SmallVector<OpFoldResult> getMixedKernelSize();

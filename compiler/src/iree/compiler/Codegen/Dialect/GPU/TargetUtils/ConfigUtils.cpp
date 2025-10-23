@@ -483,7 +483,9 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     ArrayRef<int64_t> bounds, ArrayRef<AffineMap> maps,
     ArrayRef<Value> operands, IREE::GPU::TargetAttr target, bool useDirectLoad,
     bool isGemm, bool scaled,
-    std::optional<ConvToIgemmInfo> convToIgemmInfo = std::nullopt) {
+    llvm::function_ref<void(SmallVector<NamedAttribute> &)> addExtraAttrs =
+        nullptr) {
+  // std::optional<ConvToIgemmInfo> convToIgemmInfo = std::nullopt) {
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -780,14 +782,9 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     }
     paddingTileSizes[innerKDim] *= kPackFactor;
     attrs.emplace_back("padding", b.getI64ArrayAttr(paddingTileSizes));
-
-    // Create `padding_conv` attribute when padding convolutions before IGEMM
-    // is possible.
-    if (auto attr =
-            getPaddingConvSizes(b, bounds, paddingTileSizes, workgroupTileSizes,
-                                reductionTileSizes, convToIgemmInfo)) {
-      attrs.emplace_back("padding_conv", *attr);
-    }
+  }
+  if (addExtraAttrs) {
+    addExtraAttrs(attrs);
   }
   auto configDict = DictionaryAttr::get(context, attrs);
   auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
@@ -819,55 +816,44 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
     return failure();
   }
 
-  ConvToIgemmInfo convToIgemmInfo;
-  if (padConv) {
-    auto inputType = llvm::cast<ShapedType>(op->getOperands()[0].getType());
-    ArrayRef<int64_t> inputShape = inputType.getShape();
-    AffineMap inputMap = linalgOp.getIndexingMapsArray()[0];
-    SmallVector<int64_t> inputImagePos;
-    SmallVector<int64_t> batchPos;
-    for (auto dim : igemmGenericConvDetails->convDims.inputChannel) {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(dim)) {
-          convToIgemmInfo.inputChannelDimToSize[dim] = inputShape[idx];
-        }
-      }
-    }
-    for (auto dim : igemmGenericConvDetails->convDims.outputImage) {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(dim)) {
-          inputImagePos.push_back(idx);
-        }
-      }
-    }
-    for (auto dim : igemmGenericConvDetails->convDims.batch) {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(dim)) {
-          batchPos.push_back(idx);
-        }
-      }
-    }
-    llvm::sort(inputImagePos);
-    llvm::sort(batchPos);
-    convToIgemmInfo.isBatchDimLast =
-        !batchPos.empty() && batchPos.back() == inputShape.size() - 1;
-    convToIgemmInfo.isSpatialDimLast =
-        !inputImagePos.empty() && inputImagePos.back() == inputShape.size() - 1;
-    convToIgemmInfo.convDims = igemmGenericConvDetails->convDims;
-    convToIgemmInfo.convToIgemmDimMap =
-        igemmGenericConvDetails->convToIgemmDimMap;
-  }
-
   SmallVector<AffineMap> igemmContractionMaps =
       igemmGenericConvDetails->igemmContractionMaps;
   SmallVector<int64_t> igemmLoopBounds =
       igemmGenericConvDetails->igemmLoopBounds;
   SmallVector<Value> igemmOperands = igemmGenericConvDetails->igemmOperands;
+  auto addPaddingConvAttr = [&](SmallVector<NamedAttribute> &attrs) {
+    if (padConv) {
+      Builder b(linalgOp->getContext());
+      SmallVector<int64_t> paddingSizes(linalgOp.getNumLoops(), 0);
+      AffineMap imageMap = linalgOp.getIndexingMapsArray()[0];
+      auto imageType = cast<RankedTensorType>(linalgOp->getOperandTypes()[0]);
+      int64_t preferredVectorSize =
+          kPreferredCopyNumBits / imageType.getElementTypeBitWidth();
+      SmallVector<int64_t> convBounds = linalgOp.getStaticLoopRanges();
+      imageMap.getResults().back().walk([&](AffineExpr expr) {
+        if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+          int64_t paddingAmount = preferredVectorSize;
+          while (paddingAmount > 1) {
+            int64_t dimIdx = dimExpr.getPosition();
+            // Don't pad if it will increase the total iteration space by more
+            // than a factor of 2.
+            if (convBounds[dimIdx] < paddingAmount / 2) {
+              paddingAmount /= 2;
+              continue;
+            }
+            paddingSizes[dimIdx] = paddingAmount;
+            break;
+          }
+        }
+      });
+      attrs.emplace_back("padding_conv", b.getI64ArrayAttr(paddingSizes));
+    }
+  };
   FailureOr<std::pair<LoweringConfigAttr, int64_t>> configAndWgSize =
       getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
           igemmLoopBounds, igemmContractionMaps, igemmOperands, target,
           useDirectLoad, /*isGemm=*/false,
-          /*scaled=*/false, convToIgemmInfo);
+          /*scaled*/ false, addPaddingConvAttr);
   if (failed(configAndWgSize)) {
     return failure();
   }
@@ -1721,7 +1707,6 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
       IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
 
   auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
-
   return setOpConfigAndEntryPointFnTranslation(
       entryPoint, op, loweringConfig,
       Codegen::DispatchLoweringPassPipeline::LLVMGPUTileAndFuse, workgroupSize,

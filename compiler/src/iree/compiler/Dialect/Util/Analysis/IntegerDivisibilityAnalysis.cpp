@@ -8,6 +8,8 @@
 
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #define DEBUG_TYPE "iree-util-int-divisibility-analysis"
 
@@ -56,7 +58,6 @@ LogicalResult IntegerDivisibilityAnalysis::visitOperation(
     });
     if (isYieldedResult && !oldDiv.isUninitialized() &&
         !(lattice->getValue() == oldDiv)) {
-      LLVM_DEBUG(llvm::dbgs() << "Loop variant loop result detected\n");
       changed |= lattice->join(IntegerDivisibility::getMinDivisibility());
     }
     propagateIfChanged(lattice, changed);
@@ -64,6 +65,60 @@ LogicalResult IntegerDivisibilityAnalysis::visitOperation(
 
   inferrable.inferResultDivisibility(argDivs, joinCallback);
   return success();
+}
+
+void IntegerDivisibilityAnalysis::visitNonControlFlowArguments(
+    Operation *op, const RegionSuccessor &successor,
+    ArrayRef<IntegerDivisibilityLattice *> argLattices, unsigned firstIndex) {
+  auto getDivFromConstants = [&](std::optional<OpFoldResult> loopBound,
+                                 Block *block, bool isUnsigned) -> uint64_t {
+    if (loopBound.has_value()) {
+      if (auto constBound = getConstantIntValue(*loopBound)) {
+        return constBound.value();
+      }
+      auto value = cast<Value>(loopBound.value());
+      const IntegerDivisibilityLattice *lattice =
+          getLatticeElementFor(getProgramPointBefore(block), value);
+      if (lattice != nullptr && !lattice->getValue().isUninitialized())
+        return isUnsigned ? lattice->getValue().getValue().udiv()
+                          : lattice->getValue().getValue().sdiv();
+    }
+    return isUnsigned
+               ? IntegerDivisibility::getMinDivisibility().getValue().udiv()
+               : IntegerDivisibility::getMinDivisibility().getValue().sdiv();
+  };
+
+  // Infer bounds for loop arguments that have static bounds
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(op)) {
+    std::optional<Value> iv = loop.getSingleInductionVar();
+    if (!iv) {
+      return SparseForwardDataFlowAnalysis ::visitNonControlFlowArguments(
+          op, successor, argLattices, firstIndex);
+    }
+    Block *block = iv->getParentBlock();
+    std::optional<OpFoldResult> lb = loop.getSingleLowerBound();
+    std::optional<OpFoldResult> step = loop.getSingleStep();
+
+    IntegerDivisibilityLattice *ivEntry = getLatticeElement(*iv);
+    uint64_t stepUDiv = getDivFromConstants(step, block, /*unsigned=*/true);
+    uint64_t stepSDiv = getDivFromConstants(step, block, /*unsigned=*/false);
+    // if (lb.has_value() && isConstantIntValue(*lb, 0)) {
+    //   ConstantIntDivisibility ivDiv(stepUDiv, stepSDiv);
+    //   propagateIfChanged(ivEntry, ivEntry->join(ivDiv));
+    //   return;
+    // }
+
+    uint64_t lbUDiv = getDivFromConstants(lb, block, /*unsigned=*/true);
+    uint64_t lbSDiv = getDivFromConstants(lb, block, /*unsigned=*/false);
+    ConstantIntDivisibility lbDiv(lbUDiv, lbSDiv);
+    ConstantIntDivisibility stepDiv(stepUDiv, stepSDiv);
+    ConstantIntDivisibility ivDiv = stepDiv.getUnion(lbDiv);
+    propagateIfChanged(ivEntry, ivEntry->join(ivDiv));
+    return;
+  }
+
+  return SparseForwardDataFlowAnalysis::visitNonControlFlowArguments(
+      op, successor, argLattices, firstIndex);
 }
 
 } // namespace mlir::iree_compiler::IREE::Util

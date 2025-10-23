@@ -2446,10 +2446,6 @@ Im2colOp::getInputToOutputDimVectorizationMap() {
     if (batchInputDims.contains(dim)) {
       continue;
     }
-    if (kInputDims.contains(dim)) {
-      orderedKInputDims.push_back(dim);
-      continue;
-    }
     orderedKInputDims.push_back(dim);
   }
   applyPermutationToVector(orderedKInputDims, getInputKPerm());
@@ -2462,6 +2458,158 @@ Im2colOp::getInputToOutputDimVectorizationMap() {
     vectorizationMap[orderedKInputDims.back()].push_back(kOutputDims.back());
   }
   return vectorizationMap;
+}
+
+/// Reshape the `permutation` to match the rank of `input`, and return the
+/// reshaped permutation applied to `input`. The reshape is defined by the
+/// `inputGroupSizes` and `permGroupSizes` arrays, which are expected to have
+/// the same length, and represent the sizes of corresponding groups of
+/// dimensions in the input and permutation. These groups are expected to be
+/// contiguous in the input of `permutation`, and the output of `input`. In
+/// other words, they are in the domain of the boundary between the two
+/// permutations. The reshape is done by collapsing outer dimensions of the
+/// group into the inner dimensions of the group, or expanding from the
+/// outermost dimension in the group.
+///
+/// Example:
+///   input = [{0, 1, 2}, {3, 4}]
+///   inputGroupSizes = [3, 2]
+///   permutation = [{1, 2}, {3, 4, 0}]
+///   permGroupSizes = [2, 3]
+/// The first group will be expanded from 2 to 3 dims:
+///   permutation before = [{1, 2}, {3, 4, 0}]
+///   permutation after = [{1, 2, 3}, {4, 5, 0}]
+/// The second group will be collapsed from 3 to 2 dims:
+///   permutation after = [{1, 2, 3}, {4, 5, 0}]
+///   permutation after = [{1, 2, 3}, {4, 0}]
+/// The final permutation will be:
+///   permutation after = [1, 2, 3, 4, 0]
+static SmallVector<int64_t> reshapeAndApplyPermutation(
+    ArrayRef<int64_t> input, ArrayRef<int64_t> permutation,
+    ArrayRef<int64_t> inputGroupSizes, ArrayRef<int64_t> permGroupSizes) {
+  SmallVector<int64_t> reshapedPerm(permutation);
+
+  auto expandDims = [&](int64_t insertPos, int64_t numToInsert) {
+    int64_t baseValue = reshapedPerm[insertPos];
+    for (int64_t &permIdx : reshapedPerm) {
+      if (permIdx >= baseValue) {
+        permIdx += numToInsert;
+      }
+    }
+    reshapedPerm.insert(reshapedPerm.begin() + insertPos, numToInsert, 0);
+    for (int64_t i = 0; i < numToInsert; ++i) {
+      reshapedPerm[insertPos + i] = baseValue + i;
+    }
+  };
+
+  auto collapseDims = [&](int64_t startPos, int64_t numToRemove) {
+    int64_t endPos = startPos + numToRemove;
+    reshapedPerm.erase(std::remove_if(reshapedPerm.begin(), reshapedPerm.end(),
+                                      [&](int64_t val) {
+                                        return val >= startPos && val < endPos;
+                                      }),
+                       reshapedPerm.end());
+    for (int64_t &permIdx : reshapedPerm) {
+      if (permIdx >= endPos) {
+        permIdx -= numToRemove;
+      }
+    }
+  };
+
+  // Process each group of dimensions, and expand or collapse as needed to
+  // make the group sizes match between the permutations.
+  int64_t groupStart = 0;
+  for (auto [inputPermGroupSize, permGroupSize] :
+       llvm::zip_equal(inputGroupSizes, permGroupSizes)) {
+    if (permGroupSize < inputPermGroupSize) {
+      expandDims(groupStart, inputPermGroupSize - permGroupSize);
+    } else if (permGroupSize > inputPermGroupSize) {
+      collapseDims(groupStart, permGroupSize - inputPermGroupSize);
+    }
+    groupStart += inputPermGroupSize;
+  }
+  return applyPermutation(input, reshapedPerm);
+}
+
+SmallVector<int64_t> Im2colOp::getOutputToInputDimOrderPerm() {
+  // Step 1: Compute permutation from output to canonical output order
+  // This is the inverse of output_perm
+  SmallVector<int64_t> actualToCanonicalOutputPerm =
+      invertPermutationVector(getOutputPerm());
+
+  // Step 2: Build the permutation from the canonical input dim order to the
+  // actual input dim order.
+  // Canonical input order: [b0, b1, ..., m0, m1, ..., k0, k1, ...]
+  // Actual input positions come from batch_pos, m_pos, k_pos
+  ArrayRef<int64_t> batchPos = getBatchPos();
+  ArrayRef<int64_t> mPos = getMPos();
+  ArrayRef<int64_t> kPos = getKPos();
+
+  SmallVector<int64_t> actualToCanonicalInputPerm;
+  actualToCanonicalInputPerm.append(batchPos.begin(), batchPos.end());
+  actualToCanonicalInputPerm.append(mPos.begin(), mPos.end());
+  actualToCanonicalInputPerm.append(kPos.begin(), kPos.end());
+
+  // Invert to get canonical to actual mapping
+  SmallVector<int64_t> canonicalToActualInputPerm =
+      invertPermutationVector(actualToCanonicalInputPerm);
+
+  // Step 3: Reshape the canonicalToActualInputPerm to match the rank of the
+  // output.
+  SmallVector<int64_t> inputGroupSizes;
+  inputGroupSizes.push_back(batchPos.size());
+  inputGroupSizes.push_back(mPos.size());
+  inputGroupSizes.push_back(kPos.size());
+
+  SmallVector<int64_t> permGroupSizes;
+  permGroupSizes.push_back(getBatchOutputDims().size());
+  permGroupSizes.push_back(getMOutputDims().size());
+  permGroupSizes.push_back(getKOutputDims().size());
+
+  // Step 4: Compose the two permutations
+  SmallVector<int64_t> outputToInputOrderPerm = reshapeAndApplyPermutation(
+      actualToCanonicalOutputPerm, canonicalToActualInputPerm, inputGroupSizes,
+      permGroupSizes);
+
+  return outputToInputOrderPerm;
+}
+
+SmallVector<int64_t> Im2colOp::getInputToOutputDimOrderPerm() {
+  // Step 1: Build the permutation from the actual input dim order to the
+  // canonical input dim order.
+  // Actual input positions come from batch_pos, m_pos, k_pos
+  // Canonical input order: [b0, b1, ..., m0, m1, ..., k0, k1, ...]
+  ArrayRef<int64_t> batchPos = getBatchPos();
+  ArrayRef<int64_t> mPos = getMPos();
+  ArrayRef<int64_t> kPos = getKPos();
+
+  SmallVector<int64_t> actualToCanonicalInputPerm;
+  actualToCanonicalInputPerm.append(batchPos.begin(), batchPos.end());
+  actualToCanonicalInputPerm.append(mPos.begin(), mPos.end());
+  actualToCanonicalInputPerm.append(kPos.begin(), kPos.end());
+
+  // Step 2: Compute permutation from canonical output dim order to the actual
+  // output dim order. This is just the output_perm.
+  ArrayRef<int64_t> canonicalToActualOutputPerm = getOutputPerm();
+
+  // Step 3: Reshape the canonicalToActualInputPerm to match the rank of the
+  // output.
+  SmallVector<int64_t> inputGroupSizes;
+  inputGroupSizes.push_back(batchPos.size());
+  inputGroupSizes.push_back(mPos.size());
+  inputGroupSizes.push_back(kPos.size());
+
+  SmallVector<int64_t> permGroupSizes;
+  permGroupSizes.push_back(getBatchOutputDims().size());
+  permGroupSizes.push_back(getMOutputDims().size());
+  permGroupSizes.push_back(getKOutputDims().size());
+
+  // Step 4: Compose the two permutations
+  SmallVector<int64_t> inputToOutputOrderPerm = reshapeAndApplyPermutation(
+      actualToCanonicalInputPerm, canonicalToActualOutputPerm, inputGroupSizes,
+      permGroupSizes);
+
+  return inputToOutputOrderPerm;
 }
 
 /// Custom builder methods for im2col op.
@@ -2502,7 +2650,8 @@ void Im2colOp::build(
         builder.getDenseI64ArrayAttr(batchPos),
         builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos),
         builder.getDenseI64ArrayAttr(inputKPerm),
-        builder.getDenseI64ArrayAttr(outputPerm));
+        builder.getDenseI64ArrayAttr(outputPerm),
+        /*vectorization_hint=*/nullptr);
 }
 
 LogicalResult Im2colOp::verify() {

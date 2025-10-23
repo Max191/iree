@@ -666,8 +666,29 @@ getCombineRelayoutOpsControlFn(IREE::Codegen::RelayoutCombinationScope scope) {
       if (failed(result)) {
         return false;
       }
-      return !llvm::all_of(
-          slice, llvm::IsaPred<tensor::CollapseShapeOp, tensor::ExpandShapeOp>);
+      return !llvm::all_of(slice, [](Operation *op) {
+        SmallVector<ReassociationIndices> reassociationIndices;
+        RankedTensorType expandedType;
+        if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(op)) {
+          reassociationIndices = collapseOp.getReassociationIndices();
+          expandedType = collapseOp.getSrcType();
+        } else if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(op)) {
+          reassociationIndices = expandOp.getReassociationIndices();
+          expandedType = expandOp.getResultType();
+        }
+        for (auto [idx, group] : llvm::enumerate(reassociationIndices)) {
+          if (group.size() == 1) {
+            continue;
+          }
+          SmallVector<int64_t> groupSizes(
+              expandedType.getShape().begin() + group.front(),
+              expandedType.getShape().begin() + group.back() + 1);
+          if (ShapedType::isDynamicShape(groupSizes)) {
+            return false;
+          }
+        }
+        return true;
+      });
     };
     break;
   }
