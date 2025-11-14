@@ -33,6 +33,21 @@ static llvm::cl::opt<float> clAttentionSoftmaxMax(
     llvm::cl::init(1.0));
 
 template <typename T>
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const llvm::SmallVectorImpl<T> &vector) {
+  os << "[";
+  for (auto [idx, element] : llvm::enumerate(vector)) {
+    if (idx == vector.size() - 1) {
+      os << element;
+    } else {
+      os << element << ", ";
+    }
+  }
+  os << "]";
+  return os;
+}
+
+template <typename T>
 static Value elementwiseValueInPlace(OpBuilder &builder, Location loc,
                                      AffineMap inputMap, AffineMap scaleMap,
                                      Value value, Value scale) {
@@ -739,7 +754,7 @@ static Value generateInOrderIm2colSlice(
   // TODO: Compute the reassociations for the input and output based on
   // `outputToInputDimVectorizationMap`.
   SmallVector<ReassociationIndices> inputReassociations, outputReassociations;
-  int64_t prevInputDim = 0, expandedInputDim = 0, expandedOutputDim = 0;
+  int64_t prevInputDim = -1, expandedInputDim = 0, expandedOutputDim = 0;
   for (auto [outputDim, inputDim] :
        llvm::enumerate(outputToInputDimVectorizationMap)) {
     // Case 1: Output dim doesn't map to any input dim. Just add the output dim
@@ -766,7 +781,7 @@ static Value generateInOrderIm2colSlice(
     // Case 3: Output dim maps to the immediate next input dim. This obeys the
     // 1 to 1 mapping, so just add both dims to their own groups.
     if (*inputDim == prevInputDim + 1) {
-      inputReassociations.back().push_back(expandedInputDim++);
+      inputReassociations.push_back({expandedInputDim++});
       outputReassociations.push_back({expandedOutputDim++});
       prevInputDim = *inputDim;
       continue;
@@ -779,10 +794,14 @@ static Value generateInOrderIm2colSlice(
     int64_t numSkippedInputDims = *inputDim - prevInputDim - 1;
     for (int64_t i = 0; i < numSkippedInputDims; ++i) {
       inputReassociations.push_back({expandedInputDim++});
-      outputReassociations.back().push_back(expandedOutputDim++);
+      if (outputReassociations.empty()) {
+        outputReassociations.push_back({expandedOutputDim++});
+      } else {
+        outputReassociations.back().push_back(expandedOutputDim++);
+      }
     }
     inputReassociations.push_back({expandedInputDim++});
-    outputReassociations.push_back({expandedOutputDim++});
+    outputReassociations.back().push_back(expandedOutputDim++);
     prevInputDim = *inputDim;
   }
 
@@ -805,20 +824,18 @@ static Value generateInOrderIm2colSlice(
   }
   SmallVector<OpFoldResult> expandedOutputSizes(sliceRank, b.getIndexAttr(1));
   for (auto [idx, group] : llvm::enumerate(outputReassociations)) {
-    expandedOutputSizes[idx] = outputSizes[idx];
+    expandedOutputSizes[group.back()] = outputSizes[idx];
   }
-
   RankedTensorType expandedInputType = inputType.clone(expandedInputShape);
   Value expandedInput = tensor::ExpandShapeOp::create(
       b, loc, expandedInputType, im2colOp.getInput(), inputReassociations,
       expandedInputSizes);
-
   ArrayRef<OpFoldResult> sliceOffsets = expandedInputOffsets;
   ArrayRef<OpFoldResult> sliceSizes = expandedOutputSizes;
   SmallVector<OpFoldResult> sliceStrides(sliceRank, b.getIndexAttr(1));
+  b.setInsertionPoint(im2colOp);
   Value slice = tensor::ExtractSliceOp::create(
       b, loc, expandedInput, sliceOffsets, sliceSizes, sliceStrides);
-
   return tensor::CollapseShapeOp::create(b, loc, slice, outputReassociations);
 }
 

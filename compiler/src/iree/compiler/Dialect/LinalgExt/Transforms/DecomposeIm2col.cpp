@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/compiler/Codegen/Common/Transforms.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
@@ -263,13 +265,48 @@ void DecomposeIm2colPass::runOnOperation() {
       return signalPassFailure();
     }
   }
-  RewritePatternSet patterns(context);
-  memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
+
+  auto populateCleanupPatterns = [&context](RewritePatternSet &patterns) {
+    tensor::populateFoldTensorEmptyPatterns(patterns);
+    linalg::FillOp::getCanonicalizationPatterns(patterns, context);
+    tensor::CollapseShapeOp::getCanonicalizationPatterns(patterns, context);
+    // populateSwapExtractWithCollapsePattern(patterns);
+    tensor::EmptyOp::getCanonicalizationPatterns(patterns, context);
+    tensor::ExpandShapeOp::getCanonicalizationPatterns(patterns, context);
+    tensor::PadOp::getCanonicalizationPatterns(patterns, context);
+    memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
+  };
+
+  RewritePatternSet expandPatterns(context);
+  linalg::ControlFusionFn expandControlFn = [](OpOperand *fusedOperand) {
+    Operation *producer = fusedOperand->get().getDefiningOp();
+    Operation *consumer = fusedOperand->getOwner();
+    return isa<tensor::PadOp>(producer) || isa<tensor::PadOp>(consumer);
+  };
+  linalg::populateFoldReshapeOpsByExpansionPatterns(expandPatterns,
+                                                    expandControlFn);
+  populateCleanupPatterns(expandPatterns);
   // After im2col is decomposed, im2col extract slice can be swapped with input
   // padding.
-  patterns.insert<linalg::ExtractSliceOfPadTensorSwapPattern>(
+  expandPatterns.insert<linalg::ExtractSliceOfPadTensorSwapPattern>(
       context, [](tensor::ExtractSliceOp) { return false; });
-  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+  populateSwapExtractWithCollapsePattern(expandPatterns, &solver);
+  if (failed(
+          applyPatternsGreedily(getOperation(), std::move(expandPatterns)))) {
+    return signalPassFailure();
+  }
+
+  RewritePatternSet collapsePatterns(context);
+  linalg::ControlFusionFn collapseControlFn = [](OpOperand *fusedOperand) {
+    Operation *producer = fusedOperand->get().getDefiningOp();
+    Operation *consumer = fusedOperand->getOwner();
+    return isa<tensor::PadOp>(producer) || isa<tensor::PadOp>(consumer);
+  };
+  linalg::populateFoldReshapeOpsByCollapsingPatterns(collapsePatterns,
+                                                     collapseControlFn);
+  populateCleanupPatterns(collapsePatterns);
+  if (failed(
+          applyPatternsGreedily(getOperation(), std::move(collapsePatterns)))) {
     return signalPassFailure();
   }
 }

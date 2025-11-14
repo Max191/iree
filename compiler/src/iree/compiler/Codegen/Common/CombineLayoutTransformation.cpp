@@ -667,6 +667,9 @@ getCombineRelayoutOpsControlFn(IREE::Codegen::RelayoutCombinationScope scope) {
         return false;
       }
       return !llvm::all_of(slice, [](Operation *op) {
+        if (!isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(op)) {
+          return false;
+        }
         SmallVector<ReassociationIndices> reassociationIndices;
         RankedTensorType expandedType;
         if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(op)) {

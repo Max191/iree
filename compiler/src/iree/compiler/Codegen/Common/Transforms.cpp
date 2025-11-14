@@ -5,11 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/Transforms.h"
+#include <memory>
 #include "iree/compiler/Codegen/Common/CombineLayoutTransformation.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/Util/Analysis/IntegerDivisibilityAnalysis.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 
 #define DEBUG_TYPE "iree-codegen-common-transforms"
@@ -377,6 +381,193 @@ void populateSwapExtractWithExpandPattern(RewritePatternSet &patterns) {
   patterns.add<SwapExpandShapeWithSlicePattern>(patterns.getContext());
 }
 
+static uint64_t getIntegerDivisibility(OpFoldResult value,
+                                       DataFlowSolver *solver) {
+  if (auto constValue = getConstantIntValue(value)) {
+    return constValue.value();
+  }
+  if (!solver) {
+    return 1;
+  }
+  auto *divState = solver->lookupState<IREE::Util::IntegerDivisibilityLattice>(
+      cast<Value>(value));
+  if (divState && !divState->getValue().isUninitialized()) {
+    return divState->getValue().getValue().udiv();
+  }
+  return 1;
+}
+
+static std::optional<int64_t> getUpperBound(OpFoldResult ofr) {
+  if (auto constValue = getConstantIntValue(ofr)) {
+    return constValue.value();
+  }
+  auto value = cast<Value>(ofr);
+  auto ub = ValueBoundsConstraintSet::computeConstantBound(
+      presburger::BoundType::UB, {value, /*dim=*/std::nullopt},
+      /*stopCondition=*/nullptr, /*closedUB=*/true);
+  if (failed(ub)) {
+    return std::nullopt;
+  }
+  return ub.value();
+}
+
+static LogicalResult sliceableGroupPrecondition(
+    RewriterBase &rewriter, OpFoldResult collapsedSize,
+    OpFoldResult collapsedOffset, ReassociationIndices reassocIndices,
+    tensor::ExtractSliceOp sliceOp, tensor::CollapseShapeOp collapseShapeOp,
+    DataFlowSolver *solver) {
+  // Do not support cases where both the collapsed size and offset are
+  // dynamic, as this may cause failures when padding the operands.
+  ArrayRef<int64_t> srcShape = collapseShapeOp.getSrcType().getShape();
+  int64_t offsetDivisibility = getIntegerDivisibility(collapsedOffset, solver);
+  std::optional<int64_t> sizeUpperBound = getUpperBound(collapsedSize);
+  int64_t lastReassocSize = srcShape[reassocIndices.back()];
+  if (offsetDivisibility == 0) {
+    offsetDivisibility = lastReassocSize;
+  }
+  if (sizeUpperBound.has_value() && ShapedType::isStatic(lastReassocSize) &&
+      lastReassocSize % offsetDivisibility == 0 &&
+      sizeUpperBound.value() <= offsetDivisibility) {
+    return success();
+  }
+  if (isa<Value>(collapsedSize) && isa<Value>(collapsedOffset)) {
+    return rewriter.notifyMatchFailure(
+        sliceOp, "collapsed size and offset cannot be both dynamic");
+  }
+  // CASE #1 - size or offset is dynamic.
+  else if (isa<Value>(collapsedSize) || isa<Value>(collapsedOffset)) {
+    // Special case especially for collapse shape of convolution filter in
+    // IGEMM, while the offset is dynamic and the size is static.
+    if (isa<Attribute>(collapsedSize) && isa<Value>(collapsedOffset)) {
+      auto maybeStaticSize = getConstantIntValue(collapsedSize);
+      if (!maybeStaticSize) {
+        return rewriter.notifyMatchFailure(sliceOp,
+                                           "collapsed size must be static");
+      }
+      auto staticSize = maybeStaticSize.value();
+
+      // Check if offset is from a block argument or an affine.apply op of
+      // form (d0 * K) or (K * d0).
+      auto offsetVal = cast<Value>(collapsedOffset);
+      auto collapseDefOp = offsetVal.getDefiningOp();
+      if (isa<BlockArgument>(offsetVal)) {
+        // The loop is already normalized.
+        if (staticSize != 1) {
+          return rewriter.notifyMatchFailure(
+              sliceOp, "collapsed size must be 1 when the collapsed offset "
+                       "is a block argument");
+        }
+      } else if (auto applyOp =
+                     dyn_cast<affine::AffineApplyOp>(collapseDefOp)) {
+        AffineMap map = applyOp.getAffineMap();
+        if (map.getNumResults() != 1) {
+          return rewriter.notifyMatchFailure(
+              sliceOp, "affine.apply must have only one result");
+        }
+
+        // Compose all nested affine.apply chains and check if the offset is
+        // multiple of collapsed size.
+        SmallVector<Value> operands(applyOp.getOperands());
+        affine::fullyComposeAffineMapAndOperands(&map, &operands);
+        map = simplifyAffineMap(map);
+        if (!map.getResult(0).isMultipleOf(staticSize)) {
+          return rewriter.notifyMatchFailure(
+              sliceOp, "offset multiplier must be multiple of collapsed size");
+        }
+
+        unsigned lastReassocSize = srcShape[reassocIndices.back()];
+        if (lastReassocSize % staticSize != 0) {
+          return rewriter.notifyMatchFailure(
+              sliceOp,
+              "the last expanded size is not divisible by collapse size");
+        }
+      } else {
+        return rewriter.notifyMatchFailure(
+            sliceOp, "offset is not from a block argument or affine.apply op");
+      }
+      return success();
+    }
+
+    // In other general case, the slice can be represented as a contiguous
+    // slice only if there is a single dimension in the reassociation group
+    // that has a size not equal to 1.
+    int nonUnitSizeCount = 0;
+    for (int64_t expandedShapeIdx : reassocIndices) {
+      if (srcShape[expandedShapeIdx] != 1) {
+        nonUnitSizeCount++;
+        continue;
+      }
+    }
+
+    if (nonUnitSizeCount != 1) {
+      return rewriter.notifyMatchFailure(
+          sliceOp, "unsupported: slice cannot be verified to be contiguous");
+    }
+    return success();
+  }
+
+  // CASE #2 = size and offset are static.
+  // Verify that the slice can be represented as a contiguous slice of the
+  // src of the collapse_shape.
+  // Checking this is done on order of most internal dimensions first,
+  // so traversal is done in reverse order of the reassociation group.
+  // If the expected slice shape is [1, 1, ..., 1, Sk, Ak + 1, Ak + 2,
+  // ...,An] then we first find the size and offset for n...k+1 then for k
+  // and then for k-1...0.
+
+  // currentCollapsedsize and currentCollapsedOffset are initialized with
+  // the original collapsed size and offset and divided by the expanded
+  // shape size in each dimension as we go along the reassociation group.
+  // In essence we are spreading the original collapsed size and offset over
+  // the various expanded slice dimensions.
+  // The variables are used both to check the validity of the slice and to
+  // compute the expanded sizes and offsets.
+  int64_t currentCollapsedsize = getConstantIntValue(collapsedSize).value();
+  int64_t currentCollapsedOffset = getConstantIntValue(collapsedOffset).value();
+
+  ReassociationIndices reversedReassocIndices(reassocIndices.rbegin(),
+                                              reassocIndices.rend());
+  int64_t idx = 0;
+  int64_t reassocGroupSize = reassocIndices.size();
+
+  // First handle the trailing dimensions where the slice size should be
+  // equal to the tensor shape and the offset should be 0 (n...k+1).
+  for (; idx < reassocGroupSize; ++idx) {
+    int64_t expandedShapeSize = srcShape[reversedReassocIndices[idx]];
+
+    if (currentCollapsedsize < expandedShapeSize)
+      break;
+
+    // We need to make sure that the slice size can be set to the shape size
+    // and the offset to 0.
+    if ((currentCollapsedsize % expandedShapeSize) != 0 ||
+        (currentCollapsedOffset % expandedShapeSize) != 0) {
+      return rewriter.notifyMatchFailure(
+          sliceOp, "unsupported: cannot be extracted as a contiguous slice "
+                   "of the src of the collapse_shape");
+    }
+
+    currentCollapsedsize /= expandedShapeSize;
+    currentCollapsedOffset /= expandedShapeSize;
+  }
+
+  // Now handle the first dim where slicing occurs on (k).
+  if (idx < reassocGroupSize) {
+    int64_t expandedShapeSize = srcShape[reversedReassocIndices[idx]];
+    int64_t offsetInDim = currentCollapsedOffset % expandedShapeSize;
+    // We need to make sure that the slice size in this dim + offset will
+    // not exceed the shape size.
+    if ((currentCollapsedsize + offsetInDim) >= expandedShapeSize) {
+      return rewriter.notifyMatchFailure(
+          sliceOp, "unsupported: slice cannot be extracted as a contiguous "
+                   "slice of the src of the collapse_shape");
+    }
+    currentCollapsedOffset /= expandedShapeSize;
+  }
+
+  return success();
+}
+
 /// Note the following pattern is adapted from the upstream pattern
 /// `BubbleUpCollapseShapeThroughExtractSlice` by allowing some special cases.
 ///
@@ -453,10 +644,9 @@ void populateSwapExtractWithExpandPattern(RewritePatternSet &patterns) {
 ///                                                       to tensor<15xf32>
 /// ```
 /// But this is not the intended purpose of the transformation.
-static LogicalResult
-swapCollapseShapeWithSlice(RewriterBase &rewriter,
-                           tensor::CollapseShapeOp collapseShapeOp,
-                           tensor::ExtractSliceOp sliceOp) {
+static LogicalResult swapCollapseShapeWithSlice(
+    RewriterBase &rewriter, tensor::CollapseShapeOp collapseShapeOp,
+    tensor::ExtractSliceOp sliceOp, DataFlowSolver *solver) {
   // FIXME: this is a workaround for the fact that this inf loops due to the
   // creation of `affine::AffineDelinearizeIndexOp` but still returns failure.
   SmallVector<Operation *> createdOps;
@@ -483,6 +673,8 @@ swapCollapseShapeWithSlice(RewriterBase &rewriter,
   }
 
   ArrayRef<int64_t> srcShape = collapseShapeOp.getSrcType().getShape();
+  SmallVector<OpFoldResult> srcSizes = tensor::getMixedSizes(
+      rewriter, collapseShapeOp->getLoc(), collapseShapeOp.getSrc());
   SmallVector<ReassociationIndices, 4> reassociationIndices =
       collapseShapeOp.getReassociationIndices();
 
@@ -494,108 +686,57 @@ swapCollapseShapeWithSlice(RewriterBase &rewriter,
   SmallVector<OpFoldResult> expandedStrides(srcShape.size(),
                                             rewriter.getIndexAttr(1));
 
+  Location loc = collapseShapeOp->getLoc();
   for (auto [collapsedSize, collapsedOffset, reassocIndices] :
        llvm::zip_equal(collapsedSizes, collapsedOffsets,
                        collapseShapeOp.getReassociationIndices())) {
-    // Do not support cases where both the collapsed size and offset are
-    // dynamic, as this may cause failures when padding the operands.
-    if (isa<Value>(collapsedSize) && isa<Value>(collapsedOffset)) {
-      return rewriter.notifyMatchFailure(
-          sliceOp, "collapsed size and offset cannot be both dynamic");
+    if (failed(sliceableGroupPrecondition(rewriter, collapsedSize,
+                                          collapsedOffset, reassocIndices,
+                                          sliceOp, collapseShapeOp, solver))) {
+      return failure();
     }
     // CASE #1 - size or offset is dynamic.
-    else if (isa<Value>(collapsedSize) || isa<Value>(collapsedOffset)) {
+    if (isa<Value>(collapsedSize) || isa<Value>(collapsedOffset)) {
+      llvm::dbgs() << "case 1\n";
       // Special case especially for collapse shape of convolution filter in
       // IGEMM, while the offset is dynamic and the size is static.
-      if (isa<Attribute>(collapsedSize) && isa<Value>(collapsedOffset)) {
-        auto maybeStaticSize = getConstantIntValue(collapsedSize);
-        if (!maybeStaticSize) {
-          return rewriter.notifyMatchFailure(sliceOp,
-                                             "collapsed size must be static");
-        }
-        auto staticSize = maybeStaticSize.value();
-
-        // Check if offset is from a block argument or an affine.apply op of
-        // form (d0 * K) or (K * d0).
-        auto offsetVal = cast<Value>(collapsedOffset);
-        auto collapseDefOp = offsetVal.getDefiningOp();
-        if (isa<BlockArgument>(offsetVal)) {
-          // The loop is already normalized.
-          if (staticSize != 1) {
-            return rewriter.notifyMatchFailure(
-                sliceOp, "collapsed size must be 1 when the collapsed offset "
-                         "is a block argument");
-          }
-        } else if (auto applyOp =
-                       dyn_cast<affine::AffineApplyOp>(collapseDefOp)) {
-          AffineMap map = applyOp.getAffineMap();
-          if (map.getNumResults() != 1) {
-            return rewriter.notifyMatchFailure(
-                sliceOp, "affine.apply must have only one result");
-          }
-
-          // Compose all nested affine.apply chains and check if the offset is
-          // multiple of collapsed size.
-          SmallVector<Value> operands(applyOp.getOperands());
-          affine::fullyComposeAffineMapAndOperands(&map, &operands);
-          map = simplifyAffineMap(map);
-          if (!map.getResult(0).isMultipleOf(staticSize)) {
-            return rewriter.notifyMatchFailure(
-                sliceOp,
-                "offset multiplier must be multiple of collapsed size");
-          }
-
-          unsigned lastReassocSize = srcShape[reassocIndices.back()];
-          if (lastReassocSize % staticSize != 0) {
-            return rewriter.notifyMatchFailure(
-                sliceOp,
-                "the last expanded size is not divisible by collapse size");
-          }
-        } else {
-          return rewriter.notifyMatchFailure(
-              sliceOp,
-              "offset is not from a block argument or affine.apply op");
-        }
-
-        // Calculate expanded offsets and sizes.
-        SmallVector<OpFoldResult> expandedBasis;
-        for (auto dimIdx : reassocIndices) {
-          expandedBasis.push_back(rewriter.getIndexAttr(srcShape[dimIdx]));
-        }
-        auto delinearizeOp = affine::AffineDelinearizeIndexOp::create(
-            rewriter, sliceOp.getLoc(), cast<Value>(collapsedOffset),
-            expandedBasis);
-        createdOps.push_back(delinearizeOp);
-        ValueRange offsets = delinearizeOp.getResults();
-        expandedOffsets.append(offsets.begin(), offsets.end());
-
-        expandedSizes.append(reassocIndices.size(), rewriter.getIndexAttr(1));
-        expandedSizes.back() = collapsedSize;
-        continue;
+      // if (isa<Attribute>(collapsedSize) && isa<Value>(collapsedOffset)) {
+      llvm::dbgs() << "case 1.1\n";
+      // Calculate expanded offsets and sizes.
+      SmallVector<OpFoldResult> expandedBasis;
+      for (auto dimIdx : reassocIndices) {
+        expandedBasis.push_back(srcSizes[dimIdx]);
       }
+      auto delinearizeOp = affine::AffineDelinearizeIndexOp::create(
+          rewriter, loc,
+          getValueOrCreateConstantIndexOp(rewriter, loc, collapsedOffset),
+          expandedBasis);
+      createdOps.push_back(delinearizeOp);
+      ValueRange offsets = delinearizeOp.getResults();
+      expandedOffsets.append(offsets.begin(), offsets.end());
 
-      // In other general case, the slice can be represented as a contiguous
-      // slice only if there is a single dimension in the reassociation group
-      // that has a size not equal to 1.
-      int nonUnitSizeCount = 0;
-      for (int64_t expandedShapeIdx : reassocIndices) {
-        if (srcShape[expandedShapeIdx] != 1) {
-          nonUnitSizeCount++;
-          expandedSizes.push_back(collapsedSize);
-          expandedOffsets.push_back(collapsedOffset);
-          continue;
-        }
-
-        expandedSizes.push_back(rewriter.getIndexAttr(1));
-        expandedOffsets.push_back(rewriter.getIndexAttr(0));
-      }
-
-      if (nonUnitSizeCount != 1) {
-        return rewriter.notifyMatchFailure(
-            sliceOp, "unsupported: slice cannot be verified to be contiguous");
-      }
+      expandedSizes.append(reassocIndices.size(), rewriter.getIndexAttr(1));
+      expandedSizes.back() = collapsedSize;
       continue;
+      // }
+
+      // llvm::dbgs() << "case 1.2\n";
+      // // In other general case, the slice can be represented as a contiguous
+      // // slice only if there is a single dimension in the reassociation group
+      // // that has a size not equal to 1.
+      // for (int64_t expandedShapeIdx : reassocIndices) {
+      //   if (srcShape[expandedShapeIdx] != 1) {
+      //     expandedSizes.push_back(collapsedSize);
+      //     expandedOffsets.push_back(collapsedOffset);
+      //     continue;
+      //   }
+
+      //   expandedSizes.push_back(rewriter.getIndexAttr(1));
+      //   expandedOffsets.push_back(rewriter.getIndexAttr(0));
+      // }
+      // continue;
     }
+    llvm::dbgs() << "case 2\n";
 
     // CASE #2 = size and offset are static.
     // Verify that the slice can be represented as a contiguous slice of the
@@ -632,15 +773,6 @@ swapCollapseShapeWithSlice(RewriterBase &rewriter,
       if (currentCollapsedsize < expandedShapeSize)
         break;
 
-      // We need to make sure that the slice size can be set to the shape size
-      // and the offset to 0.
-      if ((currentCollapsedsize % expandedShapeSize) != 0 ||
-          (currentCollapsedOffset % expandedShapeSize) != 0) {
-        return rewriter.notifyMatchFailure(
-            sliceOp, "unsupported: cannot be extracted as a contiguous slice "
-                     "of the src of the collapse_shape");
-      }
-
       groupExpandedSizes.push_back(rewriter.getIndexAttr(expandedShapeSize));
       groupExpandedOffsets.push_back(rewriter.getIndexAttr(0));
 
@@ -652,14 +784,6 @@ swapCollapseShapeWithSlice(RewriterBase &rewriter,
     if (idx < reassocGroupSize) {
       int64_t expandedShapeSize = srcShape[reversedReassocIndices[idx]];
       int64_t offsetInDim = currentCollapsedOffset % expandedShapeSize;
-      // We need to make sure that the slice size in this dim + offset will
-      // not exceed the shape size.
-      if ((currentCollapsedsize + offsetInDim) >= expandedShapeSize) {
-        return rewriter.notifyMatchFailure(
-            sliceOp, "unsupported: slice cannot be extracted as a contiguous "
-                     "slice of the src of the collapse_shape");
-      }
-
       groupExpandedSizes.push_back(rewriter.getIndexAttr(currentCollapsedsize));
       groupExpandedOffsets.push_back(rewriter.getIndexAttr(offsetInDim));
 
@@ -688,8 +812,8 @@ swapCollapseShapeWithSlice(RewriterBase &rewriter,
   }
 
   Value newSliceOp = tensor::ExtractSliceOp::create(
-      rewriter, collapseShapeOp->getLoc(), collapseShapeOp.getSrc(),
-      expandedOffsets, expandedSizes, expandedStrides);
+      rewriter, loc, collapseShapeOp.getSrc(), expandedOffsets, expandedSizes,
+      expandedStrides);
   rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
       sliceOp, sliceOp.getResultType(), newSliceOp,
       collapseShapeOp.getReassociationIndices());
@@ -703,6 +827,12 @@ struct SwapCollapseShapeWithSlicePattern
     : public OpRewritePattern<tensor::ExtractSliceOp> {
   using Base::Base;
 
+  SwapCollapseShapeWithSlicePattern(MLIRContext *context,
+                                    DataFlowSolver *solver,
+                                    PatternBenefit benefit = 1)
+      : OpRewritePattern<tensor::ExtractSliceOp>(context, benefit),
+        solver(solver) {}
+
   LogicalResult matchAndRewrite(tensor::ExtractSliceOp sliceOp,
                                 PatternRewriter &rewriter) const override {
     auto collapseOp =
@@ -712,20 +842,34 @@ struct SwapCollapseShapeWithSlicePattern
           sliceOp,
           "tensor.extract_slice source not produced by tensor.collapse_shape");
     }
+    llvm::dbgs() << "sliceOp: " << sliceOp << "\n";
+    llvm::dbgs() << "collapseOp: " << collapseOp << "\n";
 
     if (!sliceOp.hasUnitStride()) {
       return rewriter.notifyMatchFailure(sliceOp,
                                          "unsupported: non-unit stride");
     }
 
-    return swapCollapseShapeWithSlice(rewriter, collapseOp, sliceOp);
+    return swapCollapseShapeWithSlice(rewriter, collapseOp, sliceOp, solver);
   }
+
+private:
+  DataFlowSolver *solver;
 };
 
 } // namespace
 
-void populateSwapExtractWithCollapsePattern(RewritePatternSet &patterns) {
-  patterns.add<SwapCollapseShapeWithSlicePattern>(patterns.getContext());
+// void populateSwapExtractWithCollapsePattern(RewritePatternSet &patterns) {
+//   auto solver = std::make_unique<DataFlowSolver>();
+//   solver->load<IREE::Util::IntegerDivisibilityAnalysis>();
+//   patterns.add<SwapCollapseShapeWithSlicePattern>(patterns.getContext(),
+//                                                   std::move(solver));
+// }
+
+void populateSwapExtractWithCollapsePattern(RewritePatternSet &patterns,
+                                            DataFlowSolver *solver) {
+  patterns.add<SwapCollapseShapeWithSlicePattern>(patterns.getContext(),
+                                                  solver);
 }
 
 } // namespace mlir::iree_compiler
