@@ -11,6 +11,7 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPUTileSwizzleUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUEnums.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Utils/Indexing.h"
 #include "llvm/ADT/STLExtras.h"
@@ -780,6 +781,32 @@ MMAAttr::buildUnderlyingOperations(OpBuilder &builder, Location loc,
   return failure();
 }
 
+/// Creates a transpose_load_index_hint wrapping a set of index values.
+/// The values are expected to be ordered with the innermost/fastest-varying
+/// dimension (column) last. Returns the original values if fewer than 2.
+static SmallVector<Value>
+createTransposeLoadIndexHint(OpBuilder &builder, Location loc,
+                              ValueRange values) {
+  // Need at least 2 dimensions for transpose load pattern
+  if (values.size() < 2) {
+    SmallVector<Value> results;
+    for (Value v : values) {
+      results.push_back(v);
+    }
+    return results;
+  }
+
+  // Create hint wrapping the values
+  auto hintOp = IREE::GPU::TransposeLoadIndexHintOp::create(
+      builder, loc, values);
+
+  SmallVector<Value> results;
+  for (Value v : hintOp.getResults()) {
+    results.push_back(v);
+  }
+  return results;
+}
+
 static LogicalResult populateCanonicalOffsetsSizesAndStrides(
     OpBuilder &builder, Location loc, Value laneId,
     ArrayRef<int64_t> permutation, MMASingleSubgroupLayout subgroupLayout,
@@ -817,6 +844,12 @@ static LogicalResult populateCanonicalOffsetsSizesAndStrides(
   auto splitLaneId = affine::AffineDelinearizeIndexOp::create(
       builder, loc, laneId, vtidBasis, /*hasOuterBound=*/false);
 
+  // Wrap delinearize results with transpose_load_index_hint.
+  // The delinearize results are already in the correct order
+  // (innermost/fastest-varying dimension is last).
+  SmallVector<Value> hintedSplitLaneId =
+      createTransposeLoadIndexHint(builder, loc, splitLaneId.getResults());
+
   // Each thread grabs `element` contiguous data, so the vtid needs to be
   // multiplied by `element` to get the next bunch of data.
   // vtid: virtual thread id
@@ -828,7 +861,7 @@ static LogicalResult populateCanonicalOffsetsSizesAndStrides(
   // worsen the generated code quality.
   for (auto [splitResultIdx, element] :
        llvm::zip_equal(dimToVtid, subgroupLayout.element)) {
-    Value vtid = splitLaneId.getResult(splitResultIdx);
+    Value vtid = hintedSplitLaneId[splitResultIdx];
     int64_t vtidLen = vtidBasis[splitResultIdx - 1];
     if (element != 1) {
       vtid = affine::AffineLinearizeIndexOp::create(
