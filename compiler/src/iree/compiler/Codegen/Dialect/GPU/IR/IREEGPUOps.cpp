@@ -313,4 +313,22 @@ LogicalResult CoalescedGatherDMAOp::verify() {
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// TransposeLoadIndexHintOp
+//===----------------------------------------------------------------------===//
+
+void TransposeLoadIndexHintOp::build(OpBuilder &builder, OperationState &result,
+                                     ValueRange indices) {
+  result.addOperands(indices);
+  result.addTypes(
+      llvm::map_range(indices, [](Value v) { return v.getType(); }));
+}
+
+LogicalResult TransposeLoadIndexHintOp::verify() {
+  if (getNumOperands() < 2) {
+    return emitOpError("requires at least 2 operands (row and column indices)");
+  }
+  return success();
+}
+
 } // namespace mlir::iree_compiler::IREE::GPU

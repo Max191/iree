@@ -197,3 +197,25 @@ func.func @coalesced_gather_dma_tensor_indices(%idx0: tensor<64xi32>, %source: t
 //       CHECK:   scf.forall
 //       CHECK:     scf.forall.in_parallel
 //       CHECK:       iree_gpu.coalesced_gather_dma %{{.+}}[%{{.+}}] into %{{.+}} lane(%{{.+}}) : tensor<4096xf32>, tensor<64xi32>, tensor<64xf32>, index -> tensor<64xf32>
+
+// -----
+
+func.func @transpose_load_index_hint_basic(%k: index, %m: index) -> (index, index) {
+  %hint:2 = iree_gpu.transpose_load_index_hint %k, %m : index, index
+  return %hint#0, %hint#1 : index, index
+}
+
+// CHECK-LABEL: @transpose_load_index_hint_basic
+// CHECK: %[[HINT:.+]]:2 = iree_gpu.transpose_load_index_hint %arg0, %arg1
+// CHECK: return %[[HINT]]#0, %[[HINT]]#1
+
+// -----
+
+func.func @transpose_load_index_hint_multiple_row_indices(%k0: index, %k1: index, %m: index) -> (index, index, index) {
+  %hint:3 = iree_gpu.transpose_load_index_hint %k0, %k1, %m : index, index, index
+  return %hint#0, %hint#1, %hint#2 : index, index, index
+}
+
+// CHECK-LABEL: @transpose_load_index_hint_multiple_row_indices
+// CHECK: %[[HINT:.+]]:3 = iree_gpu.transpose_load_index_hint %arg0, %arg1, %arg2
+// CHECK: return %[[HINT]]#0, %[[HINT]]#1, %[[HINT]]#2

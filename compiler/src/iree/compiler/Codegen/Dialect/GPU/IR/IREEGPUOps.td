@@ -374,4 +374,57 @@ def IREEGPU_CoalescedGatherDMAOp : Op<IREEGPU_Dialect, "coalesced_gather_dma", [
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// TransposeLoadIndexHintOp
+//===----------------------------------------------------------------------===//
+
+def IREEGPU_TransposeLoadIndexHintOp : Op<IREEGPU_Dialect, "transpose_load_index_hint", [
+    Pure,
+    SameVariadicOperandSize,
+    AllTypesMatch<["indices", "results"]>]> {
+  let summary = [{Compiler hint marking indices for potential transpose load optimization.}];
+  let description = [{
+    This operation is a pure pass-through that marks a set of indices as
+    potentially suitable for lowering to amdgpu.transpose_load instructions.
+    It takes N index operands and produces N index results, where each result
+    is semantically identical to its corresponding input.
+
+    The operation serves as a compiler hint that can guide later optimization
+    passes. Specifically, it indicates that:
+    - The last result represents the "column" index (contiguous dimension)
+      that is expected to increase monotonically by 1 within each group of
+      16 lanes in the subgroup
+    - All preceding results represent the "row" indices (dimensions being
+      transposed)
+
+    This hint is always safe to remove from the IR. If the transpose load
+    lowering pass determines that the requirements for transpose_load are not
+    met (e.g., wrong memory space, incompatible indexing pattern), the hint
+    is silently dropped and normal lowering proceeds.
+
+    Example usage:
+    ```mlir
+    %tid = gpu.thread_id x
+    %m_idx = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%m_base, %tid)
+    %hint:2 = iree_gpu.transpose_load_index_hint %k_base, %m_idx : index, index
+    %data = vector.transfer_read %src[%hint#0, %hint#1] : ...
+    ```
+
+    The operation provides no functional behavior and is purely for optimization.
+  }];
+
+  let arguments = (ins Variadic<Index>:$indices);
+  let results   = (outs Variadic<Index>:$results);
+
+  let assemblyFormat = [{
+    $indices attr-dict (`:` type($indices)^)?
+  }];
+
+  let builders = [
+    OpBuilder<(ins "ValueRange":$indices)>
+  ];
+
+  let hasVerifier = 1;
+}
+
 #endif // IREE_CODEGEN_DIALECT_IREEGPUOPS

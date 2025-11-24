@@ -189,3 +189,11 @@ func.func @vector_multi_mma_with_permutation_of_wrong_size(%lhs: vector<2x3x4xf1
   } : vector<2x3x4xf16>, vector<3x5x4xf16> into vector<2x5x4xf32>
   return %0 : vector<2x5x4xf32>
 }
+
+// -----
+
+func.func @transpose_load_index_hint_too_few_operands(%idx: index) {
+  // expected-error @+1 {{requires at least 2 operands (row and column indices)}}
+  %hint = iree_gpu.transpose_load_index_hint %idx : index
+  return
+}
