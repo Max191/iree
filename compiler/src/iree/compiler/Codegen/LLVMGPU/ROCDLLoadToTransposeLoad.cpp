@@ -456,8 +456,16 @@ static Value generateTransposeLoads(vector::TransferReadOp transferOp,
   for (int64_t i = 0; i < unrollCount; ++i) {
     SmallVector<Value> indices = computeTransposeLoadIndices(
         transferOp, analysis, i, rowGroupIdx, newColIdx, rewriter, loc);
-    auto transposeLoadOp = amdgpu::TransposeLoadOp::create(
-        rewriter, loc, intrinsicVecType, source, indices);
+    // HACK: Replace transpose_load with transfer_read to test scheduling
+    // difference. Produces incorrect results but shows what LLVM does with
+    // regular loads vs transpose_loads.
+    auto transposeLoadOp = vector::TransferReadOp::create(
+        rewriter, loc,
+        /*vectorType=*/intrinsicVecType,
+        /*source=*/source,
+        /*indices=*/indices,
+        /*padding=*/std::nullopt,
+        /*inBounds=*/SmallVector<bool>(1, true));
     results.push_back(transposeLoadOp.getResult());
   }
 
