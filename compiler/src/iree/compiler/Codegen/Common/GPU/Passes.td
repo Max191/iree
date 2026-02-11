@@ -287,9 +287,10 @@ def GPUReduceBankConflictsPass :
     InterfacePass<"iree-codegen-gpu-reduce-bank-conflicts", "mlir::FunctionOpInterface"> {
   let summary = "Pass to try to reduce the number of bank conflicts by padding memref.alloc ops.";
   let options = [
-    Option<"paddingBits", "padding-bits", "unsigned",
-            /*default=*/"128",
-            "Padding size (in bits) to introduce between rows.">
+    Option<"paddingBits", "padding-bits", "int",
+           /*default=*/"0",
+           "Fallback padding size in bits for allocs without explicit hints. "
+           "Set to 0 to only pad allocs with BankConflictPaddingHintOp hints.">,
   ];
 }
 
