@@ -111,3 +111,29 @@ func.func private @workgroup_scope_attr_linearize() attributes {
 }
 // CHECK-LABEL: func.func private @workgroup_scope_attr_linearize()
 // CHECK-SAME:    scope = #iree_codegen.workgroup_scope<linearize>
+
+// -----
+
+func.func @bank_conflict_padding_hint_tensor(%arg0: tensor<4x16xf16>) -> tensor<4x16xf16> {
+  %0 = iree_codegen.bank_conflict_padding_hint %arg0 [padding_bits = 32]
+      : tensor<4x16xf16>
+  return %0 : tensor<4x16xf16>
+}
+// CHECK-LABEL: func.func @bank_conflict_padding_hint_tensor(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: tensor<4x16xf16>
+// CHECK:         iree_codegen.bank_conflict_padding_hint %[[ARG0]][padding_bits = 32]
+// CHECK-SAME:      : tensor<4x16xf16>
+
+// -----
+
+func.func @bank_conflict_padding_hint_memref(
+    %arg0: memref<4x16xf16, #gpu.address_space<workgroup>>
+) -> memref<4x16xf16, #gpu.address_space<workgroup>> {
+  %0 = iree_codegen.bank_conflict_padding_hint %arg0 [padding_bits = 64]
+      : memref<4x16xf16, #gpu.address_space<workgroup>>
+  return %0 : memref<4x16xf16, #gpu.address_space<workgroup>>
+}
+// CHECK-LABEL: func.func @bank_conflict_padding_hint_memref(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: memref<4x16xf16, #gpu.address_space<workgroup>>
+// CHECK:         iree_codegen.bank_conflict_padding_hint %[[ARG0]][padding_bits = 64]
+// CHECK-SAME:      : memref<4x16xf16, #gpu.address_space<workgroup>>

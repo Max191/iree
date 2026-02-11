@@ -133,7 +133,8 @@ def IREECodegen_FusionBarrierOp :
 //===----------------------------------------------------------------------===//
 
 def IREECodegen_SwizzleHintOp : Op<IREECodegen_Dialect, "swizzle_hint", [
-    SameOperandsAndResultType, Pure]> {
+    SameOperandsAndResultType, Pure,
+    DeclareOpInterfaceMethods<IREECodegen_AllocationHintOpInterface>]> {
   let summary = [{Hint to swizzle accesses according to an access pattern.}];
   let description = [{
     Optimization hint to swizzle all accesses to the memref or tensor that this takes a
@@ -180,6 +181,53 @@ def IREECodegen_SwizzleHintOp : Op<IREECodegen_Dialect, "swizzle_hint", [
   let assemblyFormat = [{
     $operand `[` $swizzle attr-dict `]` `:` type($result)
   }];
+
+  let extraClassDeclaration = [{
+    /// Returns the hint attribute for bufferization interface.
+    Attribute getHintAttribute() { return getSwizzleAttr(); }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// BankConflictPaddingHintOp
+//===----------------------------------------------------------------------===//
+
+def IREECodegen_BankConflictPaddingHintOp : Op<IREECodegen_Dialect,
+    "bank_conflict_padding_hint", [
+    SameOperandsAndResultType, Pure,
+    DeclareOpInterfaceMethods<IREECodegen_AllocationHintOpInterface>]> {
+  let summary = [{Hint to apply bank conflict padding to a shared memory allocation.}];
+  let description = [{
+    Wraps a tensor or memref to indicate the desired bank conflict padding.
+    Consumed by GPUReduceBankConflicts which reads the padding amount and
+    applies it to the underlying allocation.
+
+    The hint is best-effort - if padding cannot be applied, the hint is
+    simply removed without effect.
+
+    Example:
+    ```
+    %hint = iree_codegen.bank_conflict_padding_hint %alloc
+            [padding_bits = 128] : memref<32x32xf32>
+    ```
+
+    When lowered, padding_bits / element_bits = 128 / 32 = 4 extra elements
+    are added to the innermost dimension of the allocation:
+    ```
+    %padded = memref.alloc() : memref<32x36xf32>  // 32 + 4
+    %view = memref.subview %padded[0, 0][32, 32][1, 1] : ... to memref<32x32xf32, strided<[36, 1]>>
+    // %view replaces all uses of %hint
+    ```
+  }];
+
+  let arguments = (ins AnyRankedTensorOrMemRef:$operand,
+                       I64Attr:$padding_bits);
+  let results = (outs AnyRankedTensorOrMemRef:$result);
+
+  let assemblyFormat = [{
+    $operand `[` `padding_bits` `=` $padding_bits `]` attr-dict `:` type($result)
+  }];
+
 }
 
 //===----------------------------------------------------------------------===//

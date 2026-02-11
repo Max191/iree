@@ -22,4 +22,8 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenInterfaces.h.inc"
 // clang-format on
 
+// clang-format off
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOpInterfaces.h.inc"
+// clang-format on
+
 #endif // IREE_COMPILER_CODEGEN_DIALECT_CODEGEN_IREECODEGENINTERFACES_H_
