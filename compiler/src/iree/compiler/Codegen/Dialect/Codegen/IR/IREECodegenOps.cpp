@@ -452,3 +452,10 @@ void WorkgroupCountHintOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, dynamicSizes,
         builder.getDenseI64ArrayAttr(staticSizes));
 }
+
+//===----------------------------------------------------------------------===//
+// AllocationHintOpInterface implementations
+//===----------------------------------------------------------------------===//
+
+OpOperand &SwizzleHintOp::getHintedOperand() { return getOperandMutable(); }
+
