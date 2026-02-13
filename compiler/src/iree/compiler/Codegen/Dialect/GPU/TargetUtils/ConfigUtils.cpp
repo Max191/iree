@@ -442,102 +442,6 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   return schedule;
 }
 
-struct ConvToIgemmInfo {
-  bool isBatchDimLast = false;
-  bool isSpatialDimLast = false;
-  linalg::ConvolutionDimensions convDims;
-  DenseMap<int64_t, AffineExpr> convToIgemmDimMap;
-  DenseMap<int64_t, int64_t> inputChannelDimToSize;
-};
-
-/// Helper function to get convolution padding sizes if possible.
-static std::optional<ArrayAttr> getPaddingConvSizes(
-    Builder &b, ArrayRef<int64_t> bounds, ArrayRef<int64_t> paddingSizes,
-    ArrayRef<int64_t> workgroupTileSizes, ArrayRef<int64_t> reductionTileSizes,
-    const std::optional<ConvToIgemmInfo> &convToIgemmInfo) {
-  if (!convToIgemmInfo.has_value()) {
-    return std::nullopt;
-  }
-
-  // Skip padding convolution for NCHW layout.
-  if (convToIgemmInfo->isSpatialDimLast) {
-    return std::nullopt;
-  }
-
-  DenseMap<int64_t, AffineExpr> convToIgemmMap =
-      convToIgemmInfo->convToIgemmDimMap;
-  DenseSet<int64_t> paddedIGEMMDims;
-  DenseMap<int64_t, SmallVector<int64_t>> paddedReductionConvDims;
-  linalg::ConvolutionDimensions convDims = convToIgemmInfo->convDims;
-  SetVector<int64_t> inputChannelDims(llvm::from_range, convDims.inputChannel);
-  SmallVector<int64_t> paddingConvSizes(convToIgemmMap.size(), 0);
-
-  // For batch-last layout (e.g., CHWN), only pad the batch dimension to avoid
-  // introducing pad op as the producer of collapse_shape op which may cause
-  // fusion problem.
-  if (convToIgemmInfo->isBatchDimLast) {
-    int64_t lastBatchDim = convDims.batch.back();
-    auto IGEMMDimExpr = cast<AffineDimExpr>(convToIgemmMap[lastBatchDim]);
-    unsigned IGEMMBatchPos = IGEMMDimExpr.getPosition();
-    if (paddingSizes[IGEMMBatchPos] &&
-        bounds[IGEMMBatchPos] % paddingSizes[IGEMMBatchPos] == 0) {
-      return std::nullopt;
-    }
-    paddingConvSizes[lastBatchDim] = paddingSizes[IGEMMBatchPos];
-    return b.getI64ArrayAttr(paddingConvSizes);
-  }
-
-  for (auto [convDim, IGEMMExpr] : convToIgemmMap) {
-    auto IGEMMDimExpr = cast<AffineDimExpr>(IGEMMExpr);
-    unsigned IGEMMPos = IGEMMDimExpr.getPosition();
-    if (reductionTileSizes[IGEMMPos] != 0) {
-      // For reduction dimensions, avoid setting padding on the convolution
-      // if the product of the corresponding conv sizes are already divisible
-      // by the padding size.
-      if (paddingSizes[IGEMMPos] &&
-          bounds[IGEMMPos] % paddingSizes[IGEMMPos] == 0) {
-        paddedIGEMMDims.insert(IGEMMPos);
-        continue;
-      }
-      // Only pad input channel dims. If we need to pad filter dims, then we
-      // would rather just do padding on the GEMM instead.
-      if (inputChannelDims.contains(convDim)) {
-        // Multiple input channel dims for a single IGEMMPos is not supported.
-        if (paddedIGEMMDims.contains(IGEMMPos)) {
-          return std::nullopt;
-        }
-        int64_t inputChannelSize =
-            convToIgemmInfo->inputChannelDimToSize.lookup(convDim);
-        bool isInputChannelSizeSmall =
-            (paddingSizes[IGEMMPos] / inputChannelSize > 2);
-        // If the input channel dimension is much smaller than the padding size,
-        // skip padding along that dimension while still padding the others.
-        if (isInputChannelSizeSmall) {
-          paddingConvSizes[convDim] = 0;
-        } else {
-          paddingConvSizes[convDim] = paddingSizes[IGEMMPos];
-        }
-        paddedIGEMMDims.insert(IGEMMPos);
-      }
-      continue;
-    }
-    // Multiple padded parallel dims mapping to the same IGEMM dim is not
-    // supported.
-    if (workgroupTileSizes[IGEMMPos] != 0 &&
-        paddedIGEMMDims.contains(IGEMMPos)) {
-      return std::nullopt;
-    }
-    paddingConvSizes[convDim] = paddingSizes[IGEMMPos];
-    paddedIGEMMDims.insert(IGEMMPos);
-  }
-
-  // Ensure that all dimensions have been padded.
-  if (paddedIGEMMDims.size() != paddingSizes.size()) {
-    return std::nullopt;
-  }
-  return b.getI64ArrayAttr(paddingConvSizes);
-}
-
 [[maybe_unused]] static FailureOr<int64_t> getRank(Value in) {
   if (auto type = dyn_cast<ShapedType>(in.getType())) {
     return type.getRank();
@@ -637,17 +541,112 @@ checkForDPSOperandComputeOpProducers(DestinationStyleOpInterface dpsOp) {
   return false;
 }
 
+struct ConvToIgemmInfo {
+  bool isBatchDimLast = false;
+  bool isSpatialDimLast = false;
+  linalg::ConvolutionDimensions convDims;
+  DenseMap<int64_t, AffineExpr> convToIgemmDimMap;
+  DenseMap<int64_t, int64_t> inputChannelDimToSize;
+};
+
+/// Helper function to get convolution padding sizes if possible.
+static std::optional<ArrayAttr> getPaddingConvSizes(
+    Builder &b, ArrayRef<int64_t> bounds, ArrayRef<int64_t> paddingSizes,
+    ArrayRef<int64_t> workgroupTileSizes, ArrayRef<int64_t> reductionTileSizes,
+    const std::optional<ConvToIgemmInfo> &convToIgemmInfo) {
+  if (!convToIgemmInfo.has_value()) {
+    return std::nullopt;
+  }
+
+  // Skip padding convolution for NCHW layout.
+  if (convToIgemmInfo->isSpatialDimLast) {
+    return std::nullopt;
+  }
+
+  DenseMap<int64_t, AffineExpr> convToIgemmMap =
+      convToIgemmInfo->convToIgemmDimMap;
+  DenseSet<int64_t> paddedIGEMMDims;
+  DenseMap<int64_t, SmallVector<int64_t>> paddedReductionConvDims;
+  linalg::ConvolutionDimensions convDims = convToIgemmInfo->convDims;
+  SetVector<int64_t> inputChannelDims(llvm::from_range, convDims.inputChannel);
+  SmallVector<int64_t> paddingConvSizes(convToIgemmMap.size(), 0);
+
+  // For batch-last layout (e.g., CHWN), only pad the batch dimension to avoid
+  // introducing pad op as the producer of collapse_shape op which may cause
+  // fusion problem.
+  if (convToIgemmInfo->isBatchDimLast) {
+    int64_t lastBatchDim = convDims.batch.back();
+    auto IGEMMDimExpr = cast<AffineDimExpr>(convToIgemmMap[lastBatchDim]);
+    unsigned IGEMMBatchPos = IGEMMDimExpr.getPosition();
+    if (paddingSizes[IGEMMBatchPos] &&
+        bounds[IGEMMBatchPos] % paddingSizes[IGEMMBatchPos] == 0) {
+      return std::nullopt;
+    }
+    paddingConvSizes[lastBatchDim] = paddingSizes[IGEMMBatchPos];
+    return b.getI64ArrayAttr(paddingConvSizes);
+  }
+
+  for (auto [convDim, IGEMMExpr] : convToIgemmMap) {
+    auto IGEMMDimExpr = cast<AffineDimExpr>(IGEMMExpr);
+    unsigned IGEMMPos = IGEMMDimExpr.getPosition();
+    if (reductionTileSizes[IGEMMPos] != 0) {
+      // For reduction dimensions, avoid setting padding on the convolution
+      // if the product of the corresponding conv sizes are already divisible
+      // by the padding size.
+      if (paddingSizes[IGEMMPos] &&
+          bounds[IGEMMPos] % paddingSizes[IGEMMPos] == 0) {
+        paddedIGEMMDims.insert(IGEMMPos);
+        continue;
+      }
+      // Only pad input channel dims. If we need to pad filter dims, then we
+      // would rather just do padding on the GEMM instead.
+      if (inputChannelDims.contains(convDim)) {
+        // Multiple input channel dims for a single IGEMMPos is not supported.
+        if (paddedIGEMMDims.contains(IGEMMPos)) {
+          return std::nullopt;
+        }
+        int64_t inputChannelSize =
+            convToIgemmInfo->inputChannelDimToSize.lookup(convDim);
+        bool isInputChannelSizeSmall =
+            (paddingSizes[IGEMMPos] / inputChannelSize > 2);
+        // If the input channel dimension is much smaller than the padding size,
+        // skip padding along that dimension while still padding the others.
+        if (isInputChannelSizeSmall) {
+          paddingConvSizes[convDim] = 0;
+        } else {
+          paddingConvSizes[convDim] = paddingSizes[IGEMMPos];
+        }
+        paddedIGEMMDims.insert(IGEMMPos);
+      }
+      continue;
+    }
+    // Multiple padded parallel dims mapping to the same IGEMM dim is not
+    // supported.
+    if (workgroupTileSizes[IGEMMPos] != 0 &&
+        paddedIGEMMDims.contains(IGEMMPos)) {
+      return std::nullopt;
+    }
+    paddingConvSizes[convDim] = paddingSizes[IGEMMPos];
+    paddedIGEMMDims.insert(IGEMMPos);
+  }
+
+  // Ensure that all dimensions have been padded.
+  if (paddedIGEMMDims.size() != paddingSizes.size()) {
+    return std::nullopt;
+  }
+  return b.getI64ArrayAttr(paddingConvSizes);
+}
+
 /// Create a lowering config for matmul or IGEMM convolution based on iteration
 /// bounds and indexing maps for a given target. This function computes
 /// contraction dimensions and deduces an MMA intrinsic schedule to choose tile
-/// sizes and the workgroup size. The optional argument `padConvDims` is used to
-/// determine the convolution dimensions for padding when creating
+/// sizes and the workgroup size. The optional argument `convToIgemmInfo` is used
+/// to pass convolution-to-IGEMM dimension mapping information for computing
 /// `padding_conv` config. `padding_conv` attribute is only used when padding
-/// convolutions before converting them to IGEMM.
-/// `hasExistingAccumulator` indicates whether the accumulator is read from
-/// global memory (matmul_accumulate) vs zero-initialized in registers. When
-/// true, the accumulator needs shared memory, similar to when padding requires
-/// C promotion.
+/// convolutions before IGEMM. `hasExistingAccumulator` indicates whether the
+/// accumulator is read from global memory (matmul_accumulate) vs
+/// zero-initialized in registers. When true, the accumulator needs shared
+/// memory, similar to when padding requires C promotion.
 static FailureOr<std::pair<LoweringConfigAttr, int64_t>>
 getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     ArrayRef<int64_t> bounds, ArrayRef<AffineMap> maps,
@@ -989,7 +988,7 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     attrs.emplace_back("padding", b.getI64ArrayAttr(paddingTileSizes));
 
     // Create `padding_conv` attribute when padding convolutions before IGEMM
-    // is possible.
+    // transform.
     if (auto attr =
             getPaddingConvSizes(b, bounds, paddingTileSizes, workgroupTileSizes,
                                 reductionTileSizes, convToIgemmInfo)) {
@@ -1086,7 +1085,8 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
           useDirectLoad, /*isGemm=*/false,
           /*scaled=*/false, splitReductionTripCnt,
           /*cPromoteIfPadding=*/cPromoteIfPadding, hasExistingAccumulator,
-          convToIgemmInfo);
+          padConv ? std::optional<ConvToIgemmInfo>(convToIgemmInfo)
+                  : std::nullopt);
   if (failed(configAndWgSize)) {
     return failure();
   }
