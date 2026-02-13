@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Interfaces/BufferizationInterfaces.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 
 namespace mlir::bufferization {
@@ -201,7 +202,8 @@ void populateFoldExtractSliceOfBroadcastPattern(RewritePatternSet &patterns);
 
 /// Populate pattern to convert `tensor.extract_slice(tensor.collapse_shape)` to
 /// `tensor.collapse_shape(tensor.extract_slice)`.
-void populateSwapExtractWithCollapsePattern(RewritePatternSet &patterns);
+void populateSwapExtractWithCollapsePattern(
+    RewritePatternSet &patterns, DataFlowSolver *solver = nullptr);
 
 /// Populate patterns to fold relayout operations into map_scatter ops. If a
 /// `padDistributionConfigFn` is passed, then the tensor.pad folding pattern
