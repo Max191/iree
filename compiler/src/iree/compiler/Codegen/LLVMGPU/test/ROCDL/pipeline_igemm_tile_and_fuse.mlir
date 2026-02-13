@@ -156,8 +156,8 @@ hal.executable private @main {
 // CHECK-COUNT-1:       amdgpu.mfma 16x16x16
 //          CHECK:     %[[LOOP_T:.+]] = vector.shape_cast %[[LOOP]]
 //          CHECK:     vector.transfer_write %[[LOOP_T]]
-// Note there is a writeback loop here that is skipped to simplify the test.
-//          CHECK:        memref.copy {{.*}}#gpu.address_space<workgroup>> to {{.*}}#amdgpu.address_space<fat_raw_buffer>
+// Note the writeback is vectorized (copies are vectorized for iGEMM).
+//          CHECK:        vector.transfer_write {{.*}}#amdgpu.address_space<fat_raw_buffer>
 //          CHECK:   } {mapping = [#iree_codegen.workgroup_mapping<z>, #iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
 
 // -----
