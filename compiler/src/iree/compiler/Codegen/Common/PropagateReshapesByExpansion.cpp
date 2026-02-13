@@ -10,6 +10,9 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/Util/Analysis/IntegerDivisibilityAnalysis.h"
+#include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
+#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -393,6 +396,33 @@ struct SwapInnerBitcastWithExtractSlice
   }
 };
 
+/// Listener that invalidates DataFlowSolver state when ops are erased or
+/// modified during greedy pattern rewriting. This prevents the solver from
+/// returning stale analysis results for ops that no longer exist or have
+/// changed. Follows the canonical pattern from arith::IntRangeOptimizations
+/// and IREE's OptimizeIntArithmetic.
+class DataFlowListener : public RewriterBase::Listener {
+public:
+  DataFlowListener(DataFlowSolver &s) : s(s) {}
+
+protected:
+  void notifyOperationErased(Operation *op) override {
+    s.eraseState(s.getProgramPointAfter(op));
+    for (Value res : op->getResults()) {
+      s.eraseState(res);
+    }
+  }
+
+  void notifyOperationModified(Operation *op) override {
+    s.eraseState(s.getProgramPointAfter(op));
+    for (Value res : op->getResults()) {
+      s.eraseState(res);
+    }
+  }
+
+  DataFlowSolver &s;
+};
+
 struct PropagateReshapesByExpansionPass final
     : impl::PropagateReshapesByExpansionPassBase<
           PropagateReshapesByExpansionPass> {
@@ -437,6 +467,18 @@ void PropagateReshapesByExpansionPass::runOnOperation() {
                                               context);
   tensor::CollapseShapeOp::getCanonicalizationPatterns(
       bubbleExpandShapePatterns, context);
+  // Run divisibility analysis so that the swap pattern can handle
+  // dynamic offsets/sizes that are provably aligned.
+  DataFlowSolver solver;
+  solver.load<IREE::Util::IntegerDivisibilityAnalysis>();
+  solver.load<dataflow::SparseConstantPropagation>();
+  solver.load<dataflow::DeadCodeAnalysis>();
+  DataFlowSolver *solverPtr = nullptr;
+  if (succeeded(solver.initializeAndRun(getOperation()))) {
+    solverPtr = &solver;
+  }
+  populateSwapExtractWithCollapsePattern(bubbleExpandShapePatterns,
+                                         solverPtr);
   tensor::EmptyOp::getCanonicalizationPatterns(bubbleExpandShapePatterns,
                                                context);
   tensor::ExpandShapeOp::getCanonicalizationPatterns(bubbleExpandShapePatterns,
@@ -447,8 +489,17 @@ void PropagateReshapesByExpansionPass::runOnOperation() {
       .add<ExpandDestinationForallOp, SwapInnerBitcastWithExtractSlice>(
           context);
 
+  // Attach a listener to invalidate solver state as the greedy driver
+  // erases or modifies ops, preventing stale divisibility lookups.
+  GreedyRewriteConfig config;
+  DataFlowListener listener(solver);
+  if (solverPtr) {
+    config.setListener(&listener);
+  }
+
   if (failed(applyPatternsGreedily(getOperation(),
-                                   std::move(bubbleExpandShapePatterns)))) {
+                                   std::move(bubbleExpandShapePatterns),
+                                   config))) {
     getOperation()->emitOpError("Failed to propagate reshapes");
     return signalPassFailure();
   }
