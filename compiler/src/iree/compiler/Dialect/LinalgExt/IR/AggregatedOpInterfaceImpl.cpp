@@ -632,6 +632,22 @@ chooseDimToVectorize(OpBuilder &b, Location loc, Im2colOp im2colOp,
                      SmallVector<Range> iterationDomain,
                      SmallVector<OpFoldResult> inputSizes,
                      OpFoldResult kOffset) {
+  // Check vectorization hint first. The hint is computed during the
+  // DecomposeIm2col pass with more powerful divisibility analysis (using
+  // DataFlowSolver), so we trust it when available.
+  std::optional<ArrayRef<int64_t>> vectorizationHint =
+      im2colOp.getVectorizationHint();
+  if (vectorizationHint.has_value() && !vectorizationHint->empty()) {
+    // The hint may contain unit-extent dims (always size 1) and a contiguous
+    // vectorizable dim. Skip unit-extent dims since vectorizing them is a
+    // no-op that can change transpose/permutation behavior.
+    for (int64_t dim : llvm::reverse(*vectorizationHint)) {
+      if (!isConstantIntValue(iterationDomain[dim].size, 1)) {
+        return dim;
+      }
+    }
+    // All hint dims are unit-extent; fall through to normal analysis.
+  }
   int64_t innerInputDim = im2colOp.getInputRank() - 1;
   SmallVector<SmallVector<int64_t>> vectorizationMap =
       im2colOp.getInputToOutputDimVectorizationMap();
@@ -755,12 +771,12 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   SmallVector<Range> iterationDomain(getIterationDomain(b));
   SmallVector<OpFoldResult> inputSizes =
       tensor::getMixedSizes(b, loc, getInput());
-  std::optional<unsigned> maybeOutputDimToVectorize =
+  std::optional<int64_t> maybeOutputDimToVectorize =
       chooseDimToVectorize(b, loc, *this, iterationDomain, inputSizes, kOffset);
 
   OpFoldResult innerInputTileSize;
   if (maybeOutputDimToVectorize.has_value()) {
-    unsigned outputDimToVectorize = maybeOutputDimToVectorize.value();
+    int64_t outputDimToVectorize = maybeOutputDimToVectorize.value();
     innerInputTileSize = iterationDomain[outputDimToVectorize].size;
     iterationDomain.erase(iterationDomain.begin() + outputDimToVectorize);
   } else {
@@ -916,10 +932,8 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   sliceSizes.back() = innerInputTileSize;
 
   // Set the batch and K offsets for the input tensor.
-  if (!getKPos().empty()) {
-    const int64_t kPos = getKPos().front();
-    sliceOffsets[kPos] = inputKOffset.front();
-  }
+  const int64_t kPos = getKPos().front();
+  sliceOffsets[kPos] = inputKOffset.front();
   SmallVector<int64_t> inverseOutputPerm =
       invertPermutationVector(getOutputPerm());
   for (auto [ivIdx, bPos] : llvm::enumerate(getBatchPos())) {
