@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/TilingInterface.h"
 
 #define DEBUG_TYPE "iree-codegen-promotion-utils"
@@ -220,6 +221,77 @@ Value cacheSwizzlePromotionImpl(OpBuilder &builder, OpOperand &operand,
   bufferCastOperand->assign(resourceCast);
 
   return promotedValue;
+}
+
+/// Helper to create a tensor.empty + BankConflictPaddingHintOp for a given
+/// tensor value. Returns the result of the hint op.
+static Value createEmptyWithPaddingHint(OpBuilder &builder, Location loc,
+                                        Value v, int64_t paddingBits) {
+  auto tensorType = cast<RankedTensorType>(v.getType());
+  SmallVector<OpFoldResult> mixedSizes = tensor::getMixedSizes(builder, loc, v);
+  Value empty = tensor::EmptyOp::create(builder, loc, mixedSizes,
+                                        tensorType.getElementType());
+  return IREE::GPU::BankConflictPaddingHintOp::create(
+      builder, loc, tensorType, empty,
+      builder.getI64IntegerAttr(paddingBits));
+}
+
+/// Promotion implementation that places a BankConflictPaddingHintOp on the
+/// DPS init of the promoted operation. This hint is later consumed by
+/// GPUReduceBankConflicts which applies the specified padding to the
+/// underlying shared memory allocation.
+///
+/// For DPS producers (Im2colOp, LinalgOp), a new empty tensor + hint is
+/// created and set as the DPS init. For other cases, a linalg.copy is
+/// created with the hinted empty tensor as its DPS init.
+Value bankConflictPaddingPromotionImpl(OpBuilder &builder, OpOperand &operand,
+                                       Attribute copyConfig,
+                                       int64_t paddingBits) {
+  if (auto producer = operand.get().getDefiningOp<TilingInterface>()) {
+    // Skip promotion of fills.
+    if (isa<linalg::FillOp>(producer)) {
+      return operand.get();
+    }
+    if (auto generic = dyn_cast<linalg::GenericOp>(&*producer)) {
+      if (linalg::isaFillOpInterface(generic)) {
+        return operand.get();
+      }
+    }
+
+    // For DPS producers (Im2colOp, LinalgOp), set the lowering config and
+    // create a new empty tensor + hint as the DPS init.
+    if (isa<linalg::LinalgOp, IREE::LinalgExt::Im2colOp>(
+            producer.getOperation())) {
+      setLoweringConfig(producer, copyConfig);
+      auto dpsOp = cast<DestinationStyleOpInterface>(producer.getOperation());
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(producer);
+      Location loc = operand.getOwner()->getLoc();
+      for (OpOperand &initOperand : dpsOp.getDpsInitsMutable()) {
+        if (!isa<RankedTensorType>(initOperand.get().getType())) {
+          continue;
+        }
+        Value hinted =
+            createEmptyWithPaddingHint(builder, loc, initOperand.get(),
+                                       paddingBits);
+        initOperand.set(hinted);
+      }
+      return operand.get();
+    }
+  }
+
+  auto tensorType = dyn_cast<RankedTensorType>(operand.get().getType());
+  if (!tensorType) {
+    return operand.get();
+  }
+
+  // External producer: create a copy with the hinted empty as DPS init.
+  Location loc = operand.getOwner()->getLoc();
+  Value hinted = createEmptyWithPaddingHint(builder, loc, operand.get(),
+                                            paddingBits);
+  auto copy = linalg::CopyOp::create(builder, loc, operand.get(), hinted);
+  setLoweringConfig(copy, copyConfig);
+  return copy.getResult(0);
 }
 
 } // namespace mlir::iree_compiler::IREE::GPU

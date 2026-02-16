@@ -306,6 +306,13 @@ Value swizzlePromotionImpl(OpBuilder &builder, OpOperand &operand,
                            Attribute attr,
                            Codegen::SwizzleAttrInterface swizzle);
 
+/// Promotes an operand by placing a BankConflictPaddingHintOp on the DPS
+/// init, later consumed by GPUReduceBankConflicts to pad the shared memory
+/// allocation.
+Value bankConflictPaddingPromotionImpl(OpBuilder &builder, OpOperand &operand,
+                                       Attribute copyConfig,
+                                       int64_t paddingBits);
+
 } // namespace mlir::iree_compiler::IREE::GPU
 
 // clang-format off

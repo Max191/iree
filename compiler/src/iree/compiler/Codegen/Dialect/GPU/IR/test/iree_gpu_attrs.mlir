@@ -234,3 +234,21 @@ module {
 }
 // CHECK-LABEL: func @test_swizzle_hint_promotion
 //  CHECK-SAME:   promotion_types = [#iree_gpu.swizzle_operand<copy_config = #iree_gpu.derived_thread_config, swizzle = #iree_codegen.xor_shuffle<256, 32>>]
+
+module {
+  func.func @test_bank_conflict_padding_promotion() attributes {
+      promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 32, copy_config = #iree_gpu.derived_thread_config>]} {
+    return
+  }
+}
+// CHECK-LABEL: func @test_bank_conflict_padding_promotion
+//  CHECK-SAME:   promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 32, copy_config = #iree_gpu.derived_thread_config>]
+
+module {
+  func.func @test_bank_conflict_padding_promotion_64bit() attributes {
+      promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.use_global_load_dma>]} {
+    return
+  }
+}
+// CHECK-LABEL: func @test_bank_conflict_padding_promotion_64bit
+//  CHECK-SAME:   promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.use_global_load_dma>]

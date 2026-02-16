@@ -176,6 +176,49 @@ def IREEGPU_SwizzleOperand :
   );
 }
 
+def IREEGPU_PromoteWithBankConflictPadding :
+    AttrDef<IREEGPU_Dialect, "PromoteWithBankConflictPadding", [
+      DeclareAttrInterfaceMethods<IREEGPU_PromotionAttr, [
+        "promoteOperand",
+      ]>
+    ]> {
+  let mnemonic = "promote_with_bank_conflict_padding";
+  let summary = [{
+    Indicate promotion of an operand with bank conflict padding hint.
+  }];
+  let description = [{
+    When promoting, this will create a `tensor.empty`, wrap it with a
+    `iree_gpu.bank_conflict_padding_hint` to indicate the desired padding
+    for bank conflict avoidance, and then create a `linalg.copy` into the
+    hinted allocation. For example,
+
+    ```
+    %0 = tensor_ext.dispatch.tensor.load : tensor<?x16xf16>
+    %1 = linalg.matmul ins(%0, ...)
+    ```
+
+    Becomes with `#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 32, copy_config = #iree_gpu.derived_thread_config>`
+
+    ```
+    %0 = tensor_ext.dispatch.tensor.load : tensor<?x16xf16>
+    %empty = tensor.empty() : tensor<?x16xf16>
+    %padded = iree_gpu.bank_conflict_padding_hint %empty [padding_bits = 32]
+    %copy = linalg.copy %0 to %padded {lowering_config = #iree_gpu.derived_thread_config}
+    %1 = linalg.matmul ins(%copy, ...)
+    ```
+
+    The hint is placed on the DPS init (empty tensor) so that it propagates
+    through bufferization to the underlying shared memory allocation. It is
+    later consumed by GPUReduceBankConflicts which applies the specified
+    padding.
+  }];
+  let assemblyFormat = "`<` struct(params) `>`";
+  let parameters = (ins
+    "int64_t":$padding_bits,
+    "Attribute":$copy_config
+  );
+}
+
 //===----------------------------------------------------------------------===//
 // GPU Workgroup Processor (WGP) Level Feature/Limit Attributes
 //===----------------------------------------------------------------------===//

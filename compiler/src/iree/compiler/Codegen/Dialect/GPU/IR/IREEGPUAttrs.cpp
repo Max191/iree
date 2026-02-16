@@ -2454,6 +2454,16 @@ Value SwizzleOperandAttr::promoteOperand(mlir::OpBuilder &builder,
 }
 
 //===----------------------------------------------------------------------===//
+// PromoteWithBankConflictPaddingAttr
+//===----------------------------------------------------------------------===//
+
+Value PromoteWithBankConflictPaddingAttr::promoteOperand(
+    mlir::OpBuilder &builder, mlir::OpOperand &operand) const {
+  return bankConflictPaddingPromotionImpl(builder, operand, getCopyConfig(),
+                                          getPaddingBits());
+}
+
+//===----------------------------------------------------------------------===//
 // LaneIdAttr
 //===----------------------------------------------------------------------===//
 

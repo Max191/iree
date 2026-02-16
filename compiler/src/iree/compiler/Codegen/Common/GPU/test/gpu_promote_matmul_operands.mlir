@@ -392,3 +392,98 @@ func.func @swizzle_operand_no_promote_fill(%b: tensor<128x128xf32>) -> tensor<4x
 //   CHECK-NOT:   tensor.expand_shape
 //       CHECK:   linalg.matmul
 //       CHECK: return
+
+// -----
+
+// Test bank conflict padding promotion - operand 0 gets 32-bit padding, operand 1 gets 64-bit padding.
+
+#lowering_config_padding = #iree_gpu.lowering_config<{
+  promote_operands = [0, 1],
+  promotion_types = [
+    #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 32, copy_config = #iree_gpu.derived_thread_config>,
+    #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
+
+func.func @promote_with_bank_conflict_padding(%a: tensor<32x1024xf16>, %b: tensor<1024x128xf16>) -> tensor<32x128xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<32x128xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<32x128xf32>) -> tensor<32x128xf32>
+  %mm = linalg.matmul {lowering_config = #lowering_config_padding}
+    ins(%a, %b : tensor<32x1024xf16>, tensor<1024x128xf16>) outs(%fill : tensor<32x128xf32>) -> tensor<32x128xf32>
+  return %mm : tensor<32x128xf32>
+}
+
+// CHECK-LABEL: func.func @promote_with_bank_conflict_padding
+//  CHECK-SAME:   %[[A:[A-Za-z0-9]+]]: tensor<32x1024xf16>
+//  CHECK-SAME:   %[[B:[A-Za-z0-9]+]]: tensor<1024x128xf16>
+//       CHECK:   %[[EMPTY_A:.+]] = tensor.empty() : tensor<32x1024xf16>
+//       CHECK:   %[[HINT_A:.+]] = iree_gpu.bank_conflict_padding_hint %[[EMPTY_A]][padding_bits = 32]
+//       CHECK:   %[[COPY_A:.+]] = linalg.copy
+//  CHECK-SAME:     lowering_config = #iree_gpu.derived_thread_config
+//  CHECK-SAME:     ins(%[[A]] : tensor<32x1024xf16>) outs(%[[HINT_A]]
+//       CHECK:   %[[EMPTY_B:.+]] = tensor.empty() : tensor<1024x128xf16>
+//       CHECK:   %[[HINT_B:.+]] = iree_gpu.bank_conflict_padding_hint %[[EMPTY_B]][padding_bits = 64]
+//       CHECK:   %[[COPY_B:.+]] = linalg.copy
+//  CHECK-SAME:     lowering_config = #iree_gpu.derived_thread_config
+//  CHECK-SAME:     ins(%[[B]] : tensor<1024x128xf16>) outs(%[[HINT_B]]
+//       CHECK:   linalg.matmul {{.*}} ins(%[[COPY_A]], %[[COPY_B]] : tensor<32x1024xf16>, tensor<1024x128xf16>)
+
+// -----
+
+// Test bank conflict padding with im2col (DPS producer). The im2col op gets
+// the lowering config and its DPS init gets the padding hint.
+
+#lowering_config_padding_im2col = #iree_gpu.lowering_config<{
+  promote_operands = [0, 1],
+  promotion_types = [
+    #iree_gpu.promote_with_bank_conflict_padding<
+      padding_bits = 64,
+      copy_config = #iree_gpu.derived_thread_config>,
+    #iree_gpu.promote_with_bank_conflict_padding<
+      padding_bits = 64,
+      copy_config = #iree_gpu.derived_thread_config>]}>
+
+func.func @promote_im2col_with_bank_conflict_padding(
+    %a: tensor<2x34x34x128xf32>,
+    %b: tensor<2x8x256xf32>) -> tensor<2x128x256xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<2x128x256xf32>
+  %im2col_empty = tensor.empty() : tensor<2x128x8xf32>
+
+  %im2col = iree_linalg_ext.im2col
+    strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+    m_offset = [0] * [1] k_offset = [0] * [1]
+    batch_pos = [0] m_pos = [2, 3] k_pos = [1]
+    input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+    ins(%a : tensor<2x34x34x128xf32>)
+    outs(%im2col_empty : tensor<2x128x8xf32>) -> tensor<2x128x8xf32>
+
+  %fill = linalg.fill ins(%cst : f32)
+    outs(%empty : tensor<2x128x256xf32>) -> tensor<2x128x256xf32>
+  %mm = linalg.batch_matmul {
+    lowering_config = #lowering_config_padding_im2col}
+    ins(%im2col, %b : tensor<2x128x8xf32>, tensor<2x8x256xf32>)
+    outs(%fill : tensor<2x128x256xf32>) -> tensor<2x128x256xf32>
+  return %mm : tensor<2x128x256xf32>
+}
+
+// Im2col is a DPS producer: it gets the lowering config and its init gets
+// the padding hint. Operand 1 gets a copy with padding hint.
+// CHECK-LABEL: func.func @promote_im2col_with_bank_conflict_padding
+//  CHECK-SAME:   %[[A:[A-Za-z0-9]+]]: tensor<2x34x34x128xf32>
+//  CHECK-SAME:   %[[B:[A-Za-z0-9]+]]: tensor<2x8x256xf32>
+//       CHECK:   %[[IM2COL_EMPTY:.+]] = tensor.empty() : tensor<2x128x8xf32>
+//       CHECK:   %[[HINT_IM2COL:.+]] = iree_gpu.bank_conflict_padding_hint
+//  CHECK-SAME:     %[[IM2COL_EMPTY]][padding_bits = 64]
+//       CHECK:   %[[IM2COL:.+]] = iree_linalg_ext.im2col
+//  CHECK-SAME:     lowering_config = #iree_gpu.derived_thread_config
+//  CHECK-SAME:     ins(%[[A]]
+//  CHECK-SAME:     outs(%[[HINT_IM2COL]]
+//       CHECK:   %[[EMPTY_B:.+]] = tensor.empty() : tensor<2x8x256xf32>
+//       CHECK:   %[[HINT_B:.+]] = iree_gpu.bank_conflict_padding_hint
+//  CHECK-SAME:     %[[EMPTY_B]][padding_bits = 64]
+//       CHECK:   %[[COPY_B:.+]] = linalg.copy
+//  CHECK-SAME:     lowering_config = #iree_gpu.derived_thread_config
+//  CHECK-SAME:     ins(%[[B]] : tensor<2x8x256xf32>)
+//  CHECK-SAME:     outs(%[[HINT_B]]
+//       CHECK:   linalg.batch_matmul
+//  CHECK-SAME:     ins(%[[IM2COL]], %[[COPY_B]]
