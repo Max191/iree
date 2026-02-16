@@ -73,7 +73,8 @@ static bool isFullAllocationView(Value memref) {
       foundAlloc = true;
       continue;
     }
-    if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp>(op)) {
+    if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp,
+            IREE::Codegen::AllocationHintOpInterface>(op)) {
       continue;
     }
     return false;
