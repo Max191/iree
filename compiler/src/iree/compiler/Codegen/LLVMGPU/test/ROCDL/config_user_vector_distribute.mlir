@@ -14,9 +14,10 @@
 
 // OPT-IN:       #[[$TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute workgroup_size = [128, 2, 1] subgroup_size = 64
 // OPT-IN-SAME:    gpu_pipeline_options = #iree_gpu.pipeline_options<no_reduce_shared_memory_bank_conflicts = true>
-#config = #iree_gpu.lowering_config<{workgroup = [128, 128, 0], reduction = [0, 0, 32], promote_operands = [0, 1],
-                                    mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-                                    subgroup_basis = [[2, 2, 1], [0, 1, 2]]}>
+#config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>, promote_operands = [0, 1],
+                                    promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>],
+                                    reduction = [0, 0, 32],
+                                    subgroup_basis = [[2, 2, 1], [0, 1, 2]], workgroup = [128, 128, 0]}>
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   #hal.pipeline.binding<storage_buffer>,
   #hal.pipeline.binding<storage_buffer>,
@@ -86,9 +87,10 @@ hal.executable public @main_0_dispatch_0 {
 
 // OPT-IN:       #[[$TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute workgroup_size = [128, 2, 1] subgroup_size = 64
 // OPT-IN-SAME:    gpu_pipeline_options = #iree_gpu.pipeline_options<reorder_workgroups_strategy = <Transpose>>
-#config = #iree_gpu.lowering_config<{workgroup = [128, 128, 0], reduction = [0, 0, 32], promote_operands = [0, 1],
-                                    mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-                                    subgroup_basis = [[2, 2, 1], [0, 1, 2]]}>
+#config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>, promote_operands = [0, 1],
+                                    promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>],
+                                    reduction = [0, 0, 32],
+                                    subgroup_basis = [[2, 2, 1], [0, 1, 2]], workgroup = [128, 128, 0]}>
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   #hal.pipeline.binding<storage_buffer>,
   #hal.pipeline.binding<storage_buffer>,
@@ -102,15 +104,15 @@ hal.executable public @main_0_dispatch_0 {
     }
     builtin.module {
       // OPT-OUT-LABEL: func.func @main_0_dispatch_0_matmul_transpose_b
-      // OPT-OUT:         memref.alloc() : memref<128x36xf16, #gpu.address_space<workgroup>>
-      // OPT-OUT:         memref.alloc() : memref<128x36xf16, #gpu.address_space<workgroup>>
+      // OPT-OUT:         memref.alloc() : memref<128x32xf16, #gpu.address_space<workgroup>>
+      // OPT-OUT:         memref.alloc() : memref<128x32xf16, #gpu.address_space<workgroup>>
       // OPT-OUT:         scf.forall
       // OPT-OUT:          scf.for
       // OPT-OUT:         } {mapping = [#iree_codegen.workgroup_mapping<x>, #iree_codegen.workgroup_mapping<y>]}
 
       // OPT-IN-LABEL: func.func @main_0_dispatch_0_matmul_transpose_b
-      // OPT-IN:         memref.alloc() : memref<128x36xf16, #gpu.address_space<workgroup>>
-      // OPT-IN:         memref.alloc() : memref<128x36xf16, #gpu.address_space<workgroup>>
+      // OPT-IN:         memref.alloc() : memref<128x32xf16, #gpu.address_space<workgroup>>
+      // OPT-IN:         memref.alloc() : memref<128x32xf16, #gpu.address_space<workgroup>>
       // OPT-IN:         scf.forall
       // OPT-IN:          scf.for
       // OPT-IN:         } {mapping = [#iree_codegen.workgroup_mapping<x>, #iree_codegen.workgroup_mapping<y>]}
@@ -153,9 +155,10 @@ hal.executable public @main_0_dispatch_0 {
 
 // OPT-OUT:       #[[$TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute workgroup_size = [128, 2, 1] subgroup_size = 64
 // OPT-OUT-SAME:    gpu_pipeline_options = #iree_gpu.pipeline_options<reorder_workgroups_strategy = <None>>
-#config = #iree_gpu.lowering_config<{workgroup = [128, 128, 0], reduction = [0, 0, 32], promote_operands = [0, 1],
-                                    mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-                                    subgroup_basis = [[2, 2, 1], [0, 1, 2]]}>
+#config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>, promote_operands = [0, 1],
+                                    promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>],
+                                    reduction = [0, 0, 32],
+                                    subgroup_basis = [[2, 2, 1], [0, 1, 2]], workgroup = [128, 128, 0]}>
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   #hal.pipeline.binding<storage_buffer>,
   #hal.pipeline.binding<storage_buffer>,
@@ -169,8 +172,8 @@ hal.executable public @main_0_dispatch_0 {
     }
     builtin.module {
       // OPT-OUT-LABEL: func.func @main_0_dispatch_0_matmul_transpose_b
-      // OPT-OUT:         memref.alloc() : memref<128x36xf16, #gpu.address_space<workgroup>>
-      // OPT-OUT:         memref.alloc() : memref<128x36xf16, #gpu.address_space<workgroup>>
+      // OPT-OUT:         memref.alloc() : memref<128x32xf16, #gpu.address_space<workgroup>>
+      // OPT-OUT:         memref.alloc() : memref<128x32xf16, #gpu.address_space<workgroup>>
       // OPT-OUT:         scf.forall
       // OPT-OUT:          scf.for
       // OPT-OUT:         } {mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}

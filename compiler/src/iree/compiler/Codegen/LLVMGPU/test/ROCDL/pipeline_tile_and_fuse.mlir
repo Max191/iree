@@ -10,7 +10,8 @@
   workgroup = [64, 64, 0],
   reduction = [0, 0, 4],
   thread = [8, 4],
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable public @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -88,7 +89,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [2, 2],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable public @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -166,7 +168,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [2, 2],
   mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable public @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -244,7 +247,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [2, 2],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 !eltype = f32
@@ -305,7 +309,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [2, 2],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F8E4M3FNUZ>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 !eltype = f8E4M3FNUZ
@@ -366,7 +371,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [1, 1],
   mma_kind = #iree_gpu.mma_layout<MFMA_I32_32x32x16_I8>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 !eltype = i8
@@ -427,7 +433,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [2, 2],
   mma_kind = #iree_gpu.mma_layout<WMMAR3_F16_16x16x16_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 !eltype = f16
@@ -544,7 +551,8 @@ hal.executable public @main {
   reduction = [0, 0, 4],
   thread = [1, 4, 0],
   workgroup = [4, 32, 0],
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 #translation_info = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [8, 4, 1] subgroup_size = 32>
@@ -626,7 +634,8 @@ hal.executable public @main {
   reduction = [0, 0, 4],
   subgroup = [2, 4, 0],
   workgroup = [64, 128, 0],
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 hal.executable public @main {
@@ -863,6 +872,7 @@ hal.executable public @main {
 
 #lowering_config = #iree_gpu.lowering_config<{
   promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>],
   reduction = [0, 0, 4],
   thread = [1, 4, 0],
   workgroup = [1, 128, 0]
@@ -1089,7 +1099,8 @@ hal.executable public @main {
   reduction = [0, 0, 2],
   subgroup = [2, 2],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-  promote_operands = [0, 1, 2]
+  promote_operands = [0, 1, 2],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable public @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -1137,7 +1148,7 @@ hal.executable public @main {
 //   CHECK-DAG:   %[[BUF2:.+]] = amdgpu.fat_raw_buffer_cast %[[ASSUMED_B2]]
 //   CHECK-DAG:   memref.alloc() : memref<64x36xf16, #gpu.address_space<workgroup>>
 //   CHECK-DAG:   memref.alloc() : memref<64x36xf16, #gpu.address_space<workgroup>>
-//   CHECK-DAG:   memref.alloc() : memref<64x66xf32, #gpu.address_space<workgroup>>
+//   CHECK-DAG:   memref.alloc() : memref<64x64xf32, #gpu.address_space<workgroup>>
 //       CHECK:   scf.forall ({{.*}}) in (32, 160) {
 //       CHECK:     %[[LOOP:.+]] = scf.for %[[IV:.+]] = %c0 to %c80 step %c2 {{.*}} -> (vector<2x2x4x1xf32>)
 //       CHECK:       gpu.barrier memfence [#gpu.address_space<workgroup>]
@@ -1171,6 +1182,7 @@ hal.executable public @main {
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>,
   padding = [1, 16, 64, 4],
   promote_operands = [0, 1, 2],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>],
   reduction = [0, 0, 0, 1],
   subgroup = [0, 1, 1, 0],
   workgroup = [1, 16, 64, 0]
@@ -1217,7 +1229,7 @@ hal.executable public @main {
 //   CHECK-DAG:   %[[B2:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(2)
 //   CHECK-DAG:   memref.alloc() : memref<1x4x66xf32, #gpu.address_space<workgroup>>
 //   CHECK-DAG:   memref.alloc() : memref<1x16x6xf32, #gpu.address_space<workgroup>>
-//   CHECK-DAG:   memref.alloc() : memref<1x16x66xf32, #gpu.address_space<workgroup>>
+//   CHECK-DAG:   memref.alloc() : memref<1x16x64xf32, #gpu.address_space<workgroup>>
 //       CHECK:   scf.forall ({{.*}}) in (12, 37, 10) {
 //       CHECK:     scf.for %[[IV:.+]] = %c0 to %c144 step %c1 {{.*}} -> (vector<1x1x1x4x1xf32>)
 //       CHECK:       gpu.barrier memfence [#gpu.address_space<workgroup>]
@@ -1242,6 +1254,7 @@ hal.executable public @main {
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>,
   padding = [1, 16, 64, 4],
   promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>],
   reduction = [0, 0, 0, 1],
   subgroup = [0, 1, 1, 0],
   workgroup = [1, 16, 64, 0]

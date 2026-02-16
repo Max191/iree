@@ -608,9 +608,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createUnrollAnnotatedLoopsPass());
   funcPassManager.addPass(createIREELoopInvariantCodeMotionPass());
   if (pipelineOptions.enableReduceSharedMemoryBankConflicts) {
-    GPUReduceBankConflictsPassOptions options = {};
-    options.paddingBits = 64;
-    funcPassManager.addPass(createGPUReduceBankConflictsPass(options));
+    funcPassManager.addPass(createGPUReduceBankConflictsPass());
   }
   funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
   if (forROCDL && pipelineOptions.prefetchNumStages >= 2) {
@@ -872,9 +870,7 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createCSEPass());
 
   if (options.enableReduceSharedMemoryBankConflicts) {
-    GPUReduceBankConflictsPassOptions options = {};
-    options.paddingBits = 64;
-    funcPassManager.addPass(createGPUReduceBankConflictsPass(options));
+    funcPassManager.addPass(createGPUReduceBankConflictsPass());
   }
   if (forROCDL && options.prefetchNumStages >= 2) {
     ROCDLPrefetchSharedMemoryPassOptions prefetchOpts;

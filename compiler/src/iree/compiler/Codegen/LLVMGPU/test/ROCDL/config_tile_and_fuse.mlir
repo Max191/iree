@@ -38,6 +38,7 @@ func.func @expanded_matmul_transpose_b(%lhs: tensor<2x64x2048xf16>, %rhs: tensor
 //       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>
 //  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 //  CHECK-SAME:     reduction = [0, 0, 0, 0, 8]
 //  CHECK-SAME:     subgroup = [1, 2, 2, 2, 0]
 //  CHECK-SAME:     workgroup = [1, 2, 64, 64, 0]
@@ -72,6 +73,7 @@ func.func @multi_dim_mma_schedule(%lhs: tensor<10x32x128x16xf16>, %rhs: tensor<4
 //       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>
 //  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 //  CHECK-SAME:     reduction = [0, 0, 0, 0, 8, 1]
 //  CHECK-SAME:     subgroup = [2, 4, 1, 1, 0, 0]
 //  CHECK-SAME:     workgroup = [2, 4, 32, 32, 0, 0]
@@ -109,6 +111,7 @@ func.func @dynamic_multi_dim_mma_schedule(%lhs: tensor<?x6x16x?x16xf16>, %rhs: t
 //       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>
 //  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 //  CHECK-SAME:     reduction = [0, 0, 0, 0, 0, 1, 1]
 //  CHECK-SAME:     subgroup = [0, 1, 0, 1, 1, 0, 0]
 //  CHECK-SAME:     workgroup = [1, 2, 1, 16, 32, 0, 0]
@@ -133,6 +136,7 @@ func.func @mfma_matmul_1024x1024x1024(%lhs: tensor<1024x1024xf16>, %rhs: tensor<
 //       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>
 //  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 //  CHECK-SAME:     reduction = [0, 0, 8]
 //  CHECK-SAME:     subgroup = [2, 4, 0]
 //  CHECK-SAME:     workgroup = [64, 128, 0]
@@ -168,6 +172,7 @@ func.func @mfma_gemm_with_split_k(%arg0: tensor<9216x480xbf16>, %arg1: tensor<92
 //       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config
 //  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_BF16>
 //  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 //  CHECK-SAME:     reduction = [0, 0, 8]
 //  CHECK-SAME:     subgroup = [2, 1, 0]
 //  CHECK-SAME:     workgroup = [64, 32, 0]
@@ -349,6 +354,7 @@ func.func @unaligned_matmul_with_two_reduce_dim(%arg0: tensor<196x9x4xf32>, %arg
 // CHECK-SAME:  {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>
 // CHECK-SAME:  padding = [64, 1, 16, 4]
 // CHECK-SAME:  promote_operands = [0, 1]
+// CHECK-SAME:  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 // CHECK-SAME:  reduction = [0, 1, 0, 1],
 // CHECK-SAME:  subgroup = [2, 0, 1, 0],
 // CHECK-SAME:  workgroup = [64, 0, 16, 0]}
@@ -373,6 +379,7 @@ func.func @aligned_dynamic_matmul_with_two_reduce_dim(%arg0: tensor<192x?x16xf32
 // CHECK:       linalg.generic
 // CHECK-SAME:  {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>
 // CHECK-SAME:  promote_operands = [0, 1]
+// CHECK-SAME:  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 // CHECK-SAME:  reduction = [0, 1, 0, 4],
 // CHECK-SAME:  subgroup = [2, 0, 1, 0],
 // CHECK-SAME:  workgroup = [64, 0, 16, 0]}
@@ -423,6 +430,7 @@ func.func @unaligned_to_intrinsic_batched_matmul_tiling_check(%lhs : tensor<12x5
 // CHECK:         linalg.batch_matmul {{.*}}lowering_config = #iree_gpu.lowering_config
 // CHECK-SAME:      padding = [1, 64, 128, 4]
 // CHECK-SAME:      promote_operands = [0, 1]
+// CHECK-SAME:      promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 // CHECK-SAME:      reduction = [0, 0, 0, 1]
 // CHECK-SAME:      subgroup = [0, 2, 4, 0]
 // CHECK-SAME:      workgroup = [1, 64, 128, 0]
@@ -447,6 +455,7 @@ func.func @unaligned_matmul_nn_layout(%lhs : tensor<513x513xf16>, %rhs : tensor<
 // CHECK-SAME:      mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>
 // CHECK-SAME:      padding = [64, 128, 16]
 // CHECK-SAME:      promote_operands = [0, 1]
+// CHECK-SAME:      promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 // CHECK-SAME:      reduction = [0, 0, 1]
 // CHECK-SAME:      subgroup = [2, 4, 0]
 // CHECK-SAME:      workgroup = [64, 128, 0]

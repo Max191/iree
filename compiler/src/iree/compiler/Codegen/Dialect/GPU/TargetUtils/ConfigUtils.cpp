@@ -24,6 +24,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
+#include "mlir/Dialect/AMDGPU/Utils/Chipset.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Attributes.h"
@@ -44,6 +45,20 @@ namespace mlir::iree_compiler::IREE::GPU {
 
 constexpr int64_t kCacheLineSizeBits = 128 * 8;
 constexpr int64_t kPreferredCopyNumBits = 128;
+
+/// Check if target supports transpose_load instruction (gfx950 only).
+/// Transpose_load uses 64-bit vectors instead of 128-bit, affecting optimal
+/// bank conflict padding.
+static bool isTransposeLoadTarget(IREE::GPU::TargetAttr target) {
+  if (!target)
+    return false;
+  constexpr amdgpu::Chipset kGfx950 = amdgpu::Chipset(9, 5, 0);
+  FailureOr<amdgpu::Chipset> chipset =
+      amdgpu::Chipset::parse(target.getArch());
+  if (failed(chipset))
+    return false;
+  return *chipset == kGfx950;
+}
 
 //===----------------------------------------------------------------------===//
 // Lowering Config Selection
@@ -934,11 +949,36 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
     }
   }
 
-  // Use global load DMA attribute (subgroup sizes will be derived from
-  // translation_info).
-  Attribute useGlobalDma = IREE::GPU::UseGlobalLoadDMAAttr::get(context);
-  SmallVector<Attribute> promotionArray = {useGlobalDma, useGlobalDma};
+  // Compute per-operand bank conflict padding based on expected load pattern:
+  // - gfx950 + transposed operand → 32-bit padding (64-bit transpose_load)
+  // - All other cases → 64-bit padding (128-bit normal load)
+  auto computePaddingBits = [&](int64_t operandIdx) -> int64_t {
+    if (!isTransposeLoadTarget(target)) {
+      return 64;
+    }
+    // On gfx950, transposed operands use 64-bit transpose_load.
+    // Optimal bank conflict padding is half the load width = 32 bits.
+    bool isTransposed = (operandIdx == 0) ? transposedLhs : transposedRhs;
+    return isTransposed ? 32 : 64;
+  };
+
+  // The copy config determines how the promotion copy is lowered:
+  // - Direct loads: UseGlobalLoadDMAAttr (subgroup-level DMA)
+  // - Otherwise: DerivedThreadConfigAttr (thread-level tiling)
+  Attribute copyConfig =
+      useDirectLoad
+          ? Attribute(IREE::GPU::UseGlobalLoadDMAAttr::get(context))
+          : Attribute(IREE::GPU::DerivedThreadConfigAttr::get(context));
+
+  // Helper to wrap a copy config with bank conflict padding.
+  auto makeBankConflictPadding = [&](Attribute config,
+                                     int64_t bits) -> Attribute {
+    return IREE::GPU::PromoteWithBankConflictPaddingAttr::get(context, bits,
+                                                              config);
+  };
+
   SmallVector<int64_t> promotionList = {0, 1};
+  SmallVector<Attribute> promotionArray;
   if (scaled) {
     // TODO(#22119): We don't use global load DMA for scaled matmuls, because
     // compilation doesn't support it. Once this is fixed, we should use global
@@ -958,15 +998,22 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
       promotionArray = {*lhsSwizzleAttr, *rhsSwizzleAttr, defaultConfigAttr,
                         defaultConfigAttr};
     }
+  } else {
+    for (int64_t operandIdx : promotionList) {
+      int64_t paddingBits = computePaddingBits(operandIdx);
+      promotionArray.push_back(
+          makeBankConflictPadding(copyConfig, paddingBits));
+    }
   }
   if ((!mustBeAligned || couldNeedPadding) && cPromoteIfPadding) {
     // If needed then add C operand which would be operand 2 or 4 for unscaled
     // and scaled GEMM respectively.
     promotionList.push_back(promotionList.size());
+    if (!promotionArray.empty()) {
+      promotionArray.push_back(makeBankConflictPadding(copyConfig, 64));
+    }
   }
-  ArrayRef<Attribute> promotionTypes = useDirectLoad
-                                           ? ArrayRef<Attribute>(promotionArray)
-                                           : ArrayRef<Attribute>{};
+  ArrayRef<Attribute> promotionTypes(promotionArray);
   GPU::appendPromotedOperandsList(context, attrs, promotionList,
                                   promotionTypes);
   if (!mustBeAligned || couldNeedPadding) {
@@ -1093,10 +1140,12 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
   std::array<int64_t, 3> workgroupSize = {configAndWgSize->second, 1, 1};
   LoweringConfigAttr loweringConfig = configAndWgSize->first;
 
+  // IGEMM convolutions are always non-scaled and may have bank conflict
+  // padding hints, so the bank conflict reduction pass should run.
   SmallVector<NamedAttribute, 1> pipelineAttrs;
   auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
       linalgOp->getContext(), /*prefetchNumStages=*/2,
-      /*no_reduce_shared_memory_bank_conflicts=*/useDirectLoad,
+      /*no_reduce_shared_memory_bank_conflicts=*/false,
       /*use_igemm_convolution=*/true,
       /*reorder_workgroups_strategy=*/std::nullopt);
   pipelineAttrs.emplace_back(
@@ -1164,10 +1213,14 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
   std::array<int64_t, 3> workgroupSize = {configAndWgSize->second, 1, 1};
   LoweringConfigAttr loweringConfig = configAndWgSize->first;
 
+  // Bank conflict avoidance is handled through per-operand lowering config
+  // attributes (PromoteWithBankConflictPaddingAttr / XorShuffleAttr).
+  // The GPUReduceBankConflicts pass is left enabled to consume any padding
+  // hints; it is a no-op when no hints are present.
   SmallVector<NamedAttribute, 1> pipelineAttrs;
   auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
       linalgOp->getContext(), /*prefetchNumStages=*/2,
-      /*no_reduce_shared_memory_bank_conflicts=*/useDirectLoad,
+      /*no_reduce_shared_memory_bank_conflicts=*/false,
       /*use_igemm_convolution=*/false,
       /*reorder_workgroups_strategy=*/std::nullopt);
   pipelineAttrs.emplace_back(

@@ -49,7 +49,7 @@ hal.executable.variant @cuda target(<"cuda", "cuda-nvptx-fb">) {
 //         CHECK:      scf.yield %[[ADD]] : vector<1x1x1xf32>
 //         CHECK:    }
 //         CHECK:    gpu.subgroup_reduce  add {{.*}} cluster(size = 32) : (f32) -> f32
-//         CHECK:    %[[ALLOC:.+]] = memref.alloc() : memref<10xf32, #gpu.address_space<workgroup>>
+//         CHECK:    %[[ALLOC:.+]] = memref.alloc() : memref<8xf32, #gpu.address_space<workgroup>>
 //         CHECK:    gpu.barrier memfence [#gpu.address_space<workgroup>]
 //         CHECK:    vector.transfer_read %[[ALLOC]]{{.*}}
 //         CHECK:    gpu.subgroup_reduce  add {{.*}} cluster(size = 8) : (f32) -> f32

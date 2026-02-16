@@ -21,7 +21,8 @@
   subgroup = [0, 0, 1, 1, 0, 0, 0],
   reduction = [0, 0, 0, 0, 1, 1, 4],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable private @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {

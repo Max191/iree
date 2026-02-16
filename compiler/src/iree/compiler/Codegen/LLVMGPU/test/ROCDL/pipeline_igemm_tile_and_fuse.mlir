@@ -21,7 +21,8 @@
   reduction = [0, 0, 0, 0, 2],
   subgroup = [1, 4, 1, 4, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable private @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -106,7 +107,8 @@ hal.executable private @main {
   reduction = [0, 0, 0, 0, 1],
   subgroup = [1, 1, 1, 1, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-  promote_operands = [0, 1, 2]
+  promote_operands = [0, 1, 2],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable private @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -142,7 +144,7 @@ hal.executable private @main {
 //      CHECK-DAG:   %[[B2:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(2)
 //      CHECK-DAG:   memref.assume_alignment %[[B2]], 64
 //      CHECK-DAG:   amdgpu.fat_raw_buffer_cast
-//      CHECK-DAG:   memref.alloc() : memref<2x1x32x18xf32, #gpu.address_space<workgroup>>
+//      CHECK-DAG:   memref.alloc() : memref<2x1x32x16xf32, #gpu.address_space<workgroup>>
 //      CHECK-DAG:   memref.alloc() : memref<16x20xf16, #gpu.address_space<workgroup>>
 //      CHECK-DAG:   memref.alloc() : memref<2x1x32x20xf16, #gpu.address_space<workgroup>>
 //      CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
@@ -183,7 +185,8 @@ hal.executable private @main {
   reduction = [0, 0, 0, 0, 1],
   subgroup = [1, 1, 1, 1, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable private @main {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -256,7 +259,8 @@ hal.executable private @main {
   reduction = [0, 0, 0, 4],
   subgroup = [2, 2, 1, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_BF16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 #map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
 #map1 = affine_map<(d0, d1, d2, d3) -> (d3, d2)>

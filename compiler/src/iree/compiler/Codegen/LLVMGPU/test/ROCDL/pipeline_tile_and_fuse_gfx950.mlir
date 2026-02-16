@@ -163,7 +163,8 @@ hal.executable public @main {
   reduction = [0, 0, 1],
   subgroup = [4, 4, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 hal.executable public @matmul_transpose_b_f16 {
   hal.executable.variant public @rocm_hsaco_fb target(<"rocm", "rocm-hsaco-fb">) {
@@ -232,7 +233,8 @@ hal.executable public @matmul_transpose_b_f16 {
   reduction = [0, 0, 1],
   subgroup = [4, 4, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_I32_16x16x64_I8>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 hal.executable public @matmul_transpose_b_i8 {
@@ -303,7 +305,8 @@ hal.executable public @matmul_transpose_b_i8 {
   reduction = [0, 0, 1],
   subgroup = [4, 4, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 hal.executable public @matmul_f16 {
@@ -368,7 +371,8 @@ hal.executable public @matmul_f16 {
   reduction = [0, 0, 1],
   subgroup = [4, 4, 0],
   mma_kind = #iree_gpu.mma_layout<MFMA_I32_16x16x64_I8>,
-  promote_operands = [0, 1]
+  promote_operands = [0, 1],
+  promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]
 }>
 
 hal.executable public @matmul_i8 {

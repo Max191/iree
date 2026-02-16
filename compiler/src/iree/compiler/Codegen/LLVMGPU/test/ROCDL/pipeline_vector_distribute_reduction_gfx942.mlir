@@ -122,7 +122,8 @@ hal.executable private @matvec_fp16_parallel_subgroup {
                                       thread = [0, 0, 8],
                                       subgroup_basis = [[1, 4, 1], [0, 1, 2]],
                                       lane_basis = [[1, 1, 64], [0, 1, 2]],
-                                      promote_operands = [1]}
+                                      promote_operands = [1],
+                                      promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}
 >
 #translation = #iree_codegen.translation_info< pipeline = LLVMGPUVectorDistribute
                                                workgroup_size = [256, 1, 1]
@@ -164,7 +165,7 @@ hal.executable private @matvec_fp16_promote_rhs {
 }
 
 //     CHECK-LABEL: func.func @matvec_fp16_promote_rhs
-//          CHECK:    %[[ALLOC:.+]] = memref.alloc() : memref<4x516xf16, #gpu.address_space<workgroup>>
+//          CHECK:    %[[ALLOC:.+]] = memref.alloc() : memref<4x512xf16, #gpu.address_space<workgroup>>
 //          CHECK:    scf.for {{.*}} = %c0 to %c4096 step %c512
 //          CHECK:      %[[RHS_SHARED_READ:.+]] = vector.transfer_read %alloc
 //          CHECK:      %[[RHS_INSERT:.+]] = vector.insert_strided_slice %[[RHS_SHARED_READ]]
@@ -190,17 +191,20 @@ hal.executable private @matvec_fp16_promote_rhs {
 
 #config = #iree_gpu.lowering_config<{workgroup = [1, 1, 0, 0, 32],
                                      reduction = [0, 0, 0, 128, 0],
-                                     promote_operands = [1, 2]}>
+                                     promote_operands = [1, 2],
+                                     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
 
 #qk_config = #iree_gpu.lowering_config<{subgroup_basis = [[1, 1, 1, 1, 4], [0, 1, 2, 3]],
                                         lane_basis = [[1, 1, 2, 32, 1], [0, 1, 2, 3]],
                                         thread         = [0, 0, 32, 4],
-                                        promote_operands = [1]}>
+                                        promote_operands = [1],
+                                        promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
 
 #pv_config = #iree_gpu.lowering_config<{subgroup_basis = [[1, 1, 1, 1, 4], [0, 1, 3, 4]],
                                         lane_basis = [[1, 1, 2, 32, 1], [0, 1, 3, 4]],
                                         thread         = [0, 0, 4, 4],
-                                        promote_operands = [1]}>
+                                        promote_operands = [1],
+                                        promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
 
 #translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
                                               workgroup_size = [256, 1, 1]
@@ -284,17 +288,20 @@ hal.executable private @attention_20x1x64x4096x64 {
 
 #config = #iree_gpu.lowering_config<{workgroup = [1, 1, 0, 0, 32],
                                      partial_reduction = [0, 0, 0, 128, 0],
-                                     promote_operands = [1, 2]}>
+                                     promote_operands = [1, 2],
+                                     promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>, #iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
 
 #qk_config = #iree_gpu.lowering_config<{subgroup_basis = [[1, 1, 1, 1, 4], [0, 1, 2, 3]],
                                         lane_basis = [[1, 1, 2, 32, 1], [0, 1, 2, 3]],
                                         thread         = [0, 0, 32, 4],
-                                        promote_operands = [1]}>
+                                        promote_operands = [1],
+                                        promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
 
 #pv_config = #iree_gpu.lowering_config<{subgroup_basis = [[1, 1, 1, 1, 4], [0, 1, 3, 4]],
                                         lane_basis = [[1, 1, 2, 32, 1], [0, 1, 3, 4]],
                                         thread         = [0, 0, 4, 4],
-                                        promote_operands = [1]}>
+                                        promote_operands = [1],
+                                        promotion_types = [#iree_gpu.promote_with_bank_conflict_padding<padding_bits = 64, copy_config = #iree_gpu.derived_thread_config>]}>
 
 #translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
                                               workgroup_size = [256, 1, 1]

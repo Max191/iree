@@ -32,7 +32,7 @@ hal.executable @transpose_dispatch_0 {
 }
 
 // CHECK-LABEL:   func @transpose_dispatch_0
-//       CHECK:   %[[A:.*]] = memref.alloc() : memref<32x34xf32, #gpu.address_space<workgroup>>
+//       CHECK:   %[[A:.*]] = memref.alloc() : memref<32x32xf32, #gpu.address_space<workgroup>>
 //   CHECK-DAG:   %[[B0:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(0)
 //   CHECK-DAG:   %[[A0:.*]] = memref.assume_alignment %[[B0]]
 //   CHECK-DAG:   %[[B1:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(1)
@@ -82,7 +82,7 @@ hal.executable @transpose_single_operand_dispatch_0_generic_768x2048 {
 }
 
 // CHECK-LABEL:   func @transpose_single_operand_dispatch_0_generic_768x2048
-//       CHECK:   %[[A:.*]] = memref.alloc() : memref<32x34xf32, #gpu.address_space<workgroup>>
+//       CHECK:   %[[A:.*]] = memref.alloc() : memref<32x32xf32, #gpu.address_space<workgroup>>
 //   CHECK-DAG:   %[[B0:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(0)
 //   CHECK-DAG:   %[[A0:.*]] = memref.assume_alignment %[[B0]]
 //   CHECK-DAG:   %[[B1:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(1)
@@ -177,7 +177,7 @@ hal.executable @transpose_3d_yes_dispatch_0_generic_10x768x2048 {
 }
 
 // CHECK-LABEL:   func @transpose_3d_yes_dispatch_0_generic_10x768x2048
-//       CHECK:   %[[A:.*]] = memref.alloc() : memref<1x32x34xf32, #gpu.address_space<workgroup>>
+//       CHECK:   %[[A:.*]] = memref.alloc() : memref<1x32x32xf32, #gpu.address_space<workgroup>>
 //   CHECK-DAG:   %[[B0:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(0)
 //   CHECK-DAG:   %[[A0:.*]] = memref.assume_alignment %[[B0]]
 //   CHECK-DAG:   %[[B1:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(1)
@@ -231,8 +231,8 @@ hal.executable @transpose_3d_trans_out_dispatch_0_generic_10x2048x768 {
 }
 
 // CHECK-LABEL:   func @transpose_3d_trans_out_dispatch_0_generic_10x2048x768
-//       CHECK:   %[[A0:.*]] = memref.alloc() : memref<1x32x34xf32, #gpu.address_space<workgroup>>
-//       CHECK:   %[[A1:.*]] = memref.alloc() : memref<1x32x34xf32, #gpu.address_space<workgroup>>
+//       CHECK:   %[[A0:.*]] = memref.alloc() : memref<1x32x32xf32, #gpu.address_space<workgroup>>
+//       CHECK:   %[[A1:.*]] = memref.alloc() : memref<1x32x32xf32, #gpu.address_space<workgroup>>
 //   CHECK-DAG:   %[[B0:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(0)
 //   CHECK-DAG:   %[[BA0:.*]] = memref.assume_alignment %[[B0]]
 //   CHECK-DAG:   %[[B1:.*]] = hal.interface.binding.subspan layout({{.+}}) binding(1)
