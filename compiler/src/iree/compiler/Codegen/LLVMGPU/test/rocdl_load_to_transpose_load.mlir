@@ -508,3 +508,23 @@ func.func @transform_expand_collapse_shape() -> vector<4x1xf16> {
        : memref<128x256xf16, #gpu.address_space<workgroup>>, vector<4x1xf16>
   return %0 : vector<4x1xf16>
 }
+
+// -----
+
+// Test: AllocationHintOpInterface ops in memref chain are skipped.
+// CHECK-LABEL: func.func @transform_with_allocation_hint
+// CHECK: amdgpu.transpose_load
+func.func @transform_with_allocation_hint() -> vector<4x1xf16> {
+  %src = memref.alloc() : memref<128x256xf16, #gpu.address_space<workgroup>>
+  %hint = iree_codegen.bank_conflict_padding_hint %src
+          [padding_bits = 128] : memref<128x256xf16, #gpu.address_space<workgroup>>
+  %c0 = arith.constant 0 : index
+  %tid = gpu.thread_id x
+  %row = iree_codegen.index_hint %c0(#iree_gpu.lane_constant<16>) : index
+  %col = iree_codegen.index_hint %tid(#iree_gpu.lane_increment<16, aligned>) : index
+  %cst = arith.constant 0.0 : f16
+  %0 = vector.transfer_read %hint[%row, %col], %cst
+       {in_bounds = [true, true], permutation_map = affine_map<(d0, d1) -> (d0, d1)>}
+       : memref<128x256xf16, #gpu.address_space<workgroup>>, vector<4x1xf16>
+  return %0 : vector<4x1xf16>
+}
