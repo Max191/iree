@@ -84,6 +84,7 @@ struct StageClassification {
     return ops;
   }
 };
+
 //===----------------------------------------------------------------------===//
 // Scheduling barrier constants and helpers
 //===----------------------------------------------------------------------===//
@@ -100,6 +101,10 @@ static constexpr uint32_t kMaskDSWrite = 0x200;
 /// Estimate the number of ISA load/store instructions a vector transfer op
 /// will lower to. The count is: product of non-contiguous dimensions *
 /// ceil(contiguous_bits / preferred_width).
+// TODO: Account for non-identity permutation maps. Currently assumes the
+// last vector dimension is contiguous in memory, which is correct for the
+// identity maps produced by IREE's lowering pipeline but would need
+// adjustment for transpose reads with non-identity permutation maps.
 static unsigned estimateISAInstCount(VectorType vecType) {
   if (!vecType || vecType.getRank() == 0)
     return 1;
@@ -150,6 +155,8 @@ static LoopScheduleInfo analyzeLoopBody(scf::ForOp forOp) {
       info.numMFMAs++;
     } else if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
       auto srcType = dyn_cast<MemRefType>(readOp.getBase().getType());
+      if (!srcType)
+        return;
       if (hasSharedMemoryAddressSpace(srcType)) {
         info.numDSReads += estimateISAInstCount(readOp);
       } else if (hasGlobalMemoryAddressSpace(srcType)) {
@@ -157,11 +164,14 @@ static LoopScheduleInfo analyzeLoopBody(scf::ForOp forOp) {
       }
     } else if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
       auto dstType = dyn_cast<MemRefType>(writeOp.getBase().getType());
+      if (!dstType)
+        return;
       if (hasSharedMemoryAddressSpace(dstType)) {
         info.numDSWrites += estimateISAInstCount(writeOp);
       }
     } else if (isa<amdgpu::GatherToLDSOp>(op)) {
-      // Fused global→LDS copy: one buffer_load + one ds_write per op.
+      // GatherToLDSOp maps to a single global_load_lds ISA instruction that
+      // fuses a buffer_load and ds_write. Count as 1 of each.
       info.numBufferLoads++;
       info.numDSWrites++;
     }
@@ -178,20 +188,30 @@ static LoopScheduleInfo analyzeLoopBody(scf::ForOp forOp) {
 // Interleaved schedule generation
 //===----------------------------------------------------------------------===//
 
+/// A single entry in the interleaved schedule: an instruction class mask
+/// and the number of instructions of that class to allow before the next
+/// group boundary.
+struct SchedGroupEntry {
+  uint32_t mask;
+  uint32_t count;
+};
+
 /// Generate an interleaved schedule from instruction counts.
-/// Returns a sequence of (mask, count) pairs for sched_group_barrier emission.
+/// Returns a sequence of schedule entries for sched_group_barrier emission.
 ///
 /// The schedule distributes memory operations across groups of MFMAs following
 /// a CK-inspired pattern:
 ///   ds_write(W/N) → MFMA(1) → buffer_load(L/N) → MFMA(1) → ds_read(R/N)
 ///   → MFMA(remaining)
-static SmallVector<std::pair<uint32_t, uint32_t>>
+static SmallVector<SchedGroupEntry>
 generateInterleavedSchedule(const LoopScheduleInfo &info) {
-  SmallVector<std::pair<uint32_t, uint32_t>> schedule;
+  SmallVector<SchedGroupEntry> schedule;
 
   if (info.numMFMAs == 0)
     return schedule;
 
+  // Group size of 4 MFMAs follows the CK (Composable Kernel) interleaving
+  // pattern. This balances memory latency hiding with scheduling overhead.
   constexpr unsigned kGroupSize = 4;
   unsigned numGroups = llvm::divideCeil(info.numMFMAs, kGroupSize);
 
@@ -263,7 +283,14 @@ static void insertSchedGroupBarriers(RewriterBase &rewriter,
     return;
   }
 
-  SmallVector<std::pair<uint32_t, uint32_t>> schedule =
+  // Skip loops with no memory ops to interleave with compute.
+  if (info.numDSReads == 0 && info.numDSWrites == 0 &&
+      info.numBufferLoads == 0) {
+    LDBG() << "No memory ops to interleave, skipping sched group barriers";
+    return;
+  }
+
+  SmallVector<SchedGroupEntry> schedule =
       generateInterleavedSchedule(info);
 
   if (schedule.empty())
@@ -281,31 +308,31 @@ static void insertSchedGroupBarriers(RewriterBase &rewriter,
       gpuBarriers.push_back(barrier);
   }
 
-  // Insert a rocdl.sched.barrier (fence, mask=0) after each gpu.barrier
+  // Insert an amdgpu.sched_barrier fence (allow=none) after each gpu.barrier
   // to prevent the LLVM scheduler from reordering across workgroup barriers.
+  Operation *lastFence = nullptr;
   for (gpu::BarrierOp barrier : gpuBarriers) {
     rewriter.setInsertionPointAfter(barrier);
-    ROCDL::SchedBarrier::create(rewriter, loc, /*mask=*/0);
+    lastFence = amdgpu::SchedBarrierOp::create(
+                    rewriter, loc,
+                    amdgpu::sched_barrier_opt_enumAttr::get(
+                        rewriter.getContext(),
+                        amdgpu::sched_barrier_opt_enum::none))
+                    .getOperation();
   }
 
-  // Insert the group barrier schedule after the last gpu.barrier (before
-  // the compute section), or at the beginning of the loop body if no
-  // gpu.barrier exists.
-  if (!gpuBarriers.empty()) {
-    // Find the sched.barrier fence we just inserted after the last gpu.barrier.
-    // The schedule goes after that fence.
-    Operation *lastGpuBarrier = gpuBarriers.back().getOperation();
-    // Move past the gpu.barrier and the sched.barrier fence we inserted.
-    auto insertPt = std::next(Block::iterator(lastGpuBarrier));
-    // Skip past the rocdl.sched.barrier we just inserted.
-    if (insertPt != body->end() && isa<ROCDL::SchedBarrier>(&*insertPt))
-      ++insertPt;
-    rewriter.setInsertionPoint(body, insertPt);
+  // Insert the group barrier schedule after the last gpu.barrier's fence
+  // (before the compute section), or at the beginning of the loop body if
+  // no gpu.barrier exists.
+  if (lastFence) {
+    rewriter.setInsertionPointAfter(lastFence);
   } else {
     rewriter.setInsertionPointToStart(body);
   }
 
   // Emit the interleaved schedule as sched_group_barrier ops.
+  // All groups use sync ID 0 — the schedule is a linear sequence within
+  // a single loop body, so no independent group synchronization is needed.
   for (auto [mask, count] : schedule) {
     ROCDL::SchedGroupBarrier::create(rewriter, loc, /*mask=*/mask,
                                      /*size=*/count, /*groupId=*/0);

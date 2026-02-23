@@ -704,11 +704,11 @@ func.func @sched_barrier_gemm(
 
 // Check fence after first gpu.barrier
 //      SCHED: gpu.barrier
-// SCHED-NEXT: rocdl.sched.barrier 0
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
 
 // Check fence after second gpu.barrier, followed by group barriers
 //      SCHED: gpu.barrier
-// SCHED-NEXT: rocdl.sched.barrier 0
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
 
 // ds_write group (mask=0x200=512, count=2)
 // SCHED-NEXT: rocdl.sched.group.barrier 512, 2, 0
@@ -727,10 +727,174 @@ func.func @sched_barrier_gemm(
 
 // Verify feature is OFF by default (no emit-sched-barriers flag).
 // NOSCHED-LABEL: @sched_barrier_gemm
+// NOSCHED-NOT: rocdl.sched.barrier
 // NOSCHED-NOT: rocdl.sched.group.barrier
 // NOSCHED: return
 
 // Verify feature is OFF with explicit emit-sched-barriers=false.
 // NOSCHED-FALSE-LABEL: @sched_barrier_gemm
+// NOSCHED-FALSE-NOT: rocdl.sched.barrier
+// NOSCHED-FALSE-NOT: rocdl.sched.group.barrier
+// NOSCHED-FALSE: return
+
+// -----
+
+// Test multi-group scheduling with 5 MFMAs (ceil(5/4)=2 groups).
+// Group 0 (4 MFMAs): ds_write(1) → MFMA(1) → buffer_load(1) → MFMA(1) → ds_read(1) → MFMA(2)
+// Group 1 (1 MFMA):  ds_write(1) → buffer_load(1) → ds_read(1) → MFMA(1)
+
+// SCHED-LABEL: @sched_barrier_gemm_multigroup
+func.func @sched_barrier_gemm_multigroup(
+    %global_A: memref<128x128xf16>,
+    %global_B: memref<128x128xf16>,
+    %result: memref<128xf32>) {
+  %cst = arith.constant dense<0.000000e+00> : vector<4xf32>
+  %cst_f16 = arith.constant 0.000000e+00 : f16
+  %c128 = arith.constant 128 : index
+  %c1 = arith.constant 1 : index
+  %c0 = arith.constant 0 : index
+
+  %shared_A = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+  %shared_B = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+
+  %out = scf.for %k = %c0 to %c128 step %c1 iter_args(%acc = %cst) -> (vector<4xf32>) {
+    // Global → shared (buffer_load + ds_write)
+    %g_a = vector.transfer_read %global_A[%k, %c0], %cst_f16 : memref<128x128xf16>, vector<4xf16>
+    vector.transfer_write %g_a, %shared_A[%c0] {in_bounds = [true]} : vector<4xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    %g_b = vector.transfer_read %global_B[%c0, %k], %cst_f16 : memref<128x128xf16>, vector<4xf16>
+    vector.transfer_write %g_b, %shared_B[%c0] {in_bounds = [true]} : vector<4xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    // Shared → register (ds_read)
+    %a = vector.transfer_read %shared_A[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+    %b = vector.transfer_read %shared_B[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+
+    // Compute (5 MFMAs)
+    %mfma0 = amdgpu.mfma 16x16x16 %a * %b + %acc {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma1 = amdgpu.mfma 16x16x16 %a * %b + %mfma0 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma2 = amdgpu.mfma 16x16x16 %a * %b + %mfma1 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma3 = amdgpu.mfma 16x16x16 %a * %b + %mfma2 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma4 = amdgpu.mfma 16x16x16 %a * %b + %mfma3 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    scf.yield %mfma4 : vector<4xf32>
+  }
+
+  vector.transfer_write %out, %result[%c0] {in_bounds = [true]} : vector<4xf32>, memref<128xf32>
+  return
+}
+
+// 5 MFMAs, 2 buffer_loads, 2 ds_writes, 2 ds_reads → 2 groups.
+// Group 0 (4 MFMAs, 1 each of mem ops):
+//      SCHED: gpu.barrier
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
+//      SCHED: gpu.barrier
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
+// SCHED-NEXT: rocdl.sched.group.barrier 512, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 32, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 256, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 2, 0
+// Group 1 (1 MFMA, 1 each of mem ops):
+// SCHED-NEXT: rocdl.sched.group.barrier 512, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 32, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 256, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+//      SCHED: return
+
+// NOSCHED-LABEL: @sched_barrier_gemm_multigroup
+// NOSCHED-NOT: rocdl.sched.barrier
+// NOSCHED-NOT: rocdl.sched.group.barrier
+// NOSCHED: return
+
+// NOSCHED-FALSE-LABEL: @sched_barrier_gemm_multigroup
+// NOSCHED-FALSE-NOT: rocdl.sched.barrier
+// NOSCHED-FALSE-NOT: rocdl.sched.group.barrier
+// NOSCHED-FALSE: return
+
+// -----
+
+// Test fewer-than-4-MFMAs case (2 MFMAs). The second MFMA interleave slot
+// is skipped since there aren't enough MFMAs to fill both interleave points.
+// Schedule: ds_write(2) → MFMA(1) → buffer_load(2) → ds_read(2) → MFMA(1)
+
+// SCHED-LABEL: @sched_barrier_gemm_small
+func.func @sched_barrier_gemm_small(
+    %global_A: memref<128x128xf16>,
+    %global_B: memref<128x128xf16>,
+    %result: memref<128xf32>) {
+  %cst = arith.constant dense<0.000000e+00> : vector<4xf32>
+  %cst_f16 = arith.constant 0.000000e+00 : f16
+  %c128 = arith.constant 128 : index
+  %c1 = arith.constant 1 : index
+  %c0 = arith.constant 0 : index
+
+  %shared_A = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+  %shared_B = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+
+  %out = scf.for %k = %c0 to %c128 step %c1 iter_args(%acc = %cst) -> (vector<4xf32>) {
+    // Global → shared (buffer_load + ds_write)
+    %g_a = vector.transfer_read %global_A[%k, %c0], %cst_f16 : memref<128x128xf16>, vector<4xf16>
+    vector.transfer_write %g_a, %shared_A[%c0] {in_bounds = [true]} : vector<4xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    %g_b = vector.transfer_read %global_B[%c0, %k], %cst_f16 : memref<128x128xf16>, vector<4xf16>
+    vector.transfer_write %g_b, %shared_B[%c0] {in_bounds = [true]} : vector<4xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    // Shared → register (ds_read)
+    %a = vector.transfer_read %shared_A[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+    %b = vector.transfer_read %shared_B[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+
+    // Compute (2 MFMAs only - tests the "fewer than group size" path)
+    %mfma0 = amdgpu.mfma 16x16x16 %a * %b + %acc {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma1 = amdgpu.mfma 16x16x16 %a * %b + %mfma0 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    scf.yield %mfma1 : vector<4xf32>
+  }
+
+  vector.transfer_write %out, %result[%c0] {in_bounds = [true]} : vector<4xf32>, memref<128xf32>
+  return
+}
+
+// 2 MFMAs, 2 buffer_loads, 2 ds_writes, 2 ds_reads → 1 group.
+// With only 2 MFMAs, the second interleave slot (between buffer_load and
+// ds_read) is skipped:
+//   ds_write(2) → MFMA(1) → buffer_load(2) → ds_read(2) → MFMA(1)
+//      SCHED: gpu.barrier
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
+//      SCHED: gpu.barrier
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
+// SCHED-NEXT: rocdl.sched.group.barrier 512, 2, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 32, 2, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 256, 2, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+//      SCHED: return
+
+// NOSCHED-LABEL: @sched_barrier_gemm_small
+// NOSCHED-NOT: rocdl.sched.barrier
+// NOSCHED-NOT: rocdl.sched.group.barrier
+// NOSCHED: return
+
+// NOSCHED-FALSE-LABEL: @sched_barrier_gemm_small
+// NOSCHED-FALSE-NOT: rocdl.sched.barrier
 // NOSCHED-FALSE-NOT: rocdl.sched.group.barrier
 // NOSCHED-FALSE: return
