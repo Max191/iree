@@ -1,6 +1,9 @@
 // RUN: iree-opt -pass-pipeline="builtin.module(func.func(iree-llvmgpu-prefetch-shared-memory),cse,canonicalize)" %s --split-input-file | FileCheck %s --check-prefixes=CHECK-ALL,CHECK
 // RUN: iree-opt -pass-pipeline="builtin.module(func.func(iree-llvmgpu-prefetch-shared-memory{num-stages=1}))" %s --split-input-file | FileCheck %s --check-prefixes=CHECK-ALL,CHECK-1STAGE
 // RUN: iree-opt -pass-pipeline="builtin.module(func.func(iree-llvmgpu-prefetch-shared-memory{num-stages=3}))" %s --split-input-file | FileCheck %s --check-prefixes=CHECK-ALL,CHECK-3STAGE
+// RUN: iree-opt -pass-pipeline="builtin.module(func.func(iree-llvmgpu-prefetch-shared-memory{emit-sched-barriers=true}))" %s --split-input-file | FileCheck %s --check-prefix=SCHED
+// RUN: iree-opt -pass-pipeline="builtin.module(func.func(iree-llvmgpu-prefetch-shared-memory))" %s --split-input-file | FileCheck %s --check-prefix=NOSCHED
+// RUN: iree-opt -pass-pipeline="builtin.module(func.func(iree-llvmgpu-prefetch-shared-memory{emit-sched-barriers=false}))" %s --split-input-file | FileCheck %s --check-prefix=NOSCHED-FALSE
 
 // CHECK-ALL-LABEL: @prefetch_add
 // CHECK-SAME: (%[[GLOBAL:.*]]: memref<128xf32>)
@@ -633,3 +636,101 @@ func.func @prefetch_transpose_load(%arg0: memref<128xf16>) {
   vector.transfer_write %0, %arg0[%c0] {in_bounds = [true]} : vector<4xf16>, memref<128xf16>
   return
 }
+
+// -----
+
+// Test sched_group_barrier emission with emit-sched-barriers=true.
+// A GEMM-like loop with global→shared transfers, shared→register reads,
+// and MFMA compute. The pass should emit rocdl.sched.barrier fences after
+// gpu.barrier ops and rocdl.sched.group.barrier ops for interleaved scheduling.
+
+// SCHED-LABEL: @sched_barrier_gemm
+func.func @sched_barrier_gemm(
+    %global_A: memref<128x128xf16>,
+    %global_B: memref<128x128xf16>,
+    %result: memref<128xf32>) {
+  %cst = arith.constant dense<0.000000e+00> : vector<4xf32>
+  %cst_f16 = arith.constant 0.000000e+00 : f16
+  %c128 = arith.constant 128 : index
+  %c1 = arith.constant 1 : index
+  %c0 = arith.constant 0 : index
+
+  %shared_A = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+  %shared_B = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+
+  %out = scf.for %k = %c0 to %c128 step %c1 iter_args(%acc = %cst) -> (vector<4xf32>) {
+    // Global → shared (buffer_load + ds_write)
+    %g_a = vector.transfer_read %global_A[%k, %c0], %cst_f16 : memref<128x128xf16>, vector<4xf16>
+    vector.transfer_write %g_a, %shared_A[%c0] {in_bounds = [true]} : vector<4xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    %g_b = vector.transfer_read %global_B[%c0, %k], %cst_f16 : memref<128x128xf16>, vector<4xf16>
+    vector.transfer_write %g_b, %shared_B[%c0] {in_bounds = [true]} : vector<4xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    // Shared → register (ds_read)
+    %a = vector.transfer_read %shared_A[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+    %b = vector.transfer_read %shared_B[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+
+    // Compute (4 MFMAs)
+    %mfma0 = amdgpu.mfma 16x16x16 %a * %b + %acc {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma1 = amdgpu.mfma 16x16x16 %a * %b + %mfma0 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma2 = amdgpu.mfma 16x16x16 %a * %b + %mfma1 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma3 = amdgpu.mfma 16x16x16 %a * %b + %mfma2 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    scf.yield %mfma3 : vector<4xf32>
+  }
+
+  vector.transfer_write %out, %result[%c0] {in_bounds = [true]} : vector<4xf32>, memref<128xf32>
+  return
+}
+
+// After pipelining with emit-sched-barriers=true, the loop body should have:
+// 1. rocdl.sched.barrier (fence) after each gpu.barrier
+// 2. rocdl.sched.group.barrier ops with expected masks for interleaved scheduling
+//
+// The loop has 4 MFMAs, 2 ds_reads, 2 ds_writes, 2 buffer_loads.
+// With 4 MFMAs / group_size=4 = 1 group, the schedule is:
+//   ds_write(2) → MFMA(1) → buffer_load(2) → MFMA(1) → ds_read(2) → MFMA(2)
+
+// Check fence after first gpu.barrier
+//      SCHED: gpu.barrier
+// SCHED-NEXT: rocdl.sched.barrier 0
+
+// Check fence after second gpu.barrier, followed by group barriers
+//      SCHED: gpu.barrier
+// SCHED-NEXT: rocdl.sched.barrier 0
+
+// ds_write group (mask=0x200=512, count=2)
+// SCHED-NEXT: rocdl.sched.group.barrier 512, 2, 0
+// MFMA group (mask=0x008=8, count=1)
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// buffer_load/VMEM read group (mask=0x020=32, count=2)
+// SCHED-NEXT: rocdl.sched.group.barrier 32, 2, 0
+// MFMA group (mask=0x008=8, count=1)
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// ds_read group (mask=0x100=256, count=2)
+// SCHED-NEXT: rocdl.sched.group.barrier 256, 2, 0
+// Remaining MFMAs (mask=0x008=8, count=2)
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 2, 0
+
+//      SCHED: return
+
+// Verify feature is OFF by default (no emit-sched-barriers flag).
+// NOSCHED-LABEL: @sched_barrier_gemm
+// NOSCHED-NOT: rocdl.sched.group.barrier
+// NOSCHED: return
+
+// Verify feature is OFF with explicit emit-sched-barriers=false.
+// NOSCHED-FALSE-LABEL: @sched_barrier_gemm
+// NOSCHED-FALSE-NOT: rocdl.sched.group.barrier
+// NOSCHED-FALSE: return
