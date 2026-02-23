@@ -63,7 +63,8 @@ void packSharedMemoryAlloc(mlir::FunctionOpInterface funcOp);
 // Stream pipeliner always prefetches one less than the number of stages.
 FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
                                                scf::ForOp forOp,
-                                               unsigned numStages = 2);
+                                               unsigned numStages = 2,
+                                               bool emitSchedBarriers = false);
 
 /// Insert barriers and wait operations if there are allocs of a different alias
 /// group before the given alloc.

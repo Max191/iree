@@ -1082,7 +1082,8 @@ static bool hasGatherToLDS(scf::ForOp forOp) {
 
 FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
                                                scf::ForOp forOp,
-                                               unsigned numStages) {
+                                               unsigned numStages,
+                                               bool emitSchedBarriers) {
   PipelineMode mode = hasGatherToLDS(forOp) ? PipelineMode::AsyncCopy
                                             : PipelineMode::StreamCopy;
 

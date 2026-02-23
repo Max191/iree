@@ -52,7 +52,8 @@ ireeGPUPipelineOptionsAttrGet(MlirContext mlirCtx, int64_t *prefetchNumStages,
   }
   return wrap(mlir::iree_compiler::IREE::GPU::GPUPipelineOptionsAttr::get(
       ctx, prefetchNumStagesOpt, noReduceSharedMemoryBankConflictsAttr,
-      useIgemmConvolutionAttr, strategyAttr));
+      useIgemmConvolutionAttr, strategyAttr,
+      /*emit_sched_barriers=*/mlir::BoolAttr()));
 }
 
 MlirAttribute

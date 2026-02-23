@@ -980,6 +980,9 @@ def IREEGPU_GPUPipelineOptionsAttr : AttrDef<IREEGPU_Dialect, "GPUPipelineOption
     * reorder_workgroups_strategy: Enum attribute indicating which strategy to
       choose for the workgroup reordering pass. Options are `None`, `Swizzle`,
       and `Transpose`.
+    * emit_sched_barriers: Boolean option indicating whether to emit
+      sched_group_barrier ops to interleave memory and compute instructions
+      in the prefetching pass.
   }];
 
   let mnemonic = "pipeline_options";
@@ -989,7 +992,8 @@ def IREEGPU_GPUPipelineOptionsAttr : AttrDef<IREEGPU_Dialect, "GPUPipelineOption
     OptionalParameter<"std::optional<int64_t>">:$prefetch_num_stages,
     OptionalParameter<"BoolAttr">:$no_reduce_shared_memory_bank_conflicts,
     OptionalParameter<"BoolAttr">:$use_igemm_convolution,
-    OptionalParameter<"ReorderWorkgroupsStrategyAttr">:$reorder_workgroups_strategy
+    OptionalParameter<"ReorderWorkgroupsStrategyAttr">:$reorder_workgroups_strategy,
+    OptionalParameter<"BoolAttr">:$emit_sched_barriers
   );
 
   let builders = [
@@ -997,7 +1001,8 @@ def IREEGPU_GPUPipelineOptionsAttr : AttrDef<IREEGPU_Dialect, "GPUPipelineOption
         CArg<"unsigned", "0">:$prefetch_num_stages,
         CArg<"bool", "false">:$no_reduce_shared_memory_bank_conflicts,
         CArg<"bool", "false">:$use_igemm_convolution,
-        CArg<"std::optional<ReorderWorkgroupsStrategy>", "{}">:$reorder_workgroups_strategy)>
+        CArg<"std::optional<ReorderWorkgroupsStrategy>", "{}">:$reorder_workgroups_strategy,
+        CArg<"bool", "false">:$emit_sched_barriers)>
   ];
 
   let assemblyFormat = "`<` struct(params) `>`";

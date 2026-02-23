@@ -621,6 +621,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
     funcPassManager.addPass(createRemoveSingleIterationLoopPass());
     ROCDLPrefetchSharedMemoryPassOptions prefetchOpts;
     prefetchOpts.numStages = pipelineOptions.prefetchNumStages;
+    prefetchOpts.emitSchedBarriers = pipelineOptions.emitSchedBarriers;
     funcPassManager.addPass(createROCDLPrefetchSharedMemoryPass(prefetchOpts));
   }
 
@@ -885,6 +886,7 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   if (forROCDL && options.prefetchNumStages >= 2) {
     ROCDLPrefetchSharedMemoryPassOptions prefetchOpts;
     prefetchOpts.numStages = options.prefetchNumStages;
+    prefetchOpts.emitSchedBarriers = options.emitSchedBarriers;
     funcPassManager.addPass(createROCDLPrefetchSharedMemoryPass(prefetchOpts));
   }
   if (clLLVMGPUEnableSharedMemoryReuse) {

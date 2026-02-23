@@ -77,6 +77,7 @@ struct GPUPipelineOptions {
   unsigned prefetchNumStages = 0;
   bool useIgemmConvolution = false;
   bool enableUkernels = false;
+  bool emitSchedBarriers = false;
   std::optional<ReorderWorkgroupsStrategy> reorderStrategy;
 };
 

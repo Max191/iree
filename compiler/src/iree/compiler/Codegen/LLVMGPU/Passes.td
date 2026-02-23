@@ -103,6 +103,9 @@ def ROCDLPrefetchSharedMemoryPass :
     Option<"numStages", "num-stages", "unsigned",
            /*default=*/"2",
            "Number of pipeline stages (1, 2, or 3+)">,
+    Option<"emitSchedBarriers", "emit-sched-barriers", "bool",
+           /*default=*/"false",
+           "Emit sched_group_barrier ops to interleave memory and compute">,
   ];
 }
 

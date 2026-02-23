@@ -2164,6 +2164,10 @@ getPipelineOptions(FunctionOpInterface funcOp,
     if (reorderWorkgroupsStrategy) {
       pipelineOptions.reorderStrategy = reorderWorkgroupsStrategy.getValue();
     }
+    BoolAttr emitSchedBarriers = pipelineOptionsAttr.getEmitSchedBarriers();
+    if (emitSchedBarriers) {
+      pipelineOptions.emitSchedBarriers = emitSchedBarriers.getValue();
+    }
   }
 
   pipelineOptions.enableUkernels =
@@ -2193,6 +2197,7 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
             << options.enableReduceSharedMemoryBankConflicts
             << ", prefetchNumStages = " << options.prefetchNumStages
             << ", useIgemmConvolution = " << options.useIgemmConvolution
+            << ", emitSchedBarriers = " << options.emitSchedBarriers
             << ", reorderWorkgroupsStrategy = " << reorderStr
             << ", enableUkernels = " << options.enableUkernels << "}";
 }
