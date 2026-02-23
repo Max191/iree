@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -83,6 +84,234 @@ struct StageClassification {
     return ops;
   }
 };
+//===----------------------------------------------------------------------===//
+// Scheduling barrier constants and helpers
+//===----------------------------------------------------------------------===//
+
+// ISA instruction width for ds_read_b128/ds_write_b128/buffer_load_dwordx4.
+static constexpr unsigned kPreferredLoadStoreWidthBits = 128;
+
+// SchedGroupMask values matching LLVM's AMDGPUIGroupLP.cpp.
+static constexpr uint32_t kMaskMFMA = 0x008;
+static constexpr uint32_t kMaskVMEMRead = 0x020;
+static constexpr uint32_t kMaskDSRead = 0x100;
+static constexpr uint32_t kMaskDSWrite = 0x200;
+
+/// Estimate the number of ISA load/store instructions a vector transfer op
+/// will lower to. The count is: product of non-contiguous dimensions *
+/// ceil(contiguous_bits / preferred_width).
+static unsigned estimateISAInstCount(VectorType vecType) {
+  if (!vecType || vecType.getRank() == 0)
+    return 1;
+
+  ArrayRef<int64_t> shape = vecType.getShape();
+  unsigned elementBits = vecType.getElementTypeBitWidth();
+
+  // The last dimension is contiguous (fastest-varying in memory).
+  int64_t contiguousDimSize = shape.back();
+  unsigned contiguousBits = contiguousDimSize * elementBits;
+  unsigned loadsPerSlice =
+      llvm::divideCeil(contiguousBits, kPreferredLoadStoreWidthBits);
+
+  // All other dimensions are non-contiguous slices.
+  unsigned numSlices = 1;
+  for (int64_t i = 0, e = shape.size() - 1; i < e; ++i) {
+    numSlices *= shape[i];
+  }
+
+  return loadsPerSlice * numSlices;
+}
+
+static unsigned estimateISAInstCount(vector::TransferReadOp op) {
+  return estimateISAInstCount(op.getVectorType());
+}
+
+static unsigned estimateISAInstCount(vector::TransferWriteOp op) {
+  return estimateISAInstCount(op.getVectorType());
+}
+
+//===----------------------------------------------------------------------===//
+// Loop body analysis for scheduling
+//===----------------------------------------------------------------------===//
+
+struct LoopScheduleInfo {
+  unsigned numMFMAs = 0;
+  unsigned numDSReads = 0;
+  unsigned numDSWrites = 0;
+  unsigned numBufferLoads = 0;
+};
+
+/// Analyze a pipelined loop body and count expected ISA instructions by type.
+static LoopScheduleInfo analyzeLoopBody(scf::ForOp forOp) {
+  LoopScheduleInfo info;
+
+  forOp.getBody()->walk([&](Operation *op) {
+    if (isa<amdgpu::MFMAOp>(op)) {
+      info.numMFMAs++;
+    } else if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
+      auto srcType = dyn_cast<MemRefType>(readOp.getBase().getType());
+      if (hasSharedMemoryAddressSpace(srcType)) {
+        info.numDSReads += estimateISAInstCount(readOp);
+      } else if (hasGlobalMemoryAddressSpace(srcType)) {
+        info.numBufferLoads += estimateISAInstCount(readOp);
+      }
+    } else if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+      auto dstType = dyn_cast<MemRefType>(writeOp.getBase().getType());
+      if (hasSharedMemoryAddressSpace(dstType)) {
+        info.numDSWrites += estimateISAInstCount(writeOp);
+      }
+    } else if (isa<amdgpu::GatherToLDSOp>(op)) {
+      // Fused global→LDS copy: one buffer_load + one ds_write per op.
+      info.numBufferLoads++;
+      info.numDSWrites++;
+    }
+  });
+
+  LDBG() << "Loop schedule analysis: MFMAs=" << info.numMFMAs
+         << " DSReads=" << info.numDSReads << " DSWrites=" << info.numDSWrites
+         << " BufferLoads=" << info.numBufferLoads;
+
+  return info;
+}
+
+//===----------------------------------------------------------------------===//
+// Interleaved schedule generation
+//===----------------------------------------------------------------------===//
+
+/// Generate an interleaved schedule from instruction counts.
+/// Returns a sequence of (mask, count) pairs for sched_group_barrier emission.
+///
+/// The schedule distributes memory operations across groups of MFMAs following
+/// a CK-inspired pattern:
+///   ds_write(W/N) → MFMA(1) → buffer_load(L/N) → MFMA(1) → ds_read(R/N)
+///   → MFMA(remaining)
+static SmallVector<std::pair<uint32_t, uint32_t>>
+generateInterleavedSchedule(const LoopScheduleInfo &info) {
+  SmallVector<std::pair<uint32_t, uint32_t>> schedule;
+
+  if (info.numMFMAs == 0)
+    return schedule;
+
+  constexpr unsigned kGroupSize = 4;
+  unsigned numGroups = llvm::divideCeil(info.numMFMAs, kGroupSize);
+
+  // Per-group shares (distributed evenly across groups).
+  unsigned dsWritePerGroup = info.numDSWrites / numGroups;
+  unsigned bufLoadPerGroup = info.numBufferLoads / numGroups;
+  unsigned dsReadPerGroup = info.numDSReads / numGroups;
+
+  // Remainders go to the last group.
+  unsigned dsWriteRemainder = info.numDSWrites % numGroups;
+  unsigned bufLoadRemainder = info.numBufferLoads % numGroups;
+  unsigned dsReadRemainder = info.numDSReads % numGroups;
+
+  unsigned mfmasRemaining = info.numMFMAs;
+
+  for (unsigned g = 0; g < numGroups; ++g) {
+    bool isLast = (g == numGroups - 1);
+    unsigned mfmasThisGroup = std::min(kGroupSize, mfmasRemaining);
+    mfmasRemaining -= mfmasThisGroup;
+
+    unsigned writes = dsWritePerGroup + (isLast ? dsWriteRemainder : 0);
+    unsigned loads = bufLoadPerGroup + (isLast ? bufLoadRemainder : 0);
+    unsigned reads = dsReadPerGroup + (isLast ? dsReadRemainder : 0);
+
+    // Pattern: ds_write → MFMA(1) → buffer_load → MFMA(1) → ds_read →
+    //          MFMA(remaining)
+    unsigned mfmaUsed = 0;
+
+    if (writes > 0) {
+      schedule.push_back({kMaskDSWrite, writes});
+    }
+    if (mfmasThisGroup > mfmaUsed + 1) {
+      schedule.push_back({kMaskMFMA, 1});
+      mfmaUsed++;
+    }
+    if (loads > 0) {
+      schedule.push_back({kMaskVMEMRead, loads});
+    }
+    if (mfmasThisGroup > mfmaUsed + 1) {
+      schedule.push_back({kMaskMFMA, 1});
+      mfmaUsed++;
+    }
+    if (reads > 0) {
+      schedule.push_back({kMaskDSRead, reads});
+    }
+    // Remaining MFMAs in this group.
+    unsigned remaining = mfmasThisGroup - mfmaUsed;
+    if (remaining > 0) {
+      schedule.push_back({kMaskMFMA, remaining});
+    }
+  }
+
+  return schedule;
+}
+
+//===----------------------------------------------------------------------===//
+// Sched group barrier emission
+//===----------------------------------------------------------------------===//
+
+/// Insert rocdl.sched.group.barrier ops into the pipelined loop body to
+/// create an interleaved instruction schedule.
+static void insertSchedGroupBarriers(RewriterBase &rewriter,
+                                     scf::ForOp pipelinedLoop) {
+  LoopScheduleInfo info = analyzeLoopBody(pipelinedLoop);
+
+  // Only emit scheduling barriers if there are MFMAs to interleave with.
+  if (info.numMFMAs == 0) {
+    LDBG() << "No MFMAs in loop body, skipping sched group barriers";
+    return;
+  }
+
+  SmallVector<std::pair<uint32_t, uint32_t>> schedule =
+      generateInterleavedSchedule(info);
+
+  if (schedule.empty())
+    return;
+
+  LDBG() << "Inserting " << schedule.size() << " sched_group_barrier ops";
+
+  Location loc = pipelinedLoop.getLoc();
+  Block *body = pipelinedLoop.getBody();
+
+  // Collect gpu.barrier positions in the loop body.
+  SmallVector<gpu::BarrierOp> gpuBarriers;
+  for (Operation &op : *body) {
+    if (auto barrier = dyn_cast<gpu::BarrierOp>(&op))
+      gpuBarriers.push_back(barrier);
+  }
+
+  // Insert a rocdl.sched.barrier (fence, mask=0) after each gpu.barrier
+  // to prevent the LLVM scheduler from reordering across workgroup barriers.
+  for (gpu::BarrierOp barrier : gpuBarriers) {
+    rewriter.setInsertionPointAfter(barrier);
+    ROCDL::SchedBarrier::create(rewriter, loc, /*mask=*/0);
+  }
+
+  // Insert the group barrier schedule after the last gpu.barrier (before
+  // the compute section), or at the beginning of the loop body if no
+  // gpu.barrier exists.
+  if (!gpuBarriers.empty()) {
+    // Find the sched.barrier fence we just inserted after the last gpu.barrier.
+    // The schedule goes after that fence.
+    Operation *lastGpuBarrier = gpuBarriers.back().getOperation();
+    // Move past the gpu.barrier and the sched.barrier fence we inserted.
+    auto insertPt = std::next(Block::iterator(lastGpuBarrier));
+    // Skip past the rocdl.sched.barrier we just inserted.
+    if (insertPt != body->end() && isa<ROCDL::SchedBarrier>(&*insertPt))
+      ++insertPt;
+    rewriter.setInsertionPoint(body, insertPt);
+  } else {
+    rewriter.setInsertionPointToStart(body);
+  }
+
+  // Emit the interleaved schedule as sched_group_barrier ops.
+  for (auto [mask, count] : schedule) {
+    ROCDL::SchedGroupBarrier::create(rewriter, loc, /*mask=*/mask,
+                                     /*size=*/count, /*groupId=*/0);
+  }
+}
+
 } // namespace
 
 /// Checks if a loop contains gather_to_lds operations directly in the loop
@@ -1176,6 +1405,11 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
 
   // Insert barriers using the appropriate strategy for each mode.
   insertPipelineBarriers(rewriter, newForOp, mode);
+
+  // Insert scheduling group barriers to interleave memory and compute.
+  if (emitSchedBarriers) {
+    insertSchedGroupBarriers(rewriter, newForOp);
+  }
 
   return newForOp;
 }
