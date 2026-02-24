@@ -458,14 +458,31 @@ util.func public @conv_2d_nhwc_chwf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<
   util.return %0 : tensor<1x14x14x16xf32>
 }
 
+// CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d4)>
+// CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d4, d3)>
+// CHECK-DAG:  #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
 // CHECK:      util.func public @conv_2d_nhwc_chwf(
-// CHECK:        %[[IM2COL:.+]] = iree_linalg_ext.im2col
+// CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x16x16x4xf32>
+// CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: tensor<4x3x3x16xf32>
+// CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: tensor<1x14x14x16xf32>
+// CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
 // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
 // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
 // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
-// CHECK-SAME:   input_k_perm = [2, 0, 1]
-// CHECK-SAME:   ins({{.*}} : tensor<1x16x16x4xf32>)
+// CHECK-SAME:   input_k_perm = [0, 1, 2]
+// CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf32>)
 // CHECK-SAME:   outs({{.*}} : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+// CHECK:      %[[TRANSPOSED:.+]] = linalg.transpose ins(%[[ARG1]] : tensor<4x3x3x16xf32>) outs({{.*}} : tensor<3x3x4x16xf32>) permutation = [1, 2, 0, 3]
+// CHECK:      %[[COLLAPSED:.+]] = tensor.collapse_shape %[[TRANSPOSED]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf32> into tensor<36x16xf32>
+// CHECK:      %[[MATMUL:.+]] = linalg.generic
+// CHECK-SAME:   indexing_maps = [#[[MAP]], #[[MAP1]], #[[MAP2]]]
+// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
+// CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<1x14x14x36xf32>, tensor<36x16xf32>)
+// CHECK-SAME:   outs(%[[ARG2]] : tensor<1x14x14x16xf32>) {
+// CHECK:          arith.mulf
+// CHECK:          arith.addf
+// CHECK:      } -> tensor<1x14x14x16xf32>
+// CHECK:      util.return %[[MATMUL]] : tensor<1x14x14x16xf32>
 
 // -----
 
@@ -482,14 +499,31 @@ util.func public @conv_1d_nhc_chf(%arg0: tensor<1x3x2xf32>, %arg1: tensor<2x2x2x
   util.return %0 : tensor<1x2x2xf32>
 }
 
+// CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+// CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3) -> (d3, d2)>
+// CHECK-DAG:  #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
 // CHECK:      util.func public @conv_1d_nhc_chf(
-// CHECK:        %[[IM2COL:.+]] = iree_linalg_ext.im2col
+// CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
+// CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: tensor<2x2x2xf32>
+// CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: tensor<1x2x2xf32>
+// CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
 // CHECK-SAME:   strides = [1] dilations = [1] kernel_size = [2]
 // CHECK-SAME:   m_offset = [0] * [1] k_offset = [0] * [1]
 // CHECK-SAME:   batch_pos = [0] m_pos = [1] k_pos = [2]
-// CHECK-SAME:   input_k_perm = [1, 0]
-// CHECK-SAME:   ins({{.*}} : tensor<1x3x2xf32>)
+// CHECK-SAME:   input_k_perm = [0, 1]
+// CHECK-SAME:   ins(%[[ARG0]] : tensor<1x3x2xf32>)
 // CHECK-SAME:   outs({{.*}} : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
+// CHECK:      %[[TRANSPOSED:.+]] = linalg.transpose ins(%[[ARG1]] : tensor<2x2x2xf32>) outs({{.*}} : tensor<2x2x2xf32>) permutation = [1, 0, 2]
+// CHECK:      %[[COLLAPSED:.+]] = tensor.collapse_shape %[[TRANSPOSED]] {{\[}}[0, 1], [2]] : tensor<2x2x2xf32> into tensor<4x2xf32>
+// CHECK:      %[[MATMUL:.+]] = linalg.generic
+// CHECK-SAME:   indexing_maps = [#[[MAP]], #[[MAP1]], #[[MAP2]]]
+// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+// CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<1x2x4xf32>, tensor<4x2xf32>)
+// CHECK-SAME:   outs(%[[ARG2]] : tensor<1x2x2xf32>) {
+// CHECK:          arith.mulf
+// CHECK:          arith.addf
+// CHECK:      } -> tensor<1x2x2xf32>
+// CHECK:      util.return %[[MATMUL]] : tensor<1x2x2xf32>
 
 // -----
 

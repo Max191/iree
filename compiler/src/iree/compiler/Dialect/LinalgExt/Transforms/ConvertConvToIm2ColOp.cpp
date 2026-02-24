@@ -66,14 +66,27 @@ static SmallVector<int64_t> getBasisFromShape(ArrayRef<int64_t> shape) {
   return basis;
 }
 
-// Computes `inputKPerm` that maps the input spatial and channel dimension order
-// to filter's.
+// Returns the identity permutation for im2col's K linearization, preserving
+// the input tensor's native reduction dimension order. This enables
+// vector-friendly memory access patterns (e.g., HWC order for NHWC inputs).
 static SmallVector<int64_t>
-computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
-                  const mlir::linalg::ConvolutionDimensions &convDims) {
-  // Get reduction dims from input and filter in order of appearance.
+computeInputKPerm(const mlir::linalg::ConvolutionDimensions &convDims) {
+  SmallVector<int64_t> inputKPerm(convDims.inputChannel.size() +
+                                  convDims.filterLoop.size());
+  std::iota(inputKPerm.begin(), inputKPerm.end(), 0);
+  return inputKPerm;
+}
+
+// Computes the permutation needed to transpose the filter tensor so that its
+// reduction dimensions match the input tensor's native reduction order.
+// Returns std::nullopt if no transpose is needed (orders already match).
+static std::optional<SmallVector<int64_t>>
+computeFilterTransposePerm(AffineMap inputMap, AffineMap filterMap,
+                           const mlir::linalg::ConvolutionDimensions &convDims) {
   auto reductionDims =
       llvm::concat<const unsigned>(convDims.inputChannel, convDims.filterLoop);
+
+  // Get reduction dims in order of appearance in input map.
   SmallVector<int64_t> inputReductionDims;
   for (AffineExpr dimExpr : inputMap.getResults()) {
     for (unsigned reductionDim : reductionDims) {
@@ -82,6 +95,8 @@ computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
       }
     }
   }
+
+  // Get reduction dims in order of appearance in filter map.
   SmallVector<int64_t> filterReductionDims;
   for (AffineExpr dimExpr : filterMap.getResults()) {
     for (unsigned reductionDim : reductionDims) {
@@ -91,15 +106,38 @@ computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
     }
   }
 
-  // Compute the permutation that maps inputSharedDims to filterSharedDims.
-  SmallVector<int64_t> inputKPerm;
-  for (int64_t dim : filterReductionDims) {
-    auto it = llvm::find(inputReductionDims, dim);
-    assert(it != inputReductionDims.end() &&
-           "Filter dimension not found in input shared dimensions");
-    inputKPerm.push_back(std::distance(inputReductionDims.begin(), it));
+  // If the reduction dim orders already match, no transpose needed.
+  if (inputReductionDims == filterReductionDims)
+    return std::nullopt;
+
+  // For each reduction dim in the input's order, find its physical position
+  // in the filter tensor.
+  SmallVector<int64_t> desiredPositions;
+  for (int64_t dim : inputReductionDims) {
+    auto pos = filterMap.getResultPosition(
+        getAffineDimExpr(dim, filterMap.getContext()));
+    desiredPositions.push_back(pos.value());
   }
-  return inputKPerm;
+
+  // Get current sorted reduction dim positions in the filter.
+  SmallVector<int64_t> currentPositions;
+  for (int64_t dim : filterReductionDims) {
+    auto pos = filterMap.getResultPosition(
+        getAffineDimExpr(dim, filterMap.getContext()));
+    currentPositions.push_back(pos.value());
+  }
+  llvm::sort(currentPositions);
+
+  // Build full permutation: reduction dims are reordered to match the input's
+  // order; non-reduction dims keep their positions.
+  int64_t filterRank = filterMap.getNumResults();
+  SmallVector<int64_t> perm(filterRank);
+  std::iota(perm.begin(), perm.end(), 0);
+  for (size_t i = 0; i < currentPositions.size(); ++i) {
+    perm[currentPositions[i]] = desiredPositions[i];
+  }
+
+  return perm;
 }
 
 namespace {
@@ -256,8 +294,7 @@ public:
     SmallVector<OpFoldResult> kOffset(kBasis.size(), rewriter.getIndexAttr(0));
     SmallVector<OpFoldResult> mOffset(mBasis.size(), rewriter.getIndexAttr(0));
 
-    SmallVector<int64_t> inputKPerm =
-        computeInputKPerm(inputMap, filterMap, convDims);
+    SmallVector<int64_t> inputKPerm = computeInputKPerm(convDims);
 
     auto loc = linalgOp.getLoc();
     // Shape of the resulting tensor from im2col.
@@ -278,8 +315,27 @@ public:
             batchPos, mPos, kPos, inputKPerm, outputPerm)
             .getResult(0);
 
+    // If the filter's reduction dim order differs from the input's native
+    // order, transpose the filter before collapsing so that the collapsed K
+    // dimension uses the same linearization as the im2col output.
+    Value filterToCollapse = filter;
+    auto filterTransposePerm =
+        computeFilterTransposePerm(inputMap, filterMap, convDims);
+    if (filterTransposePerm) {
+      SmallVector<int64_t> transposedShape(filterShape.size());
+      for (size_t i = 0; i < filterShape.size(); ++i) {
+        transposedShape[i] = filterShape[(*filterTransposePerm)[i]];
+      }
+      Value emptyTensor = tensor::EmptyOp::create(
+          rewriter, loc, transposedShape, filterType.getElementType());
+      filterToCollapse =
+          linalg::TransposeOp::create(rewriter, loc, filter, emptyTensor,
+                                      *filterTransposePerm)
+              ->getResult(0);
+    }
+
     Value reshapedFilter = tensor::CollapseShapeOp::create(
-        rewriter, loc, filter, filterReassocIndices);
+        rewriter, loc, filterToCollapse, filterReassocIndices);
 
     auto genericGEMMOp = linalg::GenericOp::create(
         rewriter, loc, outputType,
