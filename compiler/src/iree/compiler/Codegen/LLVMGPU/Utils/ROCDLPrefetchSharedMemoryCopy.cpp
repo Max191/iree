@@ -196,15 +196,16 @@ struct SchedGroupEntry {
   uint32_t count;
 };
 
-/// Generate an interleaved schedule from instruction counts.
-/// Returns a sequence of schedule entries for sched_group_barrier emission.
+/// Generate an async copy (CK-style) interleaved schedule from instruction
+/// counts. Returns a sequence of schedule entries for sched_group_barrier
+/// emission.
 ///
 /// The schedule distributes memory operations across groups of MFMAs following
-/// a CK-inspired pattern:
+/// a CK-inspired pattern designed for multi-buffered LDS pipelines:
 ///   ds_write(W/N) → MFMA(1) → buffer_load(L/N) → MFMA(1) → ds_read(R/N)
 ///   → MFMA(remaining)
 static SmallVector<SchedGroupEntry>
-generateInterleavedSchedule(const LoopScheduleInfo &info) {
+generateAsyncCopySchedule(const LoopScheduleInfo &info) {
   SmallVector<SchedGroupEntry> schedule;
 
   if (info.numMFMAs == 0)
@@ -267,14 +268,67 @@ generateInterleavedSchedule(const LoopScheduleInfo &info) {
   return schedule;
 }
 
+/// Generate a compute-phase-only schedule for StreamCopy pipelines.
+/// Only interleaves MFMAs with DS reads — DS writes and buffer loads are
+/// phase-separated by s_barrier (workgroup sync) and cannot be interleaved
+/// with compute.
+static SmallVector<SchedGroupEntry>
+generateStreamCopySchedule(const LoopScheduleInfo &info) {
+  // Only interleave MFMAs with DS reads in StreamCopy mode.
+  // DS writes and buffer loads are phase-separated by s_barrier
+  // and cannot be interleaved with compute.
+  if (info.numMFMAs == 0 || info.numDSReads == 0)
+    return {};
+
+  constexpr unsigned kGroupSize = 4;
+  unsigned numGroups = llvm::divideCeil(info.numMFMAs, kGroupSize);
+
+  unsigned dsReadPerGroup = info.numDSReads / numGroups;
+  unsigned dsReadRemainder = info.numDSReads % numGroups;
+  unsigned mfmasRemaining = info.numMFMAs;
+
+  SmallVector<SchedGroupEntry> schedule;
+  for (unsigned g = 0; g < numGroups; ++g) {
+    bool isLast = (g == numGroups - 1);
+    unsigned mfmasThisGroup = std::min(kGroupSize, mfmasRemaining);
+    mfmasRemaining -= mfmasThisGroup;
+
+    unsigned reads = dsReadPerGroup + (isLast ? dsReadRemainder : 0);
+
+    // Pattern: ds_read(R/N) -> MFMA(group)
+    // Place reads first so they have time to complete before
+    // next group's MFMAs consume them.
+    if (reads > 0) {
+      schedule.push_back({kMaskDSRead, reads});
+    }
+    schedule.push_back({kMaskMFMA, mfmasThisGroup});
+  }
+  return schedule;
+}
+
+/// Dispatch to the appropriate schedule generation strategy based on pipeline
+/// mode.
+static SmallVector<SchedGroupEntry>
+generateSchedule(const LoopScheduleInfo &info, PipelineMode mode) {
+  switch (mode) {
+  case PipelineMode::StreamCopy:
+    return generateStreamCopySchedule(info);
+  case PipelineMode::AsyncCopy:
+    return generateAsyncCopySchedule(info);
+  }
+  llvm_unreachable("unhandled PipelineMode");
+}
+
 //===----------------------------------------------------------------------===//
 // Sched group barrier emission
 //===----------------------------------------------------------------------===//
 
 /// Insert rocdl.sched.group.barrier ops into the pipelined loop body to
-/// create an interleaved instruction schedule.
+/// create an interleaved instruction schedule. The schedule strategy is
+/// selected based on the pipeline mode.
 static void insertSchedGroupBarriers(RewriterBase &rewriter,
-                                     scf::ForOp pipelinedLoop) {
+                                     scf::ForOp pipelinedLoop,
+                                     PipelineMode mode) {
   LoopScheduleInfo info = analyzeLoopBody(pipelinedLoop);
 
   // Only emit scheduling barriers if there are MFMAs to interleave with.
@@ -290,8 +344,7 @@ static void insertSchedGroupBarriers(RewriterBase &rewriter,
     return;
   }
 
-  SmallVector<SchedGroupEntry> schedule =
-      generateInterleavedSchedule(info);
+  SmallVector<SchedGroupEntry> schedule = generateSchedule(info, mode);
 
   if (schedule.empty())
     return;
@@ -1435,7 +1488,7 @@ FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
 
   // Insert scheduling group barriers to interleave memory and compute.
   if (emitSchedBarriers) {
-    insertSchedGroupBarriers(rewriter, newForOp);
+    insertSchedGroupBarriers(rewriter, newForOp, mode);
   }
 
   return newForOp;

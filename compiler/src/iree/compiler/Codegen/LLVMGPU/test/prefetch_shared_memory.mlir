@@ -696,11 +696,12 @@ func.func @sched_barrier_gemm(
 
 // After pipelining with emit-sched-barriers=true, the loop body should have:
 // 1. rocdl.sched.barrier (fence) after each gpu.barrier
-// 2. rocdl.sched.group.barrier ops with expected masks for interleaved scheduling
+// 2. rocdl.sched.group.barrier ops with expected masks for the StreamCopy
+//    compute-phase schedule (DS_READ + MFMA only, no DS_WRITE or VMEM_READ)
 //
-// The loop has 4 MFMAs, 2 ds_reads, 2 ds_writes, 2 buffer_loads.
+// The loop has 4 MFMAs, 2 ds_reads. StreamCopy mode only interleaves these.
 // With 4 MFMAs / group_size=4 = 1 group, the schedule is:
-//   ds_write(2) → MFMA(1) → buffer_load(2) → MFMA(1) → ds_read(2) → MFMA(2)
+//   ds_read(2) -> MFMA(4)
 
 // Check fence after first gpu.barrier
 //      SCHED: gpu.barrier
@@ -710,18 +711,14 @@ func.func @sched_barrier_gemm(
 //      SCHED: gpu.barrier
 // SCHED-NEXT: amdgpu.sched_barrier allow = <none>
 
-// ds_write group (mask=0x200=512, count=2)
-// SCHED-NEXT: rocdl.sched.group.barrier 512, 2, 0
-// MFMA group (mask=0x008=8, count=1)
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
-// buffer_load/VMEM read group (mask=0x020=32, count=2)
-// SCHED-NEXT: rocdl.sched.group.barrier 32, 2, 0
-// MFMA group (mask=0x008=8, count=1)
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
 // ds_read group (mask=0x100=256, count=2)
 // SCHED-NEXT: rocdl.sched.group.barrier 256, 2, 0
-// Remaining MFMAs (mask=0x008=8, count=2)
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 2, 0
+// MFMA group (mask=0x008=8, count=4)
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 4, 0
+
+// No DS_WRITE or VMEM_READ barriers in StreamCopy mode
+// SCHED-NOT: rocdl.sched.group.barrier 512
+// SCHED-NOT: rocdl.sched.group.barrier 32
 
 //      SCHED: return
 
@@ -740,8 +737,9 @@ func.func @sched_barrier_gemm(
 // -----
 
 // Test multi-group scheduling with 5 MFMAs (ceil(5/4)=2 groups).
-// Group 0 (4 MFMAs): ds_write(1) → MFMA(1) → buffer_load(1) → MFMA(1) → ds_read(1) → MFMA(2)
-// Group 1 (1 MFMA):  ds_write(1) → buffer_load(1) → ds_read(1) → MFMA(1)
+// StreamCopy mode: only DS_READ + MFMA barriers.
+// Group 0 (4 MFMAs): ds_read(1) -> MFMA(4)
+// Group 1 (1 MFMA):  ds_read(1) -> MFMA(1)
 
 // SCHED-LABEL: @sched_barrier_gemm_multigroup
 func.func @sched_barrier_gemm_multigroup(
@@ -797,23 +795,22 @@ func.func @sched_barrier_gemm_multigroup(
   return
 }
 
-// 5 MFMAs, 2 buffer_loads, 2 ds_writes, 2 ds_reads → 2 groups.
-// Group 0 (4 MFMAs, 1 each of mem ops):
+// 5 MFMAs, 2 ds_reads -> 2 groups (StreamCopy: DS_READ + MFMA only).
+// Group 0 (4 MFMAs, 1 ds_read):
 //      SCHED: gpu.barrier
 // SCHED-NEXT: amdgpu.sched_barrier allow = <none>
 //      SCHED: gpu.barrier
 // SCHED-NEXT: amdgpu.sched_barrier allow = <none>
-// SCHED-NEXT: rocdl.sched.group.barrier 512, 1, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 32, 1, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
 // SCHED-NEXT: rocdl.sched.group.barrier 256, 1, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 2, 0
-// Group 1 (1 MFMA, 1 each of mem ops):
-// SCHED-NEXT: rocdl.sched.group.barrier 512, 1, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 32, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 4, 0
+// Group 1 (1 MFMA, 1 ds_read):
 // SCHED-NEXT: rocdl.sched.group.barrier 256, 1, 0
 // SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+
+// No DS_WRITE or VMEM_READ barriers in StreamCopy mode
+// SCHED-NOT: rocdl.sched.group.barrier 512
+// SCHED-NOT: rocdl.sched.group.barrier 32
+
 //      SCHED: return
 
 // NOSCHED-LABEL: @sched_barrier_gemm_multigroup
@@ -828,9 +825,9 @@ func.func @sched_barrier_gemm_multigroup(
 
 // -----
 
-// Test fewer-than-4-MFMAs case (2 MFMAs). The second MFMA interleave slot
-// is skipped since there aren't enough MFMAs to fill both interleave points.
-// Schedule: ds_write(2) → MFMA(1) → buffer_load(2) → ds_read(2) → MFMA(1)
+// Test fewer-than-4-MFMAs case (2 MFMAs).
+// StreamCopy mode: only DS_READ + MFMA barriers.
+// Schedule: ds_read(2) -> MFMA(2)
 
 // SCHED-LABEL: @sched_barrier_gemm_small
 func.func @sched_barrier_gemm_small(
@@ -874,19 +871,19 @@ func.func @sched_barrier_gemm_small(
   return
 }
 
-// 2 MFMAs, 2 buffer_loads, 2 ds_writes, 2 ds_reads → 1 group.
-// With only 2 MFMAs, the second interleave slot (between buffer_load and
-// ds_read) is skipped:
-//   ds_write(2) → MFMA(1) → buffer_load(2) → ds_read(2) → MFMA(1)
+// 2 MFMAs, 2 ds_reads -> 1 group (StreamCopy: DS_READ + MFMA only).
+// Schedule: ds_read(2) -> MFMA(2)
 //      SCHED: gpu.barrier
 // SCHED-NEXT: amdgpu.sched_barrier allow = <none>
 //      SCHED: gpu.barrier
 // SCHED-NEXT: amdgpu.sched_barrier allow = <none>
-// SCHED-NEXT: rocdl.sched.group.barrier 512, 2, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 32, 2, 0
 // SCHED-NEXT: rocdl.sched.group.barrier 256, 2, 0
-// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 2, 0
+
+// No DS_WRITE or VMEM_READ barriers in StreamCopy mode
+// SCHED-NOT: rocdl.sched.group.barrier 512
+// SCHED-NOT: rocdl.sched.group.barrier 32
+
 //      SCHED: return
 
 // NOSCHED-LABEL: @sched_barrier_gemm_small
