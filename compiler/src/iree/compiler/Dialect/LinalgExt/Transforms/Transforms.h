@@ -39,6 +39,9 @@ void populateBubbleTransposeFromLinalgExtOps(
 void populateFoldUnitExtentDimsPatterns(
     RewritePatternSet &patterns, const linalg::ControlDropUnitDims &options);
 
+/// Fold tensor.pad producer into a consumer iree_linalg_ext.map_load.
+void populateFoldPadIntoMapLoadPatterns(RewritePatternSet &patterns);
+
 /// Patterns to convert linalg convolution ops into a gemm with an im2col
 /// op and reshapes on the inputs.
 /// TODO(Max191): Maybe move to transforms and use a funcOp walk instead of a
