@@ -1199,6 +1199,111 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// Pad to MapLoad Raising
+//===----------------------------------------------------------------------===//
+
+/// Check if a tensor.pad feeds a linalg op that has reduction iterators
+/// (e.g., a convolution or contraction). This prevents raising arbitrary pads
+/// and focuses on pads that participate in reductions where fusion matters.
+static bool padFeedsReductionConsumer(tensor::PadOp padOp) {
+  for (Operation *user : padOp.getResult().getUsers()) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(user);
+    if (linalgOp && linalgOp.getNumReductionLoops() > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Raises a `tensor.pad` with a constant padding value into an
+/// `iree_linalg_ext.map_load`. The map_load reads from the unpadded source
+/// tensor, subtracting the low-pad offsets from each output index to compute
+/// the source index, and uses the pad's constant value as the out-of-bounds
+/// padding. This enables the padded input to fuse into the same dispatch as
+/// its consumer (e.g., a convolution), avoiding a separate fill+insert_slice
+/// dispatch.
+class RaisePadToMapLoad : public OpRewritePattern<tensor::PadOp> {
+public:
+  using Base::Base;
+  LogicalResult matchAndRewrite(tensor::PadOp padOp,
+                                PatternRewriter &rewriter) const override {
+    if (!IREE::Flow::isNonNullAndOutsideDispatch(padOp)) {
+      return failure();
+    }
+
+    // Only handle constant padding values.
+    Value padValue = padOp.getConstantPaddingValue();
+    if (!padValue) {
+      return rewriter.notifyMatchFailure(
+          padOp, "pad does not have a constant padding value");
+    }
+
+    // Only raise pads that feed reduction consumers (conv-like ops).
+    if (!padFeedsReductionConsumer(padOp)) {
+      return rewriter.notifyMatchFailure(
+          padOp, "pad does not feed a consumer with reduction dims");
+    }
+
+    Location loc = padOp.getLoc();
+    Value source = padOp.getSource();
+    RankedTensorType resultType = padOp.getResultType();
+    int64_t rank = resultType.getRank();
+
+    // Create the output tensor with the padded shape.
+    // For dynamic dims, compute: source_dim + low_pad + high_pad.
+    SmallVector<OpFoldResult> lowPad = padOp.getMixedLowPad();
+    SmallVector<OpFoldResult> highPad = padOp.getMixedHighPad();
+    SmallVector<Value> dynDims;
+    for (int64_t i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value srcDim =
+            tensor::DimOp::create(rewriter, loc, source, i);
+        Value lowValue =
+            getValueOrCreateConstantIndexOp(rewriter, loc, lowPad[i]);
+        Value highValue =
+            getValueOrCreateConstantIndexOp(rewriter, loc, highPad[i]);
+        Value sum = arith::AddIOp::create(rewriter, loc, srcDim, lowValue);
+        sum = arith::AddIOp::create(rewriter, loc, sum, highValue);
+        dynDims.push_back(sum);
+      }
+    }
+    Value output = tensor::EmptyOp::create(
+        rewriter, loc, resultType.getShape(), resultType.getElementType(),
+        dynDims);
+
+    // Create the map_load op.
+    auto mapLoadOp = IREE::LinalgExt::MapLoadOp::create(
+        rewriter, loc, TypeRange{resultType}, source, output);
+
+    // Build the transformation region.
+    Region &region = mapLoadOp.getTransformationRegion();
+    SmallVector<Type> indexTypes(rank, rewriter.getIndexType());
+    SmallVector<Location> blockArgLocs(rank, loc);
+    OpBuilder::InsertionGuard guard(rewriter);
+    Block *block =
+        rewriter.createBlock(&region, region.end(), indexTypes, blockArgLocs);
+
+    // For each dim, yield: outputIdx - lowPad[dim] as the source index.
+    SmallVector<Value> yieldedValues;
+    for (int64_t i = 0; i < rank; ++i) {
+      Value lowValue =
+          getValueOrCreateConstantIndexOp(rewriter, loc, lowPad[i]);
+      Value adjusted =
+          arith::SubIOp::create(rewriter, loc, block->getArgument(i),
+                                lowValue);
+      yieldedValues.push_back(adjusted);
+    }
+
+    // Add the pad constant value as the out-of-bounds padding.
+    yieldedValues.push_back(padValue);
+    IREE::LinalgExt::YieldOp::create(rewriter, loc, yieldedValues);
+
+    rewriter.replaceOp(padOp, mapLoadOp.getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
@@ -1253,6 +1358,7 @@ struct RaiseSpecialOpsPass
       patterns.insert<ConcatenateNegateAndSlicePattern>(context);
       patterns.insert<RaiseInsertSliceToPad>(context);
       patterns.insert<RaiseReversedGenericToMapLoad>(context);
+      patterns.insert<RaisePadToMapLoad>(context);
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
