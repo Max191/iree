@@ -48,7 +48,8 @@ struct CloneProducersIntoDispatchRegionsPass final
 
     funcOp->walk([&](Operation *op) {
       if (!IREE::Flow::isNonNullAndOutsideDispatch(op) ||
-          !isa<linalg::GenericOp, IREE::LinalgExt::GatherOp>(op)) {
+          !isa<linalg::GenericOp, IREE::LinalgExt::GatherOp,
+              IREE::LinalgExt::MapLoadOp>(op)) {
         return;
       }
       if (failed(IREE::Flow::wrapOpInDispatchRegion(rewriter, op))) {

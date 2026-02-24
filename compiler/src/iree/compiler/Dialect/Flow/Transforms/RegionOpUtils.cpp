@@ -881,7 +881,7 @@ bool isClonableIntoDispatchOp(Operation *op,
     return true;
   }
 
-  if (isa<IREE::LinalgExt::GatherOp>(op)) {
+  if (isa<IREE::LinalgExt::GatherOp, IREE::LinalgExt::MapLoadOp>(op)) {
     return true;
   }
 

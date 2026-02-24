@@ -366,8 +366,8 @@ static bool isRootLikeOp(Operation *op) {
     return !isa<linalg::FillOp>(op);
   }
   if (isa<TilingInterface>(op)) {
-    return !isa<IREE::LinalgExt::GatherOp, tensor::PadOp, tensor::ConcatOp,
-                linalg::PackOp>(op);
+    return !isa<IREE::LinalgExt::GatherOp, IREE::LinalgExt::MapLoadOp,
+                tensor::PadOp, tensor::ConcatOp, linalg::PackOp>(op);
   }
   return isa<linalg::UnPackOp>(op);
 }
