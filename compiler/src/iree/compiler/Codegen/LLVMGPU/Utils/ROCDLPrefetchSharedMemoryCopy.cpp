@@ -170,10 +170,10 @@ static LoopScheduleInfo analyzeLoopBody(scf::ForOp forOp) {
         info.numDSWrites += estimateISAInstCount(writeOp);
       }
     } else if (isa<amdgpu::GatherToLDSOp>(op)) {
-      // GatherToLDSOp maps to a single global_load_lds ISA instruction that
-      // fuses a buffer_load and ds_write. Count as 1 of each.
+      // GatherToLDSOp lowers to global_load_lds, which the LLVM scheduler
+      // classifies as VMEM_READ (isFLAT()=true), not DS_WRITE. Count only
+      // as a buffer load for scheduling purposes.
       info.numBufferLoads++;
-      info.numDSWrites++;
     }
   });
 
@@ -196,14 +196,16 @@ struct SchedGroupEntry {
   uint32_t count;
 };
 
-/// Generate an async copy (CK-style) interleaved schedule from instruction
-/// counts. Returns a sequence of schedule entries for sched_group_barrier
-/// emission.
+/// Generate an async copy interleaved schedule from instruction counts.
+/// Returns a sequence of schedule entries for sched_group_barrier emission.
 ///
-/// The schedule distributes memory operations across groups of MFMAs following
-/// a CK-inspired pattern designed for multi-buffered LDS pipelines:
-///   ds_write(W/N) → MFMA(1) → buffer_load(L/N) → MFMA(1) → ds_read(R/N)
-///   → MFMA(remaining)
+/// DS_WRITE barriers are intentionally omitted: in AsyncCopy mode,
+/// gather_to_lds lowers to global_load_lds which the LLVM scheduler classifies
+/// as VMEM_READ (isFLAT()=true), not DS_WRITE. Emitting DS_WRITE barriers
+/// would match no ISA instructions and waste scheduling budget.
+///
+/// The schedule distributes memory operations across groups of MFMAs:
+///   buffer_load(L/N) → MFMA(1) → ds_read(R/N) → MFMA(remaining)
 static SmallVector<SchedGroupEntry>
 generateAsyncCopySchedule(const LoopScheduleInfo &info) {
   SmallVector<SchedGroupEntry> schedule;
@@ -217,12 +219,10 @@ generateAsyncCopySchedule(const LoopScheduleInfo &info) {
   unsigned numGroups = llvm::divideCeil(info.numMFMAs, kGroupSize);
 
   // Per-group shares (distributed evenly across groups).
-  unsigned dsWritePerGroup = info.numDSWrites / numGroups;
   unsigned bufLoadPerGroup = info.numBufferLoads / numGroups;
   unsigned dsReadPerGroup = info.numDSReads / numGroups;
 
   // Remainders go to the last group.
-  unsigned dsWriteRemainder = info.numDSWrites % numGroups;
   unsigned bufLoadRemainder = info.numBufferLoads % numGroups;
   unsigned dsReadRemainder = info.numDSReads % numGroups;
 
@@ -233,21 +233,12 @@ generateAsyncCopySchedule(const LoopScheduleInfo &info) {
     unsigned mfmasThisGroup = std::min(kGroupSize, mfmasRemaining);
     mfmasRemaining -= mfmasThisGroup;
 
-    unsigned writes = dsWritePerGroup + (isLast ? dsWriteRemainder : 0);
     unsigned loads = bufLoadPerGroup + (isLast ? bufLoadRemainder : 0);
     unsigned reads = dsReadPerGroup + (isLast ? dsReadRemainder : 0);
 
-    // Pattern: ds_write → MFMA(1) → buffer_load → MFMA(1) → ds_read →
-    //          MFMA(remaining)
+    // Pattern: buffer_load → MFMA(1) → ds_read → MFMA(remaining)
     unsigned mfmaUsed = 0;
 
-    if (writes > 0) {
-      schedule.push_back({kMaskDSWrite, writes});
-    }
-    if (mfmasThisGroup > mfmaUsed + 1) {
-      schedule.push_back({kMaskMFMA, 1});
-      mfmaUsed++;
-    }
     if (loads > 0) {
       schedule.push_back({kMaskVMEMRead, loads});
     }

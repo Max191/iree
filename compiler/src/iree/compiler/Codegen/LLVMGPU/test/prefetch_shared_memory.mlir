@@ -895,3 +895,98 @@ func.func @sched_barrier_gemm_small(
 // NOSCHED-FALSE-NOT: rocdl.sched.barrier
 // NOSCHED-FALSE-NOT: rocdl.sched.group.barrier
 // NOSCHED-FALSE: return
+
+// -----
+
+// Test AsyncCopy mode sched_group_barrier emission.
+// AsyncCopy uses gather_to_lds which lowers to global_load_lds (VMEM_READ),
+// NOT DS_WRITE. The schedule should emit VMEM_READ + DS_READ + MFMA barriers
+// only, with NO DS_WRITE barriers (those would be wasted no-ops).
+//
+// This loop has: 2 gather_to_lds (2 VMEM_READ), 2 DS reads, 4 MFMAs.
+// AsyncCopy schedule with 1 group (ceil(4/4)=1):
+//   VMEM_READ(2) → MFMA(1) → DS_READ(2) → MFMA(3)
+
+// SCHED-LABEL: @sched_barrier_async_copy
+func.func @sched_barrier_async_copy(
+    %A_global: memref<128x128xf16>,
+    %B_global: memref<128x128xf16>,
+    %C_global: memref<128xf32>) {
+  %cst = arith.constant dense<0.000000e+00> : vector<4xf32>
+  %cst_f16 = arith.constant 0.000000e+00 : f16
+  %c128 = arith.constant 128 : index
+  %c1 = arith.constant 1 : index
+  %c0 = arith.constant 0 : index
+
+  // gather_to_lds transfer type must be 8/16/32/96/128 bits.
+  // Use vector<2xf16> (32 bits) for gather, read vector<4xf16> for MFMAs.
+  %A_lds = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+  %B_lds = memref.alloc() : memref<4xf16, #gpu.address_space<workgroup>>
+
+  %result = scf.for %k = %c0 to %c128 step %c1 iter_args(%acc = %cst) -> (vector<4xf32>) {
+    // Async copy: gather_to_lds -> global_load_lds (VMEM_READ, NOT DS_WRITE)
+    amdgpu.gather_to_lds %A_global[%c0, %k], %A_lds[%c0] : vector<2xf16>, memref<128x128xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+    amdgpu.gather_to_lds %B_global[%k, %c0], %B_lds[%c0] : vector<2xf16>, memref<128x128xf16>, memref<4xf16, #gpu.address_space<workgroup>>
+
+    // Shared → register (ds_read)
+    %a = vector.transfer_read %A_lds[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+    %b = vector.transfer_read %B_lds[%c0], %cst_f16 : memref<4xf16, #gpu.address_space<workgroup>>, vector<4xf16>
+
+    // Compute (4 MFMAs)
+    %mfma0 = amdgpu.mfma 16x16x16 %a * %b + %acc {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma1 = amdgpu.mfma 16x16x16 %a * %b + %mfma0 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma2 = amdgpu.mfma 16x16x16 %a * %b + %mfma1 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    %mfma3 = amdgpu.mfma 16x16x16 %a * %b + %mfma2 {
+      abid = 0 : i32, cbsz = 0 : i32, blocks = 1 : i32
+    } blgp = none : vector<4xf16>, vector<4xf16>, vector<4xf32>
+
+    scf.yield %mfma3 : vector<4xf32>
+  }
+
+  vector.transfer_write %result, %C_global[%c0] {in_bounds = [true]} : vector<4xf32>, memref<128xf32>
+  return
+}
+
+// After pipelining with emit-sched-barriers=true in AsyncCopy mode:
+// 1. Fences after gpu.barriers
+// 2. Group barriers for the AsyncCopy schedule (VMEM_READ + MFMA + DS_READ +
+//    MFMA, no DS_WRITE)
+//
+// 4 MFMAs, 2 VMEM_READs, 2 DS_READs -> 1 group.
+// Schedule: VMEM_READ(2) → MFMA(1) → DS_READ(2) → MFMA(3)
+
+//      SCHED: gpu.barrier
+// SCHED-NEXT: amdgpu.sched_barrier allow = <none>
+
+// VMEM_READ group (mask=0x020=32, count=2)
+// SCHED-NEXT: rocdl.sched.group.barrier 32, 2, 0
+// MFMA interleave (mask=0x008=8, count=1)
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 1, 0
+// DS_READ group (mask=0x100=256, count=2)
+// SCHED-NEXT: rocdl.sched.group.barrier 256, 2, 0
+// MFMA remaining (mask=0x008=8, count=3)
+// SCHED-NEXT: rocdl.sched.group.barrier 8, 3, 0
+
+// No DS_WRITE barriers in AsyncCopy mode (global_load_lds is VMEM_READ)
+// SCHED-NOT: rocdl.sched.group.barrier 512
+
+//      SCHED: return
+
+// NOSCHED-LABEL: @sched_barrier_async_copy
+// NOSCHED-NOT: rocdl.sched.barrier
+// NOSCHED-NOT: rocdl.sched.group.barrier
+// NOSCHED: return
+
+// NOSCHED-FALSE-LABEL: @sched_barrier_async_copy
+// NOSCHED-FALSE-NOT: rocdl.sched.barrier
+// NOSCHED-FALSE-NOT: rocdl.sched.group.barrier
+// NOSCHED-FALSE: return
