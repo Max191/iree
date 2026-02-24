@@ -48,6 +48,9 @@ struct GPUCodegenOptions : CodegenOptions {
   // Enable prefetch in the vector distribute pipeline.
   bool enablePrefetch = false;
 
+  // Emit sched_group_barrier ops to interleave memory and compute.
+  bool emitSchedBarriers = false;
+
   void bindOptions(OptionsBinder &binder);
   using FromFlags = OptionsFromFlags<GPUCodegenOptions>;
 };

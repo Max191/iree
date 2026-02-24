@@ -397,7 +397,8 @@ static LogicalResult setConvolutionVectorDistributionConfig(
         context, /*prefetch_num_stages=*/2,
         /*no_reduce_shared_memory_bank_conflicts=*/false,
         /*use_igemm_convolution=*/false,
-        /*reorder_workgroups_strategy=*/std::nullopt);
+        /*reorder_workgroups_strategy=*/std::nullopt,
+        /*emit_sched_barriers=*/gpuOpts.emitSchedBarriers);
     pipelineAttrs.emplace_back(
         IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
   }
@@ -669,7 +670,8 @@ static LogicalResult setMatmulVectorDistributionConfig(
         context, /*prefetch_num_stages=*/2,
         /*no_reduce_shared_memory_bank_conflicts=*/false,
         /*use_igemm_convolution=*/false,
-        /*reorder_workgroups_strategy=*/std::nullopt);
+        /*reorder_workgroups_strategy=*/std::nullopt,
+        /*emit_sched_barriers=*/gpuOpts.emitSchedBarriers);
     pipelineAttrs.emplace_back(
         StringAttr::get(context,
                         IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName()),

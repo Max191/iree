@@ -71,6 +71,12 @@ void GPUCodegenOptions::bindOptions(OptionsBinder &binder) {
       "iree-llvmgpu-enable-prefetch", enablePrefetch,
       llvm::cl::desc("Enable prefetch in the vector distribute pipeline."),
       llvm::cl::cat(category));
+
+  binder.opt<bool>(
+      "iree-llvmgpu-emit-sched-barriers", emitSchedBarriers,
+      llvm::cl::desc("Emit sched_group_barrier ops to interleave memory and "
+                     "compute instructions during prefetching."),
+      llvm::cl::cat(category));
 }
 
 } // namespace mlir::iree_compiler
