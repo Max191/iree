@@ -778,7 +778,7 @@ util.func public @constant_pad_f32(%arg0: tensor<?x?xf32>, %x: index, %y: index)
 
 // Test: Two reversed spatial dims (backward conv filter flip pattern).
 // The linalg.generic reverses dims 1 and 2 using arith.subi.
-// This should be raised to iree_linalg_ext.gather.
+// This should be raised to iree_linalg_ext.map_load.
 
 util.func public @raise_reverse_two_spatial_dims(%arg0: tensor<2x3x3x4xf16>) -> tensor<2x3x3x4xf16> {
   %c2 = arith.constant 2 : index
@@ -802,18 +802,19 @@ util.func public @raise_reverse_two_spatial_dims(%arg0: tensor<2x3x3x4xf16>) -> 
 }
 // CHECK-LABEL: util.func public @raise_reverse_two_spatial_dims
 //  CHECK-SAME:     %[[SRC:.+]]: tensor<2x3x3x4xf16>
-//       CHECK:   %[[INDICES:.+]] = arith.constant dense<
+//   CHECK-DAG:   %[[PAD:.+]] = ub.poison : f16
+//   CHECK-DAG:   %[[C2:.+]] = arith.constant 2 : index
 //       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<2x3x3x4xf16>
-//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.gather
-//  CHECK-SAME:     dimension_map = [0, 1, 2]
-//  CHECK-SAME:     ins(%[[SRC]], %[[INDICES]] : tensor<2x3x3x4xf16>, tensor<2x3x3x3xi32>)
-//  CHECK-SAME:     outs(%[[EMPTY]] : tensor<2x3x3x4xf16>)
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.map_load %[[SRC]] into %[[EMPTY]]
+//       CHECK:     ^bb0(%[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index, %[[I3:.+]]: index):
+//       CHECK:       %[[REV1:.+]] = arith.subi %[[C2]], %[[I1]] : index
+//       CHECK:       %[[REV2:.+]] = arith.subi %[[C2]], %[[I2]] : index
+//       CHECK:       iree_linalg_ext.yield %[[I0]], %[[REV1]], %[[REV2]], %[[I3]], %[[PAD]]
 //       CHECK:   util.return %[[RESULT]]
 
 // -----
 
 // Test: Single reversed dim (only dim 1 is reversed).
-// index_depth should be 2 (dims 0, 1 indexed; dim 2 is slice).
 
 util.func public @raise_reverse_single_dim(%arg0: tensor<4x3x8xf32>) -> tensor<4x3x8xf32> {
   %c2 = arith.constant 2 : index
@@ -835,12 +836,13 @@ util.func public @raise_reverse_single_dim(%arg0: tensor<4x3x8xf32>) -> tensor<4
 }
 // CHECK-LABEL: util.func public @raise_reverse_single_dim
 //  CHECK-SAME:     %[[SRC:.+]]: tensor<4x3x8xf32>
-//       CHECK:   %[[INDICES:.+]] = arith.constant dense<
+//   CHECK-DAG:   %[[PAD:.+]] = ub.poison : f32
+//   CHECK-DAG:   %[[C2:.+]] = arith.constant 2 : index
 //       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<4x3x8xf32>
-//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.gather
-//  CHECK-SAME:     dimension_map = [0, 1]
-//  CHECK-SAME:     ins(%[[SRC]], %[[INDICES]] : tensor<4x3x8xf32>, tensor<4x3x2xi32>)
-//  CHECK-SAME:     outs(%[[EMPTY]] : tensor<4x3x8xf32>)
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.map_load %[[SRC]] into %[[EMPTY]]
+//       CHECK:     ^bb0(%[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index):
+//       CHECK:       %[[REV1:.+]] = arith.subi %[[C2]], %[[I1]] : index
+//       CHECK:       iree_linalg_ext.yield %[[I0]], %[[REV1]], %[[I2]], %[[PAD]]
 //       CHECK:   util.return %[[RESULT]]
 
 // -----
@@ -867,18 +869,67 @@ util.func public @raise_reverse_all_dims(%arg0: tensor<3x3xf32>) -> tensor<3x3xf
 }
 // CHECK-LABEL: util.func public @raise_reverse_all_dims
 //  CHECK-SAME:     %[[SRC:.+]]: tensor<3x3xf32>
-//       CHECK:   %[[INDICES:.+]] = arith.constant dense<
+//   CHECK-DAG:   %[[PAD:.+]] = ub.poison : f32
+//   CHECK-DAG:   %[[C2:.+]] = arith.constant 2 : index
 //       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<3x3xf32>
-//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.gather
-//  CHECK-SAME:     dimension_map = [0, 1]
-//  CHECK-SAME:     ins(%[[SRC]], %[[INDICES]] : tensor<3x3xf32>, tensor<3x3x2xi32>)
-//  CHECK-SAME:     outs(%[[EMPTY]] : tensor<3x3xf32>)
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.map_load %[[SRC]] into %[[EMPTY]]
+//       CHECK:     ^bb0(%[[I0:.+]]: index, %[[I1:.+]]: index):
+//       CHECK:       %[[REV0:.+]] = arith.subi %[[C2]], %[[I0]] : index
+//       CHECK:       %[[REV1:.+]] = arith.subi %[[C2]], %[[I1]] : index
+//       CHECK:       iree_linalg_ext.yield %[[REV0]], %[[REV1]], %[[PAD]]
+//       CHECK:   util.return %[[RESULT]]
+
+// -----
+
+// Test: Dynamic shapes — reversal computed via tensor.dim instead of constants.
+// This verifies that map_load supports dynamic shapes (unlike gather).
+
+util.func public @raise_reverse_dynamic_shape(%arg0: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %c0 = arith.constant 0 : index
+  %c1_idx = arith.constant 1 : index
+  %d0 = tensor.dim %arg0, %c0 : tensor<?x?xf32>
+  %d1 = tensor.dim %arg0, %c1_idx : tensor<?x?xf32>
+  %0 = tensor.empty(%d0, %d1) : tensor<?x?xf32>
+  %max0 = arith.subi %d0, %c1_idx : index
+  %max1 = arith.subi %d1, %c1_idx : index
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                     affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%arg0 : tensor<?x?xf32>) outs(%0 : tensor<?x?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %rev0 = arith.subi %max0, %i0 : index
+    %rev1 = arith.subi %max1, %i1 : index
+    %extracted = tensor.extract %arg0[%rev0, %rev1] : tensor<?x?xf32>
+    linalg.yield %extracted : f32
+  } -> tensor<?x?xf32>
+  util.return %1 : tensor<?x?xf32>
+}
+// CHECK-LABEL: util.func public @raise_reverse_dynamic_shape
+//  CHECK-SAME:     %[[SRC:.+]]: tensor<?x?xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = ub.poison : f32
+//   CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//       CHECK:   %[[DIM0_OUT:.+]] = tensor.dim %[[SRC]], %[[C0]]
+//       CHECK:   %[[DIM1_OUT:.+]] = tensor.dim %[[SRC]], %[[C1]]
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty(%[[DIM0_OUT]], %[[DIM1_OUT]]) : tensor<?x?xf32>
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.map_load %[[SRC]] into %[[EMPTY]]
+//       CHECK:     ^bb0(%[[I0:.+]]: index, %[[I1:.+]]: index):
+//       CHECK:       %[[DIM0:.+]] = tensor.dim %[[SRC]], %[[C0]]
+//       CHECK:       %[[MAX0:.+]] = arith.subi %[[DIM0]], %[[C1]] : index
+//       CHECK:       %[[REV0:.+]] = arith.subi %[[MAX0]], %[[I0]] : index
+//       CHECK:       %[[DIM1:.+]] = tensor.dim %[[SRC]], %[[C1]]
+//       CHECK:       %[[MAX1:.+]] = arith.subi %[[DIM1]], %[[C1]] : index
+//       CHECK:       %[[REV1:.+]] = arith.subi %[[MAX1]], %[[I1]] : index
+//       CHECK:       iree_linalg_ext.yield %[[REV0]], %[[REV1]], %[[PAD]]
 //       CHECK:   util.return %[[RESULT]]
 
 // -----
 
 // Negative test: arith.addi instead of arith.subi (not a reversal).
-// Should NOT be raised to gather.
+// Should NOT be raised to map_load.
 
 // CHECK-LABEL: util.func public @no_match_not_subi
 util.func public @no_match_not_subi(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
@@ -903,7 +954,7 @@ util.func public @no_match_not_subi(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
 // -----
 
 // Negative test: yield is not the extracted value (has additional computation).
-// Should NOT be raised to gather.
+// Should NOT be raised to map_load.
 
 // CHECK-LABEL: util.func public @no_match_yield_not_extract
 util.func public @no_match_yield_not_extract(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
@@ -929,12 +980,12 @@ util.func public @no_match_yield_not_extract(%arg0: tensor<4x4xf32>) -> tensor<4
 // -----
 
 // Negative test: no reversed dims (all identity). This should be handled
-// by the existing raiseTensorExtractToInput pattern, not gather.
+// by the existing raiseTensorExtractToInput pattern, not map_load.
 
 // CHECK-LABEL: util.func public @no_match_no_reversed_dims
 util.func public @no_match_no_reversed_dims(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
   %0 = tensor.empty() : tensor<4x4xf32>
-  // CHECK-NOT: iree_linalg_ext.gather
+  // CHECK-NOT: iree_linalg_ext.map_load
   %1 = linalg.generic {
     indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
                      affine_map<(d0, d1) -> (d0, d1)>],
@@ -952,7 +1003,7 @@ util.func public @no_match_no_reversed_dims(%arg0: tensor<4x4xf32>) -> tensor<4x
 // -----
 
 // Negative test: subi max value doesn't match dim_size - 1.
-// Should NOT be raised to gather.
+// Should NOT be raised to map_load.
 
 // CHECK-LABEL: util.func public @no_match_wrong_max_value
 util.func public @no_match_wrong_max_value(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
