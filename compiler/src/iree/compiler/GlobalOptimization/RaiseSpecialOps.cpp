@@ -1004,6 +1004,185 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// Reversed-Index Generic to Gather Raising
+//===----------------------------------------------------------------------===//
+
+/// Matches a linalg.generic whose body extracts from a tensor using reversed
+/// indices (arith.subi of max - linalg.index), and raises it to an
+/// iree_linalg_ext.gather op. This pattern targets the filter flip in backward
+/// data convolution, which produces a separate dispatch when left as a generic.
+class RaiseReversedGenericToGather
+    : public OpRewritePattern<linalg::GenericOp> {
+public:
+  using Base::Base;
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    if (!IREE::Flow::isNonNullAndOutsideDispatch(genericOp))
+      return failure();
+    if (!genericOp.hasPureTensorSemantics())
+      return failure();
+    if (!isElementwise(genericOp))
+      return failure();
+    if (!llvm::hasSingleElement(genericOp.getResults()))
+      return failure();
+
+    // Find the single tensor.extract in the body.
+    auto extractOps = genericOp.getBody()->getOps<tensor::ExtractOp>();
+    if (!llvm::hasSingleElement(extractOps))
+      return failure();
+    tensor::ExtractOp extractOp = *extractOps.begin();
+
+    // The yield must yield exactly the extracted value.
+    auto yieldOp =
+        cast<linalg::YieldOp>(genericOp.getBody()->getTerminator());
+    if (yieldOp.getOperand(0) != extractOp.getResult())
+      return failure();
+
+    // Get the source tensor (the tensor being extracted from).
+    Value source = extractOp.getTensor();
+    auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+    if (!sourceType || !sourceType.hasStaticShape())
+      return failure();
+
+    // Output type must match source type (same-shape reversal).
+    auto outputType =
+        dyn_cast<RankedTensorType>(genericOp.getResult(0).getType());
+    if (!outputType || outputType != sourceType)
+      return failure();
+
+    int64_t rank = sourceType.getRank();
+    if (rank == 0)
+      return failure();
+
+    // The number of extract indices must match the source rank.
+    if (static_cast<int64_t>(extractOp.getIndices().size()) != rank)
+      return failure();
+
+    // Analyze each extract index to determine identity vs. reversed dims.
+    SmallVector<bool> isReversed(rank, false);
+    bool hasAnyReversed = false;
+    for (auto [idx, indexValue] : llvm::enumerate(extractOp.getIndices())) {
+      // Case 1: identity - linalg.index(idx)
+      if (auto indexOp = indexValue.getDefiningOp<linalg::IndexOp>()) {
+        if (static_cast<int64_t>(indexOp.getDim()) != static_cast<int64_t>(idx))
+          return failure();
+        continue;
+      }
+
+      // Case 2: reversed - arith.subi(constant, linalg.index(idx))
+      if (auto subOp = indexValue.getDefiningOp<arith::SubIOp>()) {
+        auto indexOp = subOp.getRhs().getDefiningOp<linalg::IndexOp>();
+        if (!indexOp ||
+            static_cast<int64_t>(indexOp.getDim()) !=
+                static_cast<int64_t>(idx))
+          return failure();
+
+        // LHS must be a constant equal to dim_size - 1.
+        APInt maxVal;
+        if (!matchPattern(subOp.getLhs(), m_ConstantInt(&maxVal)))
+          return failure();
+
+        int64_t expectedMax = sourceType.getDimSize(idx) - 1;
+        if (maxVal.getSExtValue() != expectedMax)
+          return failure();
+
+        isReversed[idx] = true;
+        hasAnyReversed = true;
+        continue;
+      }
+
+      // Unknown index pattern.
+      return failure();
+    }
+
+    // At least one dim must be reversed, otherwise other patterns handle it.
+    if (!hasAnyReversed)
+      return failure();
+
+    // Find index_depth: position of last reversed dim + 1.
+    // The indexed dims are source dims 0..indexDepth-1. Trailing non-reversed
+    // dims become contiguous slice dims.
+    int64_t indexDepth = 0;
+    for (int64_t i = rank - 1; i >= 0; --i) {
+      if (isReversed[i]) {
+        indexDepth = i + 1;
+        break;
+      }
+    }
+
+    // Build the indices tensor.
+    // Shape: [source_dim_0, ..., source_dim_{indexDepth-1}, indexDepth]
+    // Element type: i32.
+    SmallVector<int64_t> indicesShape;
+    for (int64_t i = 0; i < indexDepth; ++i)
+      indicesShape.push_back(sourceType.getDimSize(i));
+    indicesShape.push_back(indexDepth);
+
+    auto indicesElementType = rewriter.getI32Type();
+    auto indicesTensorType =
+        RankedTensorType::get(indicesShape, indicesElementType);
+
+    int64_t totalElements = 1;
+    for (int64_t dim : indicesShape)
+      totalElements *= dim;
+
+    // Populate the indices data.
+    // For position (b0, ..., b_{k-1}, j):
+    //   value = isReversed[j] ? (dimSize[j] - 1 - b_j) : b_j
+    SmallVector<int32_t> indicesData(totalElements);
+    SmallVector<int64_t> multiIdx(indicesShape.size(), 0);
+    for (int64_t flat = 0; flat < totalElements; ++flat) {
+      int64_t j = multiIdx.back();
+      int64_t batchDimValue = multiIdx[j];
+      int32_t value;
+      if (isReversed[j]) {
+        value = static_cast<int32_t>(sourceType.getDimSize(j) - 1 -
+                                     batchDimValue);
+      } else {
+        value = static_cast<int32_t>(batchDimValue);
+      }
+      indicesData[flat] = value;
+
+      // Increment multi-dimensional index (row-major order).
+      for (int64_t i = multiIdx.size() - 1; i >= 0; --i) {
+        multiIdx[i]++;
+        if (multiIdx[i] < indicesShape[i])
+          break;
+        multiIdx[i] = 0;
+      }
+    }
+
+    Location loc = genericOp.getLoc();
+
+    // Create the constant indices tensor.
+    auto indicesAttr =
+        DenseIntElementsAttr::get(indicesTensorType, indicesData);
+    Value indicesValue = arith::ConstantOp::create(rewriter, loc, indicesAttr);
+
+    // Create the output tensor.
+    Value output = tensor::EmptyOp::create(rewriter, loc,
+                                           outputType.getShape(),
+                                           outputType.getElementType());
+
+    // dimension_map = [0, 1, ..., indexDepth-1] (identity permutation).
+    SmallVector<int64_t> dimensionMap;
+    for (int64_t i = 0; i < indexDepth; ++i)
+      dimensionMap.push_back(i);
+
+    // Create the gather op.
+    auto gatherOp = IREE::LinalgExt::GatherOp::create(
+        rewriter, loc,
+        /*resultTypes=*/TypeRange{outputType},
+        /*inputs=*/ValueRange{source, indicesValue},
+        /*outputs=*/ValueRange{output},
+        /*dimension_map=*/rewriter.getDenseI64ArrayAttr(dimensionMap));
+
+    rewriter.replaceOp(genericOp, gatherOp.getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
@@ -1056,6 +1235,7 @@ struct RaiseSpecialOpsPass
       patterns.insert<InsertSliceNegateAndSlicePattern>(context);
       patterns.insert<ConcatenateNegateAndSlicePattern>(context);
       patterns.insert<RaiseInsertSliceToPad>(context);
+      patterns.insert<RaiseReversedGenericToGather>(context);
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }

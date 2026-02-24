@@ -773,3 +773,203 @@ util.func public @constant_pad_f32(%arg0: tensor<?x?xf32>, %x: index, %y: index)
 //       CHECK:   %[[PAD:.+]] = tensor.pad %[[ARG0]] low[1, 2] high[%[[H0]], %[[H1]]]
 //       CHECK:     tensor.yield %[[C1]]
 //       CHECK:   util.return %[[PAD]]
+
+// -----
+
+// Test: Two reversed spatial dims (backward conv filter flip pattern).
+// The linalg.generic reverses dims 1 and 2 using arith.subi.
+// This should be raised to iree_linalg_ext.gather.
+
+util.func public @raise_reverse_two_spatial_dims(%arg0: tensor<2x3x3x4xf16>) -> tensor<2x3x3x4xf16> {
+  %c2 = arith.constant 2 : index
+  %0 = tensor.empty() : tensor<2x3x3x4xf16>
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                     affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+    iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+  } ins(%arg0 : tensor<2x3x3x4xf16>) outs(%0 : tensor<2x3x3x4xf16>) {
+  ^bb0(%in: f16, %out: f16):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %i2 = linalg.index 2 : index
+    %i3 = linalg.index 3 : index
+    %rev1 = arith.subi %c2, %i1 : index
+    %rev2 = arith.subi %c2, %i2 : index
+    %extracted = tensor.extract %arg0[%i0, %rev1, %rev2, %i3] : tensor<2x3x3x4xf16>
+    linalg.yield %extracted : f16
+  } -> tensor<2x3x3x4xf16>
+  util.return %1 : tensor<2x3x3x4xf16>
+}
+// CHECK-LABEL: util.func public @raise_reverse_two_spatial_dims
+//  CHECK-SAME:     %[[SRC:.+]]: tensor<2x3x3x4xf16>
+//       CHECK:   %[[INDICES:.+]] = arith.constant dense<
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<2x3x3x4xf16>
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.gather
+//  CHECK-SAME:     dimension_map = [0, 1, 2]
+//  CHECK-SAME:     ins(%[[SRC]], %[[INDICES]] : tensor<2x3x3x4xf16>, tensor<2x3x3x3xi32>)
+//  CHECK-SAME:     outs(%[[EMPTY]] : tensor<2x3x3x4xf16>)
+//       CHECK:   util.return %[[RESULT]]
+
+// -----
+
+// Test: Single reversed dim (only dim 1 is reversed).
+// index_depth should be 2 (dims 0, 1 indexed; dim 2 is slice).
+
+util.func public @raise_reverse_single_dim(%arg0: tensor<4x3x8xf32>) -> tensor<4x3x8xf32> {
+  %c2 = arith.constant 2 : index
+  %0 = tensor.empty() : tensor<4x3x8xf32>
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+                     affine_map<(d0, d1, d2) -> (d0, d1, d2)>],
+    iterator_types = ["parallel", "parallel", "parallel"]
+  } ins(%arg0 : tensor<4x3x8xf32>) outs(%0 : tensor<4x3x8xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %i2 = linalg.index 2 : index
+    %rev1 = arith.subi %c2, %i1 : index
+    %extracted = tensor.extract %arg0[%i0, %rev1, %i2] : tensor<4x3x8xf32>
+    linalg.yield %extracted : f32
+  } -> tensor<4x3x8xf32>
+  util.return %1 : tensor<4x3x8xf32>
+}
+// CHECK-LABEL: util.func public @raise_reverse_single_dim
+//  CHECK-SAME:     %[[SRC:.+]]: tensor<4x3x8xf32>
+//       CHECK:   %[[INDICES:.+]] = arith.constant dense<
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<4x3x8xf32>
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.gather
+//  CHECK-SAME:     dimension_map = [0, 1]
+//  CHECK-SAME:     ins(%[[SRC]], %[[INDICES]] : tensor<4x3x8xf32>, tensor<4x3x2xi32>)
+//  CHECK-SAME:     outs(%[[EMPTY]] : tensor<4x3x8xf32>)
+//       CHECK:   util.return %[[RESULT]]
+
+// -----
+
+// Test: All dims reversed (no slice dims).
+
+util.func public @raise_reverse_all_dims(%arg0: tensor<3x3xf32>) -> tensor<3x3xf32> {
+  %c2 = arith.constant 2 : index
+  %0 = tensor.empty() : tensor<3x3xf32>
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                     affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%arg0 : tensor<3x3xf32>) outs(%0 : tensor<3x3xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %rev0 = arith.subi %c2, %i0 : index
+    %rev1 = arith.subi %c2, %i1 : index
+    %extracted = tensor.extract %arg0[%rev0, %rev1] : tensor<3x3xf32>
+    linalg.yield %extracted : f32
+  } -> tensor<3x3xf32>
+  util.return %1 : tensor<3x3xf32>
+}
+// CHECK-LABEL: util.func public @raise_reverse_all_dims
+//  CHECK-SAME:     %[[SRC:.+]]: tensor<3x3xf32>
+//       CHECK:   %[[INDICES:.+]] = arith.constant dense<
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<3x3xf32>
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.gather
+//  CHECK-SAME:     dimension_map = [0, 1]
+//  CHECK-SAME:     ins(%[[SRC]], %[[INDICES]] : tensor<3x3xf32>, tensor<3x3x2xi32>)
+//  CHECK-SAME:     outs(%[[EMPTY]] : tensor<3x3xf32>)
+//       CHECK:   util.return %[[RESULT]]
+
+// -----
+
+// Negative test: arith.addi instead of arith.subi (not a reversal).
+// Should NOT be raised to gather.
+
+// CHECK-LABEL: util.func public @no_match_not_subi
+util.func public @no_match_not_subi(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %c1 = arith.constant 1 : index
+  %0 = tensor.empty() : tensor<4x4xf32>
+  // CHECK: linalg.generic
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                     affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%arg0 : tensor<4x4xf32>) outs(%0 : tensor<4x4xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %shifted = arith.addi %c1, %i1 : index
+    %extracted = tensor.extract %arg0[%i0, %shifted] : tensor<4x4xf32>
+    linalg.yield %extracted : f32
+  } -> tensor<4x4xf32>
+  util.return %1 : tensor<4x4xf32>
+}
+
+// -----
+
+// Negative test: yield is not the extracted value (has additional computation).
+// Should NOT be raised to gather.
+
+// CHECK-LABEL: util.func public @no_match_yield_not_extract
+util.func public @no_match_yield_not_extract(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %c3 = arith.constant 3 : index
+  %0 = tensor.empty() : tensor<4x4xf32>
+  // CHECK: linalg.generic
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                     affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%arg0 : tensor<4x4xf32>) outs(%0 : tensor<4x4xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %rev1 = arith.subi %c3, %i1 : index
+    %extracted = tensor.extract %arg0[%i0, %rev1] : tensor<4x4xf32>
+    %added = arith.addf %extracted, %in : f32
+    linalg.yield %added : f32
+  } -> tensor<4x4xf32>
+  util.return %1 : tensor<4x4xf32>
+}
+
+// -----
+
+// Negative test: no reversed dims (all identity). This should be handled
+// by the existing raiseTensorExtractToInput pattern, not gather.
+
+// CHECK-LABEL: util.func public @no_match_no_reversed_dims
+util.func public @no_match_no_reversed_dims(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %0 = tensor.empty() : tensor<4x4xf32>
+  // CHECK-NOT: iree_linalg_ext.gather
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                     affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%arg0 : tensor<4x4xf32>) outs(%0 : tensor<4x4xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %extracted = tensor.extract %arg0[%i0, %i1] : tensor<4x4xf32>
+    linalg.yield %extracted : f32
+  } -> tensor<4x4xf32>
+  util.return %1 : tensor<4x4xf32>
+}
+
+// -----
+
+// Negative test: subi max value doesn't match dim_size - 1.
+// Should NOT be raised to gather.
+
+// CHECK-LABEL: util.func public @no_match_wrong_max_value
+util.func public @no_match_wrong_max_value(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %c5 = arith.constant 5 : index
+  %0 = tensor.empty() : tensor<4x4xf32>
+  // CHECK: linalg.generic
+  %1 = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                     affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%arg0 : tensor<4x4xf32>) outs(%0 : tensor<4x4xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %i0 = linalg.index 0 : index
+    %i1 = linalg.index 1 : index
+    %bad_rev = arith.subi %c5, %i1 : index
+    %extracted = tensor.extract %arg0[%i0, %bad_rev] : tensor<4x4xf32>
+    linalg.yield %extracted : f32
+  } -> tensor<4x4xf32>
+  util.return %1 : tensor<4x4xf32>
+}
