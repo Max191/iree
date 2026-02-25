@@ -49,15 +49,6 @@ hal.executable private @main {
 }
 
 //    CHECK-LABEL: func @conv_nhwc
-//      CHECK-DAG:   %[[B0:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0)
-//      CHECK-DAG:   memref.assume_alignment %[[B0]], 64
-//      CHECK-DAG:   %[[BUF0:.+]] = amdgpu.fat_raw_buffer_cast
-//      CHECK-DAG:   %[[B1:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(1)
-//      CHECK-DAG:   memref.assume_alignment %[[B1]], 64
-//      CHECK-DAG:   %[[BUF1:.+]] = amdgpu.fat_raw_buffer_cast
-//      CHECK-DAG:   %[[B2:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(2)
-//      CHECK-DAG:   memref.assume_alignment %[[B2]], 64
-//      CHECK-DAG:   %[[BUF2:.+]] = amdgpu.fat_raw_buffer_cast
 //      CHECK-DAG:   memref.alloc() : memref<1x4x16x36xf16, #gpu.address_space<workgroup>>
 //      CHECK-DAG:   memref.alloc() : memref<32x260xf16, #gpu.address_space<workgroup>>
 //      CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
@@ -66,19 +57,19 @@ hal.executable private @main {
 //          CHECK:   scf.forall ({{.*}}) in (2, 4, 5) {
 //          CHECK:     %[[LOOP:.+]] = scf.for {{.+}} = %[[C0]] to %[[C360]] step %[[C1]] {{.*}} -> (vector<1x4x1x4x4x1xf32>)
 //          CHECK:       gpu.barrier memfence [#gpu.address_space<workgroup>]
-//      CHECK-DAG:       %[[LHS_RD:.+]] = vector.transfer_read %[[BUF0]]{{.*}} vector<8xf16>
-//      CHECK-DAG:       vector.transfer_write %[[LHS_RD]]
-//      CHECK-DAG:       %[[RHS_RD:.+]] = vector.transfer_read %[[BUF1]]{{.*}} vector<8xf16>
-//      CHECK-DAG:       vector.transfer_write %[[RHS_RD]]
+//      CHECK-DAG:       vector.transfer_read {{.*}}#amdgpu.address_space<fat_raw_buffer>{{.*}} vector<8xf16>
+//      CHECK-DAG:       vector.transfer_write {{.*}}memref<1x4x16x36xf16, #gpu.address_space<workgroup>>
+//      CHECK-DAG:       vector.transfer_read {{.*}}memref<11520x1280xf16, #amdgpu.address_space<fat_raw_buffer>>{{.*}} vector<8xf16>
+//      CHECK-DAG:       vector.transfer_write {{.*}}memref<32x260xf16, #gpu.address_space<workgroup>>
 //          CHECK:       gpu.barrier memfence [#gpu.address_space<workgroup>]
 //      CHECK-DAG:       vector.transfer_read {{.*}} vector<4x1x1x2x4xf16>
-//      CHECK-DAG:       %[[LHS_MM1:.+]] = vector.shape_cast {{.*}} vector<4x1x1x2x4xf16> to vector<1x4x1x2x1x4xf16>
+//      CHECK-DAG:       vector.shape_cast {{.*}} vector<4x1x1x2x4xf16> to vector<1x4x1x2x1x4xf16>
 //      CHECK-DAG:       %[[RHS_MM:.+]] = vector.transfer_read {{.*}} vector<2x4x4x1xf16>
 //      CHECK-DAG:       vector.transpose %[[RHS_MM]], [0, 2, 3, 1] : vector<2x4x4x1xf16> to vector<2x4x1x4xf16>
 // CHECK-COUNT-32:       amdgpu.mfma 16x16x16
 //          CHECK:     %[[LOOP_T:.+]] = vector.transpose %[[LOOP]], [0, 1, 2, 4, 3, 5] : vector<1x4x1x4x4x1xf32> to vector<1x4x1x4x4x1xf32>
 //          CHECK:     %[[CAST:.+]] = vector.shape_cast %[[LOOP_T]] : vector<1x4x1x4x4x1xf32> to vector<4x1x4x4x1xf32>
-//          CHECK:     vector.transfer_write %[[CAST]], %[[BUF2]]
+//          CHECK:     vector.transfer_write %[[CAST]], {{.*}}#amdgpu.address_space<fat_raw_buffer>
 //          CHECK:   } {mapping = [#iree_codegen.workgroup_mapping<z>, #iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
 
 // TODO(Max191): Add tests for more convolution types

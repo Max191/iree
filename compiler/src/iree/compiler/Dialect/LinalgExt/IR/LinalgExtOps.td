@@ -1383,10 +1383,16 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
                        DenseI64ArrayAttr:$m_pos,
                        DenseI64ArrayAttr:$k_pos,
                        DenseI64ArrayAttr:$input_k_perm,
-                       DenseI64ArrayAttr:$output_perm);
+                       DenseI64ArrayAttr:$output_perm,
+                       Variadic<Index>:$input_pad_low,
+                       DenseI64ArrayAttr:$static_input_pad_low,
+                       Variadic<Index>:$input_pad_high,
+                       DenseI64ArrayAttr:$static_input_pad_high,
+                       Optional<AnyType>:$pad_value);
 
   let results = (outs Variadic<AnyShaped>:$results);
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
   let assemblyFormat = [{
     attr-dict
     `strides` `=` $strides
@@ -1404,6 +1410,9 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     `k_pos` `=` $k_pos
     `input_k_perm` `=` $input_k_perm
     `output_perm` `=` $output_perm
+    custom<OptionalPadding>($input_pad_low, $static_input_pad_low,
+                            $input_pad_high, $static_input_pad_high,
+                            $pad_value, type($pad_value))
     `ins` `(` $input `:` type($input) `)`
     `outs` `(` $output `:` type($output) `)`
     (`->` type($results)^)?
@@ -1422,7 +1431,10 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
       "ArrayRef<int64_t>":$m_dimensions,
       "ArrayRef<int64_t>":$k_dimensions,
       "ArrayRef<int64_t>":$input_k_perm,
-      "ArrayRef<int64_t>":$output_perm)>
+      "ArrayRef<int64_t>":$output_perm,
+      CArg<"ArrayRef<OpFoldResult>", "{}">:$input_pad_low,
+      CArg<"ArrayRef<OpFoldResult>", "{}">:$input_pad_high,
+      CArg<"Value", "Value()">:$pad_value)>
   ];
 
   let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
@@ -1465,12 +1477,19 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     SmallVector<OpFoldResult> getMixedKOffset();
     SmallVector<OpFoldResult> getMixedMStrides();
     SmallVector<OpFoldResult> getMixedKStrides();
+    SmallVector<OpFoldResult> getMixedInputPadLow();
+    SmallVector<OpFoldResult> getMixedInputPadHigh();
 
     // Set op metadata.
     void setMixedKOffset(SmallVector<OpFoldResult> kOffset);
     void setMixedMOffset(SmallVector<OpFoldResult> mOffset);
     void setMixedKStrides(SmallVector<OpFoldResult> kStrides);
     void setMixedMStrides(SmallVector<OpFoldResult> mStrides);
+    void setMixedInputPadLow(SmallVector<OpFoldResult> padLow);
+    void setMixedInputPadHigh(SmallVector<OpFoldResult> padHigh);
+
+    /// Returns true if the op has non-zero padding.
+    bool hasPadding() { return static_cast<bool>(getPadValue()); }
 
     // Method to implement for specifying output range for
     // DestinationStyleOpInterface

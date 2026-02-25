@@ -129,7 +129,7 @@ module {
 //   CHECK-DAG:           %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[k]])[%[[kOFF]]]
 //   CHECK-DAG:           %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (3, 3, 640)
 //   CHECK-DAG:           %[[mIDX:.+]] = affine.apply #[[$MAP1]](%[[m0]], %[[m1]])[%[[mSTRIDE]], %[[mOFF0]], %[[mOFF1]]]
-//   CHECK-DAG:           %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32, 32)
+//   CHECK-DAG:           %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (%[[mSTRIDE]])
 //   CHECK-DAG:           %[[hIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#0, %[[kParts]]#0)
 //   CHECK-DAG:           %[[wIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#1, %[[kParts]]#1)
 //       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[b]], %[[hIDX]], %[[wIDX]], %[[kParts]]#2] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<2x34x34x640xf32> to tensor<1x1x1x4xf32>
@@ -160,6 +160,37 @@ module {
 // Verify that the NCHW layout does not vectorize.
 // CHECK-LABEL: func.func @im2col_expanded_nchw
 //       CHECK:   linalg.copy ins({{.*}} : tensor<1x1x1x1xf32>) outs({{.*}} : tensor<1x1x1x1xf32>) -> tensor<1x1x1x1xf32>
+
+// -----
+
+// Test that EXPANDED M correctly uses m_strides as the delinearization basis,
+// not the convolution output-size formula. For backward-weight convolution with
+// dilation>1, the M output dimensions correspond to kernel spatial dimensions
+// (KH=3, KW=3), not the convolution output spatial dimensions. The old formula
+// (H - 1 - (kH-1)*dil) / stride + 1 = (8-1-(3-1)*2)/1+1 = 4 would be wrong.
+// The m_strides = [3, 1] encode the correct basis [3] for delinearization.
+module {
+  func.func @im2col_bwd_weight_dilation2(%arg0: tensor<1x1x8x8xf32>, %m0: index, %m1: index) -> tensor<1x1x1x1xf32> {
+    %0 = tensor.empty() : tensor<1x1x1x1xf32>
+    %result = iree_linalg_ext.im2col
+            strides = [1, 1] dilations = [2, 2] kernel_size = [3, 3]
+            m_offset = [%m0, %m1] * [3, 1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [2, 3] k_pos = [1]
+            input_k_perm = [0, 1, 2] output_perm = [0, 1, 2, 3]
+            ins(%arg0 : tensor<1x1x8x8xf32>)
+            outs(%0 : tensor<1x1x1x1xf32>) -> tensor<1x1x1x1xf32>
+    return %result : tensor<1x1x1x1xf32>
+  }
+}
+// Verify that EXPANDED M with dilation=2 uses m_strides basis [3], not the
+// formula-based value of 4 = (8-1-(3-1)*2)/1+1.
+// CHECK-LABEL: func.func @im2col_bwd_weight_dilation2
+//  CHECK-SAME: %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x1x8x8xf32>
+//  CHECK-SAME: %[[M0:[a-zA-Z0-9_]+]]: index
+//  CHECK-SAME: %[[M1:[a-zA-Z0-9_]+]]: index
+//       CHECK: %[[FLAT_M:.+]] = affine.apply {{.*}}()[%[[M0]], %[[M1]]]
+//       CHECK: %[[mParts:.+]]:2 = affine.delinearize_index %[[FLAT_M]] into (3) : index, index
+//       CHECK: tensor.extract_slice %[[ARG0]][0, 0, %[[mParts]]#0, %[[mParts]]#1] [1, 1, 1, 1] [1, 1, 1, 1]
 
 // -----
 
@@ -329,7 +360,7 @@ module {
 //       CHECK:     %[[KLOOP:.+]] = scf.for %[[K:.+]] = %[[C0]] to %[[C36]] step %[[C1]] iter_args(%[[OUT3:.+]] = %[[OUT2]]) -> (tensor<1x14x14x36xf32>)
 //   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[K]] into (4, 3, 3) : index, index, index
 //   CHECK-DAG:       %[[FLAT_M:.+]] = affine.apply #[[$MAP]](%[[M1]], %[[M2]])
-//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[FLAT_M]] into (14, 14) : index, index
+//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[FLAT_M]] into (14) : index, index
 //   CHECK-DAG:       %[[hIDX:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#0, %[[kParts]]#1)
 //   CHECK-DAG:       %[[wIDX:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#1, %[[kParts]]#2)
 //       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][0, %[[hIDX]], %[[wIDX]], %[[kParts]]#0] [1, 1, 1, 1] [1, 1, 1, 1] : tensor<1x16x16x4xf32> to tensor<1x1x1x1xf32>
@@ -375,7 +406,7 @@ module {
 //   CHECK-DAG:       %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[K]])[%[[ARG3]]]
 //   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (16, 24, 16)
 //   CHECK-DAG:       %[[mIDX:.+]] = affine.apply #[[$MAP1]](%[[M0]], %[[M1]])[%[[ARG1]], %[[ARG2]]]
-//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3, 3)
+//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3)
 //   CHECK-DAG:       %[[hIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#0, %[[kParts]]#1)
 //   CHECK-DAG:       %[[wIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#1, %[[kParts]]#2)
 //       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[hIDX]], %[[wIDX]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<16x26x18x4xf32> to tensor<1x1x1x4xf32>
@@ -421,7 +452,7 @@ module {
 //   CHECK-DAG:       %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[IV0]])[%[[ARG3]]]
 //   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (16, 24, 16)
 //   CHECK-DAG:       %[[mIDX:.+]] = affine.apply #[[$MAP1]](%[[IV1]], %[[IV2]])[%[[ARG1]], %[[ARG2]]]
-//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3, 3)
+//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3)
 //   CHECK-DAG:       %[[hIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#0, %[[kParts]]#1)
 //   CHECK-DAG:       %[[wIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#1, %[[kParts]]#2)
 //       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[hIDX]], %[[wIDX]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<16x26x18x4xf32> to tensor<1x1x1x4xf32>
@@ -469,7 +500,7 @@ module {
 //   CHECK-DAG:           %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[IV1]], %[[IV0]])[%[[ARG3]]]
 //   CHECK-DAG:           %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (16, 24, 16)
 //   CHECK-DAG:           %[[mIDX:.+]] = affine.apply #[[$MAP1]](%[[IV2]], %[[IV3]])[%[[ARG1]], %[[ARG2]]]
-//   CHECK-DAG:           %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3, 3)
+//   CHECK-DAG:           %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3)
 //   CHECK-DAG:           %[[hIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#0, %[[kParts]]#1)
 //   CHECK-DAG:           %[[wIDX:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#1, %[[kParts]]#2)
 //       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[hIDX]], %[[wIDX]], %[[IV4]], 0] [1, 1, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<16x26x18x2x4xf32> to tensor<1x1x1x1x4xf32>
@@ -506,3 +537,48 @@ module {
 //       CHECK:     %[[OUT_SLICE:.+]] = tensor.extract_slice {{.*}} : tensor<4x?x?xf32> to tensor<4xf32>
 //       CHECK:     %[[COPY:.+]] = linalg.copy ins(%[[IN_SLICE]] : tensor<4xf32>) outs(%[[OUT_SLICE]] : tensor<4xf32>)
 //       CHECK:     %[[INSERT:.+]] = tensor.insert_slice %[[COPY]] into {{.*}} : tensor<4xf32> into tensor<4x?x?xf32>
+
+// -----
+
+// Regression test: backward-weight-style im2col with dilation=2.
+// computeIm2colMBasis was broken for this case: it used the convolution
+// output-size formula which gave M-basis 4 (wrong) instead of 3 (correct)
+// for kernel_size=8, spatial=18, dilation=2.
+//
+// The fix uses m_strides[:-1] as the inner M delinearization basis
+// (hasOuterBound=false). With m_strides=[3,1], inner basis=[3], which
+// correctly encodes KW=3 regardless of the dilation value.
+//
+// Layout: input=C x IH x IW x N (k_pos=[0], m_pos=[1,2], batch_pos=[3])
+// Output: M0 x M1 x K x B (output_perm=[1,2,3,0], shape=3x3x4x2)
+// Dilation=2 means spatial offsets are: m_coord + window_coord * 2.
+//
+//   CHECK-DAG: #[[$MLINEAR:.+]] = affine_map<(d0, d1)[s0, s1] -> (d0 * 3 + d1 + s0 * 3 + s1)>
+//   CHECK-DAG: #[[$SPATIAL:.+]] = affine_map<(d0, d1) -> (d0 + d1 * 2)>
+module {
+  func.func @im2col_bwd_weight_dilation(%arg0: tensor<4x18x18x2xf32>, %m0: index, %m1: index, %k: index) -> tensor<3x3x4x2xf32> {
+    %0 = tensor.empty() : tensor<3x3x4x2xf32>
+    %1 = iree_linalg_ext.im2col
+            strides = [1, 1] dilations = [2, 2] kernel_size = [8, 8]
+            m_offset = [%m0, %m1] * [3, 1] k_offset = [%k] * [1]
+            batch_pos = [3] m_pos = [1, 2] k_pos = [0]
+            input_k_perm = [0, 1, 2] output_perm = [1, 2, 3, 0]
+            ins(%arg0 : tensor<4x18x18x2xf32>)
+            outs(%0 : tensor<3x3x4x2xf32>) -> tensor<3x3x4x2xf32>
+    return %1 : tensor<3x3x4x2xf32>
+  }
+}
+// CHECK-LABEL: func.func @im2col_bwd_weight_dilation
+//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9_]+]]: tensor<4x18x18x2xf32>
+//  CHECK-SAME:     %[[M0:[a-zA-Z0-9_]+]]: index
+//  CHECK-SAME:     %[[M1:[a-zA-Z0-9_]+]]: index
+//  CHECK-SAME:     %[[K:[a-zA-Z0-9_]+]]: index
+// Verify that M delinearization uses inner basis 3 (from m_strides=[3,1]).
+// The old (buggy) formula produced basis 4 for dilation=2, kernel_size=8, spatial=18.
+//   CHECK-DAG:   %[[mIDX:.+]] = affine.apply #[[$MLINEAR]](%{{.+}}, %{{.+}})[%[[M0]], %[[M1]]]
+//   CHECK-DAG:   %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (3) : index, index
+// Verify dilation factor 2 is applied to spatial offset computation.
+//   CHECK-DAG:   affine.apply #[[$SPATIAL]](%[[mParts]]#0, %{{.+}})
+//   CHECK-DAG:   affine.apply #[[$SPATIAL]](%[[mParts]]#1, %{{.+}})
+// Verify the im2col op is fully lowered to loops.
+//   CHECK-NOT:   iree_linalg_ext.im2col

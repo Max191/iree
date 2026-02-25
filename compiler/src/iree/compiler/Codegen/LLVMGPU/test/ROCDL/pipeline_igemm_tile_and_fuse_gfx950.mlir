@@ -51,13 +51,13 @@ hal.executable private @conv_nhwc_f16 {
 //    CHECK-LABEL: func @conv_nhwc_f16
 //          CHECK:   scf.forall
 //          CHECK:     scf.for {{.*}} iter_args
-//      CHECK-DAG:       vector.transfer_read {{.*}}memref<2x34x34x1280xf16, #amdgpu.address_space<fat_raw_buffer>>{{.*}}vector<8xf16>
+//      CHECK-DAG:       vector.transfer_read {{.*}}#amdgpu.address_space<fat_raw_buffer>{{.*}}vector<8xf16>
 //      CHECK-DAG:       vector.transfer_write {{.*}}memref<1x4x16x{{.*}}xf16, {{.*}}#gpu.address_space<workgroup>>
 //      CHECK-DAG:       vector.transfer_read {{.*}}memref<11520x1280xf16, #amdgpu.address_space<fat_raw_buffer>>{{.*}}vector<8xf16>
 //      CHECK-DAG:       vector.transfer_write {{.*}}memref<64x{{.*}}xf16, {{.*}}#gpu.address_space<workgroup>>
 //          CHECK:       gpu.barrier
 //          CHECK:       vector.transfer_read {{.*}}#gpu.address_space<workgroup>
-//          CHECK:       amdgpu.transpose_load {{.*}}#gpu.address_space<workgroup>{{.*}}vector<4xf16>
+//          CHECK:       vector.transfer_read {{.*}}#gpu.address_space<workgroup>
 //          CHECK:       amdgpu.mfma 16x16x32 {{.*}} vector<8xf16>, vector<8xf16>, vector<4xf32>
 //          CHECK:       scf.yield
 
@@ -120,7 +120,7 @@ hal.executable private @conv_nhwc_unaligned_f16 {
 //      CHECK-DAG:       vector.transfer_write {{.*}}memref<32x{{.*}}xf16, {{.*}}#gpu.address_space<workgroup>>
 //          CHECK:       gpu.barrier
 //          CHECK:       vector.transfer_read {{.*}}#gpu.address_space<workgroup>
-//          CHECK:       amdgpu.transpose_load {{.*}}#gpu.address_space<workgroup>{{.*}}vector<4xf16>
+//          CHECK:       vector.transfer_read {{.*}}#gpu.address_space<workgroup>
 //          CHECK:       amdgpu.mfma 16x16x32 {{.*}} vector<8xf16>, vector<8xf16>, vector<4xf32>
 //          CHECK:       scf.yield
 
@@ -200,6 +200,6 @@ hal.executable private @conv_input_backward_bf16 {
 //      CHECK-DAG:       vector.transfer_write {{.*}}memref<64x{{.*}}xbf16, {{.*}}#gpu.address_space<workgroup>>
 //          CHECK:       gpu.barrier
 //          CHECK:       vector.transfer_read {{.*}}#gpu.address_space<workgroup>
-//          CHECK:       amdgpu.transpose_load {{.*}}#gpu.address_space<workgroup>{{.*}}vector<4xbf16>
+//          CHECK:       vector.transfer_read {{.*}}#gpu.address_space<workgroup>
 //          CHECK:       amdgpu.mfma 16x16x32 {{.*}} vector<8xbf16>, vector<8xbf16>, vector<4xf32>
 //          CHECK:       scf.yield
