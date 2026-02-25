@@ -200,6 +200,60 @@ void simplifyMaskOps(RewriterBase &rewriter, vector::CreateMaskOp maskOp,
   }
 }
 
+// Handle broadcast masks of the form:
+//   %mask = vector.broadcast %cond : i1 to vector<Nxi1>
+//   %read = vector.transfer_read %memref, %mask, %pad
+// becomes:
+//   %padding = vector.broadcast %pad : type to vector<Nxtype>
+//   %read = vector.transfer_read %memref, %pad  // no mask
+//   %result = arith.select %cond, %read, %padding
+void simplifyBroadcastMaskOps(RewriterBase &rewriter,
+                              vector::BroadcastOp broadcastOp) {
+  // Only handle scalar i1 broadcast to vector<...xi1>.
+  Value source = broadcastOp.getSource();
+  if (!source.getType().isInteger(1)) {
+    return;
+  }
+  auto resultType = dyn_cast<VectorType>(broadcastOp.getResultVectorType());
+  if (!resultType || !resultType.getElementType().isInteger(1)) {
+    return;
+  }
+
+  Location loc = broadcastOp.getLoc();
+
+  for (Operation *user :
+       llvm::make_early_inc_range(broadcastOp.getResult().getUsers())) {
+    auto readOp = dyn_cast<vector::TransferReadOp>(user);
+    if (!readOp) {
+      continue;
+    }
+
+    auto sourceType = dyn_cast<MemRefType>(readOp.getBase().getType());
+    // Only supported for fat raw buffers (OOB reads return 0, no faults).
+    if (!sourceType || !hasAMDGPUFatRawBufferAddressSpace(sourceType)) {
+      continue;
+    }
+
+    rewriter.setInsertionPoint(readOp);
+
+    // Broadcast the padding value to create the fallback vector.
+    auto paddingVec = vector::BroadcastOp::create(
+        rewriter, loc, readOp.getVectorType(), readOp.getPadding());
+
+    // Create an unmasked read, preserving the original in_bounds attributes.
+    auto newReadOp = vector::TransferReadOp::create(
+        rewriter, loc, readOp.getVectorType(), readOp.getBase(),
+        readOp.getIndices(), readOp.getPadding(),
+        readOp.getInBoundsValues());
+
+    // Select between the read and padding based on the scalar condition.
+    auto selectOp =
+        arith::SelectOp::create(rewriter, loc, source, newReadOp, paddingVec);
+    rewriter.replaceAllUsesWith(readOp, selectOp);
+    rewriter.eraseOp(readOp);
+  }
+}
+
 struct ROCDLBufferInstructionsOptimizationPass final
     : impl::ROCDLBufferInstructionsOptimizationPassBase<
           ROCDLBufferInstructionsOptimizationPass> {
@@ -217,12 +271,21 @@ struct ROCDLBufferInstructionsOptimizationPass final
     }
 
     SmallVector<vector::CreateMaskOp> maskOps;
-    funcOp.walk(
-        [&](vector::CreateMaskOp maskOp) { maskOps.push_back(maskOp); });
+    SmallVector<vector::BroadcastOp> broadcastOps;
+    funcOp.walk([&](Operation *op) {
+      if (auto maskOp = dyn_cast<vector::CreateMaskOp>(op)) {
+        maskOps.push_back(maskOp);
+      } else if (auto broadcastOp = dyn_cast<vector::BroadcastOp>(op)) {
+        broadcastOps.push_back(broadcastOp);
+      }
+    });
 
     IRRewriter rewriter(context);
     for (vector::CreateMaskOp maskOp : maskOps) {
       simplifyMaskOps(rewriter, maskOp, solver);
+    }
+    for (vector::BroadcastOp broadcastOp : broadcastOps) {
+      simplifyBroadcastMaskOps(rewriter, broadcastOp);
     }
   }
 };
