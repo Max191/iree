@@ -82,6 +82,9 @@ void DecomposeIm2colPass::runOnOperation() {
   funcOp->walk([&](Im2colOp op) { candidates.push_back(op); });
   IRRewriter rewriter(context);
   for (auto im2colOp : candidates) {
+    if (im2colOp.hasPadding()) {
+      continue; // Deferred to vectorization path.
+    }
     if (failed(decomposeIm2col(im2colOp, rewriter, unroll))) {
       return signalPassFailure();
     }

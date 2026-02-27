@@ -17,6 +17,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OpDefinition.h"
@@ -2441,17 +2442,15 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
                        outputSlice->result_type_end());
   }
 
-  // Adjust m_offset and k_offset by adding the offsets from tiling.
-  SmallVector<OpFoldResult> newKOffsets, newMOffsets;
-  for (auto [outDim, kOffset] :
-       llvm::zip_equal(getKOutputDims(), getMixedKOffset())) {
-    OpFoldResult kTileOffset = offsets[outDim];
-    newKOffsets.push_back(addOfrs(builder, loc, kTileOffset, kOffset));
-  }
-  for (auto [outDim, mOffset] :
-       llvm::zip_equal(getMOutputDims(), getMixedMOffset())) {
-    OpFoldResult mTileOffset = offsets[outDim];
-    newMOffsets.push_back(addOfrs(builder, loc, mTileOffset, mOffset));
+  // Adjust offsets by adding the tiling offsets. The offsets are in canonical
+  // [Batch, M, K] order, and output_perm[actual] = canonical, so we use
+  // output_perm directly to map actual tensor dims to canonical positions.
+  SmallVector<OpFoldResult> newOffsets(getMixedOffsets());
+  ArrayRef<int64_t> outPerm = getOutputPerm();
+  for (int64_t actual = 0; actual < getOutputRank(); ++actual) {
+    int64_t canonical = outPerm[actual];
+    newOffsets[canonical] =
+        addOfrs(builder, loc, offsets[actual], newOffsets[canonical]);
   }
 
   // Create the tiled op.
@@ -2462,9 +2461,9 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
                   getOperation()->getOperands().end());
   Im2colOp tiledOp =
       mlir::clone(builder, *this, outputSlice->getResultTypes(), operands);
-  // Set the new k_offset and m_offset, since they have changed with tiling.
-  tiledOp.setMixedKOffset(newKOffsets);
-  tiledOp.setMixedMOffset(newMOffsets);
+  // Set the new offsets, since they have changed with tiling.
+  // output_sizes remain unchanged by tiling (key design property).
+  tiledOp.setMixedOffsets(newOffsets);
 
   return TilingResult{{tiledOp},
                       SmallVector<Value>(tiledOp->getResults()),

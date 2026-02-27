@@ -150,8 +150,10 @@ def VectorizeIREELinalgExtOpsPass :
     InterfacePass<"iree-linalg-ext-vectorize-ops", "mlir::FunctionOpInterface"> {
   let summary = "Convert linalg_ext ops into their vector form.";
   let dependentDialects = [
-    "::mlir::vector::VectorDialect",
-    "::mlir::arith::ArithDialect"
+    "::mlir::affine::AffineDialect",
+    "::mlir::arith::ArithDialect",
+    "::mlir::tensor::TensorDialect",
+    "::mlir::vector::VectorDialect"
   ];
 }
 

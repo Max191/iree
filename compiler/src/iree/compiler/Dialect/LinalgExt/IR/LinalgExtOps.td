@@ -1297,57 +1297,31 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     the output should be `tensor<BxMxK>`, and the `m_pos`, `k_pos`, and
     `batch_pos` indicate which input dimensions map to which output dimensions.
 
-    The `k_offset` is an offset within the output K dimension from which the
-    iteration space of the operation begins. This is used for tiling, since the
-    tiled implementation must leave the output K dimension untiled. Similarly,
-    `m_offset` is the offset within the output M dimension from which the
-    iteration space of the operation begins.
-    The iteration space is the full output shape of the im2col op, so if the
-    im2col op were tiled to loops with a scalar inner tile, it would look like
-    the following:
+    The `offsets` attribute provides one offset per output dimension in
+    canonical `[Batch..., M..., K...]` order. When tiling, offsets are
+    updated to reflect the tile position; `output_sizes` remain unchanged.
+
+    The `output_sizes` attribute is a nested list of delinearization sizes
+    per output dimension. Each output dimension has an inner list of sizes
+    that describe how to delinearize that dimension back to spatial or
+    channel coordinates. For example:
+    ```
+      output_sizes = [[2], [32, 32], [3, 3, 640]]
+    ```
+    means batch dim has size [2], M dim delinearizes into [32, 32] (OH, OW),
+    and K dim delinearizes into [3, 3, 640] (KH, KW, C).
+
+    Example IR:
     ```
       %im2col = iree_linalg_ext.im2col
           strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-          m_offset = [0] * [1] k_offset = [0] * [1]
+          offsets = [0, 0, 0]
+          output_sizes = [[2], [32, 32], [3, 3, 640]]
           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
           input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
           ins(%in : tensor<2x34x34x640xf32>)
           outs(%out : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
     ```
-    becomes:
-    ```
-      scf.for %arg0 = %c0 to %c2 step %c1
-        scf.for %arg1 = %c0 to %c1024 step %c1
-          scf.for %arg2 = %c0 to %c5760 step %c1
-            %im2col = iree_linalg_ext.im2col
-                strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-                m_offset = [%arg1] * [1] k_offset = [%arg2] * [1]
-                batch_pos = [0] m_pos = [1, 2] k_pos = [3]
-                ins(%in_tile : tensor<1x34x34x640xf32>)
-                outs(%out_tile : tensor<1x1x1xf32>) -> tensor<1x1x1xf32>
-    ```
-    Then, when the tiled op is decomposed, it becomes a loop over the iteration
-    space of the im2col op, whith an extract_slice from the `%in_tile` followed
-    by an insert_slice to the `%out_tile`. The indices for the extract slice are
-    computed using the `m_offset` and `k_offset` as:
-    (b, m, k) -> (b, M / 32 + K / (640*3), M % 32 + K % (640*3) / 640, K % 640)
-    Where `(b, m, k)` are the indices of the tiled op's iteration space, and
-    `M = m + m_offset` and `K = k + K_offset`.
-
-    The `m_strides` and `k_strides` fields are used as a basis for linearizing
-    the `m_offset` and `k_offset`. This is used when there are multiple M or K
-    output dimensions, and therefore multiple `m_offset` or `k_offset` values.
-    The strides fields are assembled in the IR as if they are multiplied as an
-    inner product with `m_offset` and `k_offset, indicating that the total
-    linear offset along the dimension is equal to this inner product. These
-    strides fields also determine the strides of the output dimensions along
-    M and K. For example, an op with `m_strides = [32, 1]`, `k_strides = [4, 1]`,
-    and output type `tensor<BxM0xM1xK0xK1>` (expanded from `tensor<BxMxK>`),
-    would have strides along the M dim of 32 for `M0`, meaning as `M0` increases
-    by 1, the index into the flat `M` increases by 32. Along the K dim, strides
-    would be 4 for `K0`, and 1 for `K1`, meaning as `K0` increases by 1, the
-    index into the flat `K` increases by 4. The strides in M from `m_strides`
-    are orthogonal to the strides in `K` from `k_strides`.
 
     The `input_k_perm` attribute defines the permutation needed to align the
     reduction dimensions of the input layout with those of the filter layout
@@ -1371,39 +1345,42 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
                        DenseI64ArrayAttr:$dilations,
                        Variadic<Index>:$kernel_size,
                        DenseI64ArrayAttr:$static_kernel_size,
-                       Variadic<Index>:$m_offset,
-                       DenseI64ArrayAttr:$static_m_offset,
-                       Variadic<Index>:$m_strides,
-                       DenseI64ArrayAttr:$static_m_strides,
-                       Variadic<Index>:$k_offset,
-                       DenseI64ArrayAttr:$static_k_offset,
-                       Variadic<Index>:$k_strides,
-                       DenseI64ArrayAttr:$static_k_strides,
+                       Variadic<Index>:$offsets,
+                       DenseI64ArrayAttr:$static_offsets,
+                       Variadic<Index>:$output_sizes,
+                       ArrayAttr:$static_output_sizes,
                        DenseI64ArrayAttr:$batch_pos,
                        DenseI64ArrayAttr:$m_pos,
                        DenseI64ArrayAttr:$k_pos,
                        DenseI64ArrayAttr:$input_k_perm,
-                       DenseI64ArrayAttr:$output_perm);
+                       DenseI64ArrayAttr:$output_perm,
+                       Variadic<Index>:$input_pad_low,
+                       DenseI64ArrayAttr:$static_input_pad_low,
+                       Variadic<Index>:$input_pad_high,
+                       DenseI64ArrayAttr:$static_input_pad_high,
+                       Optional<AnyType>:$pad_value);
 
   let results = (outs Variadic<AnyShaped>:$results);
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
   let assemblyFormat = [{
     attr-dict
     `strides` `=` $strides
     `dilations` `=` $dilations
     `kernel_size` `=`
     custom<DynamicIndexList>($kernel_size, $static_kernel_size)
-    `m_offset` `=`
-    custom<DynamicIndexList>($m_offset, $static_m_offset)
-    `*` custom<DynamicIndexList>($m_strides, $static_m_strides)
-    `k_offset` `=`
-    custom<DynamicIndexList>($k_offset, $static_k_offset)
-    `*` custom<DynamicIndexList>($k_strides, $static_k_strides)
+    `offsets` `=`
+    custom<DynamicIndexList>($offsets, $static_offsets)
+    `output_sizes` `=`
+    custom<NestedDynamicIndexList>($output_sizes, $static_output_sizes)
     `batch_pos` `=` $batch_pos
     `m_pos` `=` $m_pos
     `k_pos` `=` $k_pos
     `input_k_perm` `=` $input_k_perm
     `output_perm` `=` $output_perm
+    custom<OptionalPadding>($input_pad_low, $static_input_pad_low,
+                            $input_pad_high, $static_input_pad_high,
+                            $pad_value, type($pad_value))
     `ins` `(` $input `:` type($input) `)`
     `outs` `(` $output `:` type($output) `)`
     (`->` type($results)^)?
@@ -1414,15 +1391,16 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
       "ArrayRef<int64_t>":$strides,
       "ArrayRef<int64_t>":$dilations,
       "ArrayRef<OpFoldResult>":$kernel_size,
-      "ArrayRef<OpFoldResult>":$m_offset,
-      "ArrayRef<OpFoldResult>":$m_strides,
-      "ArrayRef<OpFoldResult>":$k_offset,
-      "ArrayRef<OpFoldResult>":$k_strides,
+      "ArrayRef<OpFoldResult>":$offsets,
+      "ArrayRef<SmallVector<OpFoldResult>>":$output_sizes,
       "ArrayRef<int64_t>":$batch_dimensions,
       "ArrayRef<int64_t>":$m_dimensions,
       "ArrayRef<int64_t>":$k_dimensions,
       "ArrayRef<int64_t>":$input_k_perm,
-      "ArrayRef<int64_t>":$output_perm)>
+      "ArrayRef<int64_t>":$output_perm,
+      CArg<"ArrayRef<OpFoldResult>", "{}">:$input_pad_low,
+      CArg<"ArrayRef<OpFoldResult>", "{}">:$input_pad_high,
+      CArg<"Value", "Value()">:$pad_value)>
   ];
 
   let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
@@ -1444,6 +1422,9 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     SmallVector<int64_t> getMOutputDims();
     SmallVector<int64_t> getKOutputDims();
 
+    // Returns the number of M output dimensions.
+    int64_t getNumMOutputDims();
+
     // Returns the mapping from input dimensions to the corresponding set of
     // output dimensions that can vectorize along with them. A pair of input and
     // output dims are vectorizable together if incrementing the output
@@ -1454,23 +1435,26 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     //
     // This method does not find vectorizable dims if output dims are partially
     // collapsed. For example, it computes K dim mapping for standard conv_2d if
-    // the K dim is fully collapsed or fully expanded (inlcuding all input
+    // the K dim is fully collapsed or fully expanded (including all input
     // channel and filter loop dims), but otherwise omits mappings for the K
     // dims.
     SmallVector<SmallVector<int64_t>> getInputToOutputDimVectorizationMap();
 
     // Return op metadata.
     SmallVector<OpFoldResult> getMixedKernelSize();
-    SmallVector<OpFoldResult> getMixedMOffset();
-    SmallVector<OpFoldResult> getMixedKOffset();
-    SmallVector<OpFoldResult> getMixedMStrides();
-    SmallVector<OpFoldResult> getMixedKStrides();
+    SmallVector<OpFoldResult> getMixedOffsets();
+    SmallVector<SmallVector<OpFoldResult>> getMixedOutputSizes();
+    SmallVector<OpFoldResult> getMixedInputPadLow();
+    SmallVector<OpFoldResult> getMixedInputPadHigh();
 
     // Set op metadata.
-    void setMixedKOffset(SmallVector<OpFoldResult> kOffset);
-    void setMixedMOffset(SmallVector<OpFoldResult> mOffset);
-    void setMixedKStrides(SmallVector<OpFoldResult> kStrides);
-    void setMixedMStrides(SmallVector<OpFoldResult> mStrides);
+    void setMixedOffsets(SmallVector<OpFoldResult> offsets);
+    void setMixedOutputSizes(ArrayRef<SmallVector<OpFoldResult>> outputSizes);
+    void setMixedInputPadLow(SmallVector<OpFoldResult> padLow);
+    void setMixedInputPadHigh(SmallVector<OpFoldResult> padHigh);
+
+    /// Returns true if the op has non-zero padding.
+    bool hasPadding() { return static_cast<bool>(getPadValue()); }
 
     // Method to implement for specifying output range for
     // DestinationStyleOpInterface

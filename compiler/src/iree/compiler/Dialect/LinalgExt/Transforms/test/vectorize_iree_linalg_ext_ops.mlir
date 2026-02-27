@@ -139,3 +139,409 @@ func.func @map_store_f4_mask_depends_on_inner_index(
 }
 // CHECK-LABEL: @map_store_f4_mask_depends_on_inner_index
 //   CHECK-NOT:   vector
+
+// -----
+
+// Standard NHWC layout, K tile size (4) divides innermost input dim C (640).
+// Vectorizes along K (output dim 2) with vector width 4.
+// Non-vectorized dims: batch (2) x M (2) = 4 iterations.
+#map_k = affine_map<(d0) -> (d0 * 4)>
+func.func @im2col_vectorize_nhwc(
+    %input: tensor<2x34x34x640xf32>, %m_off: index, %k: index
+) -> tensor<2x2x4xf32> {
+  %0 = tensor.empty() : tensor<2x2x4xf32>
+  %k_off = affine.apply #map_k(%k)
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[2], [32, 32], [3, 3, 640]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          ins(%input : tensor<2x34x34x640xf32>)
+          outs(%0 : tensor<2x2x4xf32>) -> tensor<2x2x4xf32>
+  return %1 : tensor<2x2x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_nhwc
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>
+//   CHECK-DAG:   %[[CST:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   %[[R0:.+]] = vector.transfer_read %[[INPUT]]{{.*}}, %[[CST]] : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write %[[R0]], {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   %[[R1:.+]] = vector.transfer_read %[[INPUT]]{{.*}}, %[[CST]] : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write %[[R1]], {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   %[[R2:.+]] = vector.transfer_read %[[INPUT]]{{.*}}, %[[CST]] : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write %[[R2]], {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   %[[R3:.+]] = vector.transfer_read %[[INPUT]]{{.*}}, %[[CST]] : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   %[[FINAL:.+]] = vector.transfer_write %[[R3]], {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   return %[[FINAL]] : tensor<2x2x4xf32>
+
+// -----
+
+// Multi-dim K output. K is split into two output dims (sizes 2 and 4).
+// Innermost K dim (4) divides C (640), so vectorizes along dim 3.
+// Non-vectorized: batch (2) x M (2) x K0 (2) = 8 iterations.
+func.func @im2col_vectorize_multi_k(
+    %input: tensor<2x34x34x640xf32>, %m_off: index, %k: index
+) -> tensor<2x2x2x4xf32> {
+  %0 = tensor.empty() : tensor<2x2x2x4xf32>
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k, 0] output_sizes = [[2], [32, 32], [3, 3], [640]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2, 3]
+          ins(%input : tensor<2x34x34x640xf32>)
+          outs(%0 : tensor<2x2x2x4xf32>) -> tensor<2x2x2x4xf32>
+  return %1 : tensor<2x2x2x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_multi_k
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+// Verify all 8 iterations produce transfer_read/write pairs.
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   %[[FINAL:.+]] = vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+//       CHECK:   return %[[FINAL]]
+
+// -----
+
+// CHWN layout with output_perm that puts batch at the last output dim.
+// Input dim 3 (batch, N=4) is innermost and maps to output dim 3 via
+// output_perm = [3, 1, 2, 0]. Vectorizes along dim 3, width 4.
+// This uses the default (minor identity) permutation map for the write.
+func.func @im2col_vectorize_chwn_output_perm(
+    %input: tensor<16x26x18x4xf32>, %m0: index, %m1: index, %k: index
+) -> tensor<2x2x2x4xf32> {
+  %0 = tensor.empty() : tensor<2x2x2x4xf32>
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [24, 16]
+          offsets = [0, %m0, %m1, %k] output_sizes = [[4], [3], [3], [16, 24, 16]]
+          batch_pos = [3] m_pos = [1, 2] k_pos = [0]
+          input_k_perm = [0, 1, 2] output_perm = [3, 1, 2, 0]
+          ins(%input : tensor<16x26x18x4xf32>)
+          outs(%0 : tensor<2x2x2x4xf32>) -> tensor<2x2x2x4xf32>
+  return %1 : tensor<2x2x2x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_chwn_output_perm
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<16x26x18x4xf32>
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<16x26x18x4xf32>, vector<4xf32>
+//  CHECK-NEXT:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x2x4xf32>
+// Verify no explicit permutation_map (default minor identity used for write).
+//   CHECK-NOT:   permutation_map
+
+// -----
+
+// CHWN layout with identity output_perm. Batch dim (innermost input, dim 3)
+// maps to output dim 0. Vectorization along dim 0 requires a non-default
+// permutation_map on the vector.transfer_write.
+//   CHECK-DAG: #[[$WRITE_MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d0)>
+func.func @im2col_vectorize_chwn(
+    %input: tensor<16x26x18x4xf32>, %m0: index, %m1: index, %k: index
+) -> tensor<4x2x2x2xf32> {
+  %0 = tensor.empty() : tensor<4x2x2x2xf32>
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [24, 16]
+          offsets = [0, %m0, %m1, %k] output_sizes = [[4], [3], [3], [16, 24, 16]]
+          batch_pos = [3] m_pos = [1, 2] k_pos = [0]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2, 3]
+          ins(%input : tensor<16x26x18x4xf32>)
+          outs(%0 : tensor<4x2x2x2xf32>) -> tensor<4x2x2x2xf32>
+  return %1 : tensor<4x2x2x2xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_chwn
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<16x26x18x4xf32>
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   %[[R:.+]] = vector.transfer_read %[[INPUT]]{{.*}} : tensor<16x26x18x4xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write %[[R]], {{.*}}permutation_map = #[[$WRITE_MAP]]{{.*}} : vector<4xf32>, tensor<4x2x2x2xf32>
+
+// -----
+
+// Dynamic output shape: vectorization pattern should not match.
+func.func @im2col_no_vectorize_dynamic(
+    %input: tensor<2x34x34x640xf32>, %m_size: index, %m_off: index, %k: index
+) -> tensor<2x?x4xf32> {
+  %0 = tensor.empty(%m_size) : tensor<2x?x4xf32>
+  %k_off = affine.apply affine_map<(d0) -> (d0 * 4)>(%k)
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[2], [32, 32], [3, 3, 640]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          ins(%input : tensor<2x34x34x640xf32>)
+          outs(%0 : tensor<2x?x4xf32>) -> tensor<2x?x4xf32>
+  return %1 : tensor<2x?x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_no_vectorize_dynamic
+//       CHECK:   iree_linalg_ext.im2col
+//   CHECK-NOT:   vector.transfer_read
+//   CHECK-NOT:   vector.transfer_write
+
+// -----
+
+// Non-vectorizable due to input_k_perm = [1, 0] making innermost K
+// non-contiguous in input. Falls back to scalar unrolling (vector<1>).
+// Output has 1*2*4 = 8 elements, so 8 scalar iterations.
+func.func @im2col_scalar_fallback(
+    %input: tensor<1x3x2xf32>
+) -> tensor<1x2x4xf32> {
+  %0 = tensor.empty() : tensor<1x2x4xf32>
+  %1 = iree_linalg_ext.im2col strides = [1] dilations = [1] kernel_size = [2]
+                          offsets = [0, 0, 0] output_sizes = [[1], [2], [2, 2]]
+                          batch_pos = [0] m_pos = [1] k_pos = [2]
+                          input_k_perm = [1, 0] output_perm = [0, 1, 2]
+                          ins(%input : tensor<1x3x2xf32>)
+                          outs(%0 : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
+  return %1 : tensor<1x2x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_scalar_fallback
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Scalar fallback: uses vector<1xf32> for each element.
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<1x3x2xf32>, vector<1xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<1xf32>, tensor<1x2x4xf32>
+
+// -----
+
+// Source padding (conv padding folded into im2col). NHWC layout.
+// Input: 2x34x34x640 (unpadded), pad_low=[0,1,1,0], pad_high=[0,1,1,0].
+// Effective: 2x36x36x640. Ho = (36-3)/1+1 = 34, Wo = 34.
+// K tile = 4 divides C = 640 -> vectorize along K.
+// Verifies: masked transfer_read with pad_value, unmasked transfer_write.
+#map_k_pad = affine_map<(d0) -> (d0 * 4)>
+func.func @im2col_vectorize_source_padding(
+    %input: tensor<2x34x34x640xf32>, %m_off: index, %k: index
+) -> tensor<2x2x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x2x4xf32>
+  %k_off = affine.apply #map_k_pad(%k)
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[2], [34, 34], [3, 3, 640]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0]
+          pad_value(%cst : f32)
+          ins(%input : tensor<2x34x34x640xf32>)
+          outs(%0 : tensor<2x2x4xf32>) -> tensor<2x2x4xf32>
+  return %1 : tensor<2x2x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_source_padding
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Verify masked transfer_read with pad_value.
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   %[[FINAL:.+]] = vector.transfer_write {{.*}} : vector<4xf32>, tensor<2x2x4xf32>
+//       CHECK:   return %[[FINAL]] : tensor<2x2x4xf32>
+
+// -----
+
+// Source padding with scalar fallback. NHWC layout, 1x6x6x8 input.
+// pad_low=[0,1,1,0], pad_high=[0,1,1,0]. Effective: 1x8x8x8.
+// kernel 3x3, strides [1,1]: Ho=6, Wo=6. Output: 1x2x8.
+// Although K tile size (8) divides C (8), the k_off argument is an opaque
+// index (not a known multiple of 8), so willBeContiguousSlice returns false
+// and vectorization falls back to scalar (vector<1xf32>) per element.
+func.func @im2col_scalar_fallback_source_padding(
+    %input: tensor<1x6x6x8xf32>, %m_off: index, %k_off: index
+) -> tensor<1x2x8xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<1x2x8xf32>
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[1], [6, 6], [3, 3, 8]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0]
+          pad_value(%cst : f32)
+          ins(%input : tensor<1x6x6x8xf32>)
+          outs(%0 : tensor<1x2x8xf32>) -> tensor<1x2x8xf32>
+  return %1 : tensor<1x2x8xf32>
+}
+// CHECK-LABEL: func.func @im2col_scalar_fallback_source_padding
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<1x6x6x8xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Scalar fallback: bounds checks and masked reads with vector<1xf32>.
+//       CHECK:   arith.cmpi sge
+//       CHECK:   arith.cmpi slt
+//       CHECK:   arith.andi
+//       CHECK:   vector.broadcast {{.*}} : i1 to vector<1xi1>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<1x6x6x8xf32>, vector<1xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<1xf32>, tensor<1x2x8xf32>
+
+// -----
+
+// Source padding with scalar fallback (non-vectorizable).
+// Input: 1x3x2 (1d conv), pad_low=[0,1,0], pad_high=[0,1,0].
+// Effective: 1x5x2. kernel [2], strides [1]: Ho = 4.
+// Scalar unrolling (vec_width=1) due to input_k_perm = [1, 0].
+func.func @im2col_scalar_fallback_padding(
+    %input: tensor<1x3x2xf32>
+) -> tensor<1x2x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<1x2x4xf32>
+  %1 = iree_linalg_ext.im2col strides = [1] dilations = [1] kernel_size = [2]
+                          offsets = [0, 0, 0] output_sizes = [[1], [4], [2, 2]]
+                          batch_pos = [0] m_pos = [1] k_pos = [2]
+                          input_k_perm = [1, 0] output_perm = [0, 1, 2]
+                          input_pad_low = [0, 1, 0] input_pad_high = [0, 1, 0]
+                          pad_value(%cst : f32)
+                          ins(%input : tensor<1x3x2xf32>)
+                          outs(%0 : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
+  return %1 : tensor<1x2x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_scalar_fallback_padding
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Scalar fallback with masked reads.
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<1x3x2xf32>, vector<1xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<1xf32>, tensor<1x2x4xf32>
+
+// -----
+
+// Regression test: backward-weight-style im2col with dilation=2, vectorized
+// along the innermost batch dimension (N=2). Verifies that:
+//   1. The im2col op is successfully lowered (no iree_linalg_ext.im2col remains).
+//   2. The K delinearization uses output_sizes K inner [4, 8, 8] correctly.
+//   3. Spatial offsets include a factor of 2 (the dilation).
+//
+// Layout: input=C x IH x IW x N (k_pos=[0], m_pos=[1,2], batch_pos=[3])
+// Output: M0 x M1 x K x B (output_perm=[1,2,3,0], shape 3x3x4x2)
+// Batch (N=2) is innermost in input, vectorized along output dim 3 (width 2).
+//
+//   CHECK-DAG: #[[$SPATIAL_DIL:.+]] = affine_map<()[s0, s1] -> (s0 + s1 * 2)>
+func.func @im2col_vectorize_chwn_dilated(
+    %input: tensor<4x18x18x2xf32>, %m0: index, %m1: index, %k: index
+) -> tensor<3x3x4x2xf32> {
+  %0 = tensor.empty() : tensor<3x3x4x2xf32>
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [2, 2] kernel_size = [8, 8]
+          offsets = [0, %m0, %m1, %k] output_sizes = [[2], [3], [3], [4, 8, 8]]
+          batch_pos = [3] m_pos = [1, 2] k_pos = [0]
+          input_k_perm = [0, 1, 2] output_perm = [1, 2, 3, 0]
+          ins(%input : tensor<4x18x18x2xf32>)
+          outs(%0 : tensor<3x3x4x2xf32>) -> tensor<3x3x4x2xf32>
+  return %1 : tensor<3x3x4x2xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_chwn_dilated
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<4x18x18x2xf32>
+//  CHECK-SAME:     %[[M0:[a-zA-Z0-9_]+]]: index
+//  CHECK-SAME:     %[[M1:[a-zA-Z0-9_]+]]: index
+//  CHECK-SAME:     %[[K:[a-zA-Z0-9_]+]]: index
+// Verify im2col is fully lowered to vector ops.
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Verify K delinearization uses output_sizes K inner [4, 8, 8].
+//       CHECK:   %{{.+}}:3 = affine.delinearize_index %{{.+}} into (4, 8, 8) : index, index, index
+// Verify dilation factor 2 is applied to spatial offset computation.
+//       CHECK:   affine.apply #[[$SPATIAL_DIL]]
+// Verify vectorized reads produce vector<2xf32> (batch dimension size 2).
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} : tensor<4x18x18x2xf32>, vector<2xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<2xf32>, tensor<3x3x4x2xf32>
+
+// -----
+
+// Result M masking: output M (20) exceeds real M (16) from effective input.
+// Input: 1x4x4x4 (NHWC), pad_low=[0,1,1,0], pad_high=[0,1,1,0].
+// Effective: 1x6x6x4. kernel 3x3, strides [1,1]: Ho=4, Wo=4, realM=16.
+// Output: 1x20x4 => output M=20 > real M=16 -> needMResultMask.
+// Vectorize along K (dim 2), width 4 divides C=4.
+// k_offset must be a known multiple of 4 for vectorization.
+// Verifies: M result mask (arith.cmpi slt for M bounds check).
+#map_k_rm = affine_map<(d0) -> (d0 * 4)>
+func.func @im2col_vectorize_m_result_mask(
+    %input: tensor<1x4x4x4xf32>, %m_off: index, %k: index
+) -> tensor<1x20x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<1x20x4xf32>
+  %k_off = affine.apply #map_k_rm(%k)
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[1], [4, 4], [3, 3, 4]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0]
+          pad_value(%cst : f32)
+          ins(%input : tensor<1x4x4x4xf32>)
+          outs(%0 : tensor<1x20x4xf32>) -> tensor<1x20x4xf32>
+  return %1 : tensor<1x20x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_m_result_mask
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<1x4x4x4xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Verify M result masking: compare linearized M index against real M extent (16).
+//       CHECK:   arith.cmpi slt, %{{.*}}, %{{.*}} : index
+// Verify masked transfer_read with pad_value and vector width 4.
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} : tensor<1x4x4x4xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<4xf32>, tensor<1x20x4xf32>
+
+// -----
+
+// Result K and M masking with vectorization along K dimension.
+// Input: 1x3x2 (batch x spatial x channel). kernel=[2], strides=[1].
+// realM = (3-2)/1+1 = 2, realK = kernel(2) * channel(2) = 4.
+// Output: 1x3x3x2 (batch=1, M=3, K0=3, K1=2).
+// output_sizes splits K into two output dims with extents 2 and 2.
+// M output dim (3) > M extent (2) -> M result masking (dynamic).
+// K0 output dim (3) > K0 extent (2) -> K0 scalar masking (folded to constant
+// for K0 iterations 0,1 and dense<false> for K0=2 since K0 offset is 0).
+// K1 output dim (2) = K1 extent (2) -> no K1 masking.
+// Vectorize along K1 (dim 3), width 2 divides C=2. vecAlongK=true.
+// Verifies: M result masking (arith.cmpi slt), K scalar masking (dense<false>
+// for oversized K0 position), and broadcast of scalar mask to vector mask.
+func.func @im2col_vectorize_k_result_mask(
+    %input: tensor<1x3x2xf32>, %m_off: index
+) -> tensor<1x3x3x2xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<1x3x3x2xf32>
+  %1 = iree_linalg_ext.im2col strides = [1] dilations = [1] kernel_size = [2]
+                          offsets = [0, %m_off, 0, 0] output_sizes = [[1], [2], [2], [2]]
+                          batch_pos = [0] m_pos = [1] k_pos = [2]
+                          input_k_perm = [0, 1] output_perm = [0, 1, 2, 3]
+                          input_pad_low = [0, 0, 0] input_pad_high = [0, 0, 0]
+                          pad_value(%cst : f32)
+                          ins(%input : tensor<1x3x2xf32>)
+                          outs(%0 : tensor<1x3x3x2xf32>) -> tensor<1x3x3x2xf32>
+  return %1 : tensor<1x3x3x2xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_k_result_mask
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-DAG:   %[[FALSE_MASK:.+]] = arith.constant dense<false> : vector<2xi1>
+//   CHECK-NOT:   iree_linalg_ext.im2col
+// Verify M result masking: comparison against real M extent (2).
+//       CHECK:   arith.cmpi slt, %{{.*}}, %{{.*}} : index
+// Verify scalar M mask is broadcast to vector mask for transfer_read.
+//       CHECK:   vector.broadcast %{{.*}} : i1 to vector<2xi1>
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]]
+//       CHECK:   vector.transfer_write {{.*}} : vector<2xf32>, tensor<1x3x3x2xf32>
+// Verify K0 result masking: dense<false> mask for K0=2 (position >= K0 extent).
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %[[FALSE_MASK]]
+//       CHECK:   vector.transfer_write {{.*}} : vector<2xf32>, tensor<1x3x3x2xf32>
+
+// NOTE: A negative test for kMaxUnrollIters (> 1024 non-vectorized elements)
+// cannot be included in this file because the VectorizeIREELinalgExtOpsPass
+// uses applyPatternsGreedily which signals pass failure when patterns don't
+// converge, and --split-input-file propagates the failure exit code. The
+// kMaxUnrollIters guard is covered by the rationale comment in the source and
+// verified indirectly by all tests above being below the limit.
