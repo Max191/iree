@@ -2264,7 +2264,8 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
   }
   if (clGPUUseTileAndFuseMatmul) {
     if (succeeded(IREE::GPU::setMatmulLoweringConfig(
-            target, entryPointFn, computeOp, clUseDirectLoad))) {
+            target, entryPointFn, computeOp, clUseDirectLoad,
+            gpuOpts.emitSchedBarriers))) {
       LDBG() << "Tile and fuse matmul config";
       return success();
     }

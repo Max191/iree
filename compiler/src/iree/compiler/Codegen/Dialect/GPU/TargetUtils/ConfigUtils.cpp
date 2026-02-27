@@ -1121,7 +1121,8 @@ LogicalResult setIGEMMConvolutionLoweringConfig(
 
 LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPoint,
-                                      Operation *op, bool useDirectLoad) {
+                                      Operation *op, bool useDirectLoad,
+                                      bool emitSchedBarriers) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp ||
       (!linalg::isaContractionOpInterface(linalgOp) &&
@@ -1177,7 +1178,8 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
       /*prefetchNumStages=*/useDirectLoad ? 0 : 2,
       /*no_reduce_shared_memory_bank_conflicts=*/useDirectLoad,
       /*use_igemm_convolution=*/false,
-      /*reorder_workgroups_strategy=*/std::nullopt);
+      /*reorder_workgroups_strategy=*/std::nullopt,
+      /*emit_sched_barriers=*/emitSchedBarriers);
   pipelineAttrs.emplace_back(
       IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
   auto pipelineConfig =
