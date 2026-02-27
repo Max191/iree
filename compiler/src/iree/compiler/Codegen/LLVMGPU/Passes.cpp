@@ -563,6 +563,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
       IREE::Codegen::RelayoutCombinationScope::Workgroup;
   funcPassManager.addPass(
       createCombineResultLayoutTransformationPass(combineLayoutOptions));
+  funcPassManager.addPass(createCombineSourceLayoutTransformationPass());
   funcPassManager.addPass(createGPUGreedilyDistributeToThreadsPass());
   funcPassManager.addPass(createTileLargeTensorsPass());
   funcPassManager.addPass(createCanonicalizerPass());
