@@ -150,6 +150,291 @@ Im2colSourceIndices computeIm2colSourceIndices(OpBuilder &b, Location loc,
   return Im2colSourceIndices{sliceOffsets, sliceSizes};
 }
 
+// Conservative for tiled ops with dynamic offsets: returns true whenever the
+// tile could potentially exceed the valid output region, even if the tiling
+// infrastructure guarantees in-bounds access. The resulting bounds-checking
+// IR folds away after canonicalize + CSE.
+bool hasOutputPadding(Im2colOp im2colOp) {
+  SmallVector<SmallVector<OpFoldResult>> outputSizes =
+      im2colOp.getMixedOutputSizes();
+  SmallVector<OpFoldResult> offsets = im2colOp.getMixedOffsets();
+  ArrayRef<int64_t> outputPerm = im2colOp.getOutputPerm();
+  // output_perm[actual] = canonical, so invert to map canonical -> actual.
+  SmallVector<int64_t> inverseOutputPerm =
+      invertPermutationVector(outputPerm);
+  ArrayRef<int64_t> outputShape = im2colOp.getOutputType().getShape();
+
+  for (auto [canonical, innerSizes] : llvm::enumerate(outputSizes)) {
+    // Compute the static product of output_sizes for this canonical dim.
+    int64_t validSize = 1;
+    for (OpFoldResult s : innerSizes) {
+      std::optional<int64_t> c = getConstantIntValue(s);
+      if (!c.has_value()) {
+        return true; // Dynamic: conservatively assume output padding.
+      }
+      validSize *= c.value();
+    }
+    int64_t actual = inverseOutputPerm[canonical];
+    int64_t tensorDim = outputShape[actual];
+    if (ShapedType::isDynamic(tensorDim)) {
+      return true; // Dynamic: conservatively assume output padding.
+    }
+    // Check if this tile's range [offset, offset+tensorDim) can exceed
+    // validSize. For tiled ops, the tensor dim is the tile size and the
+    // offset determines where the tile starts.
+    std::optional<int64_t> constOffset = getConstantIntValue(offsets[canonical]);
+    if (!constOffset.has_value()) {
+      // Dynamic offset: safe only if the tile exactly spans the valid region.
+      if (tensorDim != validSize) {
+        return true;
+      }
+      continue;
+    }
+    if (*constOffset + tensorDim > validSize) {
+      return true;
+    }
+  }
+  return false;
+}
+
+SmallVector<OpFoldResult>
+computeOutputValidSizes(OpBuilder &b, Location loc, Im2colOp im2colOp) {
+  SmallVector<SmallVector<OpFoldResult>> outputSizes =
+      im2colOp.getMixedOutputSizes();
+  SmallVector<OpFoldResult> validSizes;
+  for (const auto &innerSizes : outputSizes) {
+    OpFoldResult product = innerSizes[0];
+    for (size_t i = 1; i < innerSizes.size(); ++i) {
+      product = mulOfrs(b, loc, product, innerSizes[i]);
+    }
+    validSizes.push_back(product);
+  }
+  return validSizes;
+}
+
+Im2colPaddingBounds
+computeIm2colPaddingBounds(OpBuilder &b, Location loc, Im2colOp im2colOp,
+                           const Im2colSourceIndices &srcIndices,
+                           ArrayRef<OpFoldResult> inputSizes,
+                           ArrayRef<OpFoldResult> padLow,
+                           OpFoldResult innerTileSize,
+                           ArrayRef<Value> outputIVs,
+                           ArrayRef<OpFoldResult> outputOffsets,
+                           std::optional<int64_t> vecOutputDim) {
+  int64_t inputRank = im2colOp.getInputRank();
+  int64_t vecInputDim = inputRank - 1;
+  Value zeroVal = arith::ConstantIndexOp::create(b, loc, 0);
+
+  // Compute adjusted offsets: subtract padLow to get unpadded-space coords.
+  SmallVector<OpFoldResult> adjustedOffsets(inputRank);
+  for (int64_t d = 0; d < inputRank; ++d) {
+    adjustedOffsets[d] =
+        subOfrs(b, loc, srcIndices.sliceOffsets[d], padLow[d]);
+  }
+
+  // Compute valid_size and low pad amount along the vectorized dimension.
+  // lowPadAmt = max(-adjustedVecCoord, 0)
+  // readStart = max(adjustedVecCoord, 0)
+  // validSize = clamp(inputSize - readStart, 0, tileSize - lowPadAmt)
+  OpFoldResult adjustedVecCoordOfr = adjustedOffsets[vecInputDim];
+  OpFoldResult inputExtentOfr = inputSizes[vecInputDim];
+  // Use affine ops for the valid-size computation so that IREE's
+  // IntegerDivisibilityAnalysis can track divisibility through the chain.
+  // The analysis tracks affine.apply/min/max but NOT arith.subi/maxsi/minsi.
+  MLIRContext *ctx = b.getContext();
+  AffineExpr d0 = getAffineDimExpr(0, ctx);
+  AffineExpr d1 = getAffineDimExpr(1, ctx);
+
+  // vecLowPadAmt = max(-adjustedVecCoord, 0)
+  AffineMap negMaxMap =
+      AffineMap::get(1, 0, {-d0, getAffineConstantExpr(0, ctx)}, ctx);
+  OpFoldResult vecLowPadAmtOfr = affine::makeComposedFoldedAffineMax(
+      b, loc, negMaxMap, {adjustedVecCoordOfr});
+
+  // readStart = max(adjustedVecCoord, 0)
+  AffineMap posMaxMap =
+      AffineMap::get(1, 0, {d0, getAffineConstantExpr(0, ctx)}, ctx);
+  OpFoldResult readStartOfr = affine::makeComposedFoldedAffineMax(
+      b, loc, posMaxMap, {adjustedVecCoordOfr});
+
+  // rawValid = inputExtent - readStart
+  AffineMap subMap = AffineMap::get(2, 0, d0 - d1, ctx);
+  OpFoldResult rawValidOfr = affine::makeComposedFoldedAffineApply(
+      b, loc, subMap, {inputExtentOfr, readStartOfr});
+
+  // availableSpace = tileSize - vecLowPadAmt
+  OpFoldResult availableSpaceOfr = affine::makeComposedFoldedAffineApply(
+      b, loc, subMap, {innerTileSize, vecLowPadAmtOfr});
+
+  // clampedLow = max(rawValid, 0)
+  OpFoldResult clampedLowOfr = affine::makeComposedFoldedAffineMax(
+      b, loc, posMaxMap, {rawValidOfr});
+
+  // validSize = min(clampedLow, availableSpace)
+  AffineMap minMap = AffineMap::get(2, 0, {d0, d1}, ctx);
+  OpFoldResult validSizeOfr = affine::makeComposedFoldedAffineMin(
+      b, loc, minMap, {clampedLowOfr, availableSpaceOfr});
+
+  Value validSize = getValueOrCreateConstantIndexOp(b, loc, validSizeOfr);
+  Value vecLowPadAmt =
+      getValueOrCreateConstantIndexOp(b, loc, vecLowPadAmtOfr);
+
+  // Incorporate out-of-bounds status of non-vectorized dims (batch, spatial,
+  // and channel). If an adjusted coord is outside [0, dimSize), the valid
+  // region is empty, so clamp validSize and vecLowPadAmt to 0. This handles
+  // input padding (padLow/padHigh > 0), output-alignment OOB from
+  // non-wrapping delinearization (coord > dimSize even with zero padding),
+  // and batch OOB when tile size exceeds the batch dimension.
+  // Use affine ops + arith.muli to zero out validSize and vecLowPadAmt when a
+  // non-vectorized dim is out of bounds. We compute a 0-or-1 factor using
+  // affine.min/max, then multiply: both affine ops and arith.muli are tracked
+  // by IntegerDivisibilityAnalysis, so divisibility is preserved.
+  //
+  // For coord in [0, dimSize):
+  //   highOk = max(min(dimSize - coord, 1), 0) = 1
+  //   lowOk  = max(min(coord + 1, 1), 0)      = 1
+  //   factor = highOk * lowOk = 1 → validSize unchanged.
+  // For coord < 0: lowOk = 0 → factor = 0 → validSize = 0.
+  // For coord >= dimSize: highOk = 0 → factor = 0 → validSize = 0.
+  AffineMap clampHighToOneMap = AffineMap::get(
+      2, 0, {d0 - d1, getAffineConstantExpr(1, ctx)}, ctx);
+  AffineMap clampLowToOneMap = AffineMap::get(
+      1, 0, {d0 + 1, getAffineConstantExpr(1, ctx)}, ctx);
+
+  auto checkDimBounds = [&](int64_t dim) {
+    if (dim == vecInputDim)
+      return;
+    OpFoldResult coord = adjustedOffsets[dim];
+    OpFoldResult dimSize = inputSizes[dim];
+    // highOk = max(min(dimSize - coord, 1), 0): 1 when coord < dimSize, else 0.
+    OpFoldResult highMin = affine::makeComposedFoldedAffineMin(
+        b, loc, clampHighToOneMap, {dimSize, coord});
+    OpFoldResult highOk =
+        affine::makeComposedFoldedAffineMax(b, loc, posMaxMap, {highMin});
+    // lowOk = max(min(coord + 1, 1), 0): 1 when coord >= 0, else 0.
+    OpFoldResult lowMin = affine::makeComposedFoldedAffineMin(
+        b, loc, clampLowToOneMap, {coord});
+    OpFoldResult lowOk =
+        affine::makeComposedFoldedAffineMax(b, loc, posMaxMap, {lowMin});
+    // factor = highOk * lowOk: 1 when in-bounds, 0 otherwise.
+    Value highOkVal = getValueOrCreateConstantIndexOp(b, loc, highOk);
+    Value lowOkVal = getValueOrCreateConstantIndexOp(b, loc, lowOk);
+    Value factor = arith::MulIOp::create(b, loc, highOkVal, lowOkVal);
+    // validSize *= factor; vecLowPadAmt *= factor.
+    validSize = arith::MulIOp::create(b, loc, validSize, factor);
+    vecLowPadAmt = arith::MulIOp::create(b, loc, vecLowPadAmt, factor);
+  };
+  for (int64_t bPos : im2colOp.getBatchPos())
+    checkDimBounds(bPos);
+  for (int64_t mPos : im2colOp.getMPos())
+    checkDimBounds(mPos);
+  for (int64_t kPos : im2colOp.getKPos())
+    checkDimBounds(kPos);
+
+  // Clamp read offsets to [0, inputSize-1] to keep extract_slice in-bounds.
+  // All non-vectorized dims need clamping because the adjusted offset can
+  // be negative (padLow > offset), beyond the input extent (non-wrapping
+  // delinearize OOB), or exceed the batch dim when tile > batch size.
+  // Use affine.max/affine.min for consistency and to support folding.
+  SmallVector<OpFoldResult> readOffsets(inputRank);
+  // clampLo = max(adj, 0): use posMaxMap already defined.
+  // dimMax = dimSize - 1: use (d0, d1) -> (d0 - d1) with dimSize and 1.
+  // clamped = min(clampLo, dimMax)
+  OpFoldResult oneOfr = b.getIndexAttr(1);
+  for (int64_t d = 0; d < inputRank; ++d) {
+    OpFoldResult clampLo =
+        affine::makeComposedFoldedAffineMax(b, loc, posMaxMap,
+                                            {adjustedOffsets[d]});
+    OpFoldResult dimMax = affine::makeComposedFoldedAffineApply(
+        b, loc, subMap, {inputSizes[d], oneOfr});
+    readOffsets[d] =
+        affine::makeComposedFoldedAffineMin(b, loc, minMap, {clampLo, dimMax});
+  }
+
+  // Output-side bounds checking: when the output tensor is larger than the
+  // valid region (from FoldOutputPadIntoIm2col), positions beyond the valid
+  // output size must produce pad_value. The valid size for each output dim
+  // is product(output_sizes[d]).
+  //
+  // When outputIVs is empty (no loop IVs for output dims), fill with zeros
+  // so bounds are still checked based on offsets alone.
+  int64_t outputRank = im2colOp.getOutputRank();
+  OpFoldResult zero = b.getIndexAttr(0);
+  SmallVector<Value> zeroOutputIVs;
+  SmallVector<OpFoldResult> zeroOutputOffsets;
+  if (outputIVs.empty()) {
+    zeroOutputIVs.resize(outputRank, zeroVal);
+    outputIVs = zeroOutputIVs;
+  }
+  if (outputOffsets.empty()) {
+    zeroOutputOffsets.resize(outputRank, zero);
+    outputOffsets = zeroOutputOffsets;
+  }
+  SmallVector<OpFoldResult> outputValidSizes =
+      computeOutputValidSizes(b, loc, im2colOp);
+  // output_perm[actual] = canonical: use it directly to map actual -> canonical.
+  ArrayRef<int64_t> outputPerm = im2colOp.getOutputPerm();
+
+  // Non-vectorized output dims: if globalPos >= validSize, set validSize=0.
+  // Skip dims where we can statically prove the position is in-bounds.
+  // Non-vectorized output dims: use the same 0/1 factor approach as input
+  // bounds checking. Output positions are always >= 0, so only check the
+  // high bound (pos < validSize). Use affine.min/max + arith.muli.
+  AffineMap outClampMap = AffineMap::get(
+      2, 0, {d0 - d1, getAffineConstantExpr(1, ctx)}, ctx);
+  for (int64_t d = 0; d < outputRank; ++d) {
+    if (vecOutputDim.has_value() && d == vecOutputDim.value())
+      continue;
+    int64_t canonical = outputPerm[d];
+    OpFoldResult globalPos =
+        addOfrs(b, loc, outputOffsets[canonical], outputIVs[d]);
+    // Static optimization: if both globalPos and validSize are known
+    // constants and the position is provably in-bounds, skip the check.
+    std::optional<int64_t> constPos = getConstantIntValue(globalPos);
+    std::optional<int64_t> constBound =
+        getConstantIntValue(outputValidSizes[canonical]);
+    if (constPos && constBound && *constPos < *constBound)
+      continue;
+    // highOk = max(min(bound - pos, 1), 0): 1 when pos < bound, else 0.
+    OpFoldResult highMin = affine::makeComposedFoldedAffineMin(
+        b, loc, outClampMap, {outputValidSizes[canonical], globalPos});
+    OpFoldResult highOk =
+        affine::makeComposedFoldedAffineMax(b, loc, posMaxMap, {highMin});
+    Value factor = getValueOrCreateConstantIndexOp(b, loc, highOk);
+    validSize = arith::MulIOp::create(b, loc, validSize, factor);
+    vecLowPadAmt = arith::MulIOp::create(b, loc, vecLowPadAmt, factor);
+  }
+
+  // Vectorized output dim: clamp validSize by remaining output valid count.
+  // Skip if we can statically prove the full vector is in-bounds.
+  if (vecOutputDim.has_value()) {
+    int64_t canonical = outputPerm[vecOutputDim.value()];
+    OpFoldResult globalVecStart = addOfrs(
+        b, loc, outputOffsets[canonical], outputIVs[vecOutputDim.value()]);
+    // Static optimization: if start + tileSize <= validSize, the entire
+    // vector fits and no clamping is needed.
+    std::optional<int64_t> constStart = getConstantIntValue(globalVecStart);
+    std::optional<int64_t> constTile = getConstantIntValue(innerTileSize);
+    std::optional<int64_t> constBound =
+        getConstantIntValue(outputValidSizes[canonical]);
+    if (!(constStart && constTile && constBound &&
+          *constStart + *constTile <= *constBound)) {
+      // outputClamp = max(outputBound - vecStart, 0)
+      AffineMap clampSubMap = AffineMap::get(
+          2, 0, {d0 - d1, getAffineConstantExpr(0, ctx)}, ctx);
+      OpFoldResult outputClamp = affine::makeComposedFoldedAffineMax(
+          b, loc, clampSubMap,
+          {outputValidSizes[canonical], globalVecStart});
+      // validSize = min(validSize, outputClamp)
+      OpFoldResult vsOfr = affine::makeComposedFoldedAffineMin(
+          b, loc, minMap, {validSize, outputClamp});
+      validSize = getValueOrCreateConstantIndexOp(b, loc, vsOfr);
+    }
+  }
+
+  return Im2colPaddingBounds{readOffsets, validSize, vecLowPadAmt};
+}
+
 /// Helper to check if a slice will be contiguous given the offset and
 /// slice size. Checks that `inputSize` and `offset` are both evenly
 /// divisible by `tileSize`.

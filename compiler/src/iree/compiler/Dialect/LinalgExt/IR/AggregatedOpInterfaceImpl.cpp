@@ -668,7 +668,15 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
     innerInputTileSize = b.getIndexAttr(1);
   }
 
+  // Step 2: Set up padding (only used in the padded code path below).
   int64_t inputRank = getInputRank();
+  SmallVector<OpFoldResult> padLow(inputRank, b.getIndexAttr(0));
+  if (hasPadding()) {
+    SmallVector<OpFoldResult> inputPadLow = getMixedInputPadLow();
+    if (!inputPadLow.empty()) {
+      padLow = inputPadLow;
+    }
+  }
 
   // Build loop nest over all non-vectorized dimensions.
   SmallVector<Value> lbs, ubs, steps;
@@ -724,27 +732,102 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   }
   SmallVector<OpFoldResult> outStrides(outputRank, one);
 
-  // Step 4: Extract the input slice using source indices directly.
-  // No bounds-checking IR is needed since all positions are in-bounds.
-  SmallVector<OpFoldResult> readOffsets = srcIndices.sliceOffsets;
+  // Step 4: Compute read offsets and valid tile size, then extract the input
+  // slice. Three paths based on padding status:
+  //  - No padding: skip bounds IR, use srcIndices directly (fast path).
+  //  - Output padding only: bounds IR + linalg.copy (OOB positions are no-ops
+  //    since the output is pre-filled by the caller).
+  //  - Input padding: bounds IR + tensor.pad with pad_value.
+  bool outputPadded = hasOutputPadding(*this);
+  bool needsPaddingBounds = hasPadding() || outputPadded;
+
+  SmallVector<OpFoldResult> readOffsets;
   SmallVector<OpFoldResult> extractSizes(inputRank, one);
   SmallVector<OpFoldResult> extractStrides(inputRank, one);
-  extractSizes[vecInputDim] = innerInputTileSize;
+  Value sliceToInsert;
 
-  auto sliceType = RankedTensorType::get({paddedStaticSize},
-                                         outputType.getElementType());
-  auto extract = tensor::ExtractSliceOp::create(
-      b, nestedLoc, sliceType, inputSlice, readOffsets, extractSizes,
-      extractStrides);
+  if (!needsPaddingBounds) {
+    // Non-padded fast path: use source indices directly with the static tile
+    // size. No bounds-checking IR is needed since all positions are in-bounds.
+    readOffsets = srcIndices.sliceOffsets;
+    extractSizes[vecInputDim] = innerInputTileSize;
 
-  // linalg.copy provides a concrete copy op for downstream vectorization.
-  auto destExtract = tensor::ExtractSliceOp::create(
-      b, nestedLoc, sliceType,
-      loopNest.loops.back().getRegionIterArg(0), outOffsets, outSizes,
-      outStrides);
-  auto copy = linalg::CopyOp::create(b, nestedLoc, extract.getResult(),
-                                      destExtract.getResult());
-  Value sliceToInsert = copy.getResult(0);
+    auto sliceType = RankedTensorType::get({paddedStaticSize},
+                                           outputType.getElementType());
+    auto extract = tensor::ExtractSliceOp::create(
+        b, nestedLoc, sliceType, inputSlice, readOffsets, extractSizes,
+        extractStrides);
+
+    // linalg.copy provides a concrete copy op for downstream vectorization.
+    auto destExtract = tensor::ExtractSliceOp::create(
+        b, nestedLoc, sliceType,
+        loopNest.loops.back().getRegionIterArg(0), outOffsets, outSizes,
+        outStrides);
+    auto copy = linalg::CopyOp::create(b, nestedLoc, extract.getResult(),
+                                        destExtract.getResult());
+    sliceToInsert = copy.getResult(0);
+  } else {
+    // Bounds-checking path: compute clamped offsets and dynamic valid size.
+    // Pass output IVs when output padding is possible (tensor range can exceed
+    // valid sizes).
+    ArrayRef<Value> outputIVs;
+    ArrayRef<OpFoldResult> outputOffsets;
+    std::optional<int64_t> vecOutputDim;
+    if (outputPadded) {
+      outputIVs = ivs;
+      outputOffsets = mixedOffsets;
+      if (maybeOutputDimToVectorize.has_value()) {
+        vecOutputDim = maybeOutputDimToVectorize.value();
+      }
+    }
+    Im2colPaddingBounds bounds = computeIm2colPaddingBounds(
+        b, nestedLoc, *this, srcIndices, inputSizes, padLow,
+        innerInputTileSize, outputIVs, outputOffsets, vecOutputDim);
+
+    readOffsets = bounds.readOffsets;
+    extractSizes[vecInputDim] = bounds.validSize;
+
+    auto extractType = RankedTensorType::get({ShapedType::kDynamic},
+                                             outputType.getElementType());
+    auto extract = tensor::ExtractSliceOp::create(
+        b, nestedLoc, extractType, inputSlice, readOffsets, extractSizes,
+        extractStrides);
+
+    if (hasPadding()) {
+      // tensor.pad provides a vectorizable payload for downstream passes.
+      // vecLowPadAmt handles left-side padding when the vec dim has padding.
+      Value tileSize =
+          getValueOrCreateConstantIndexOp(b, nestedLoc, innerInputTileSize);
+      SmallVector<OpFoldResult> lowPad = {bounds.vecLowPadAmt};
+      Value validPlusLow = arith::AddIOp::create(
+          b, nestedLoc, bounds.validSize, bounds.vecLowPadAmt);
+      Value highPadAmt =
+          arith::SubIOp::create(b, nestedLoc, tileSize, validPlusLow);
+      SmallVector<OpFoldResult> highPad = {highPadAmt};
+
+      auto paddedType = RankedTensorType::get({paddedStaticSize},
+                                              outputType.getElementType());
+      auto paddedSlice = tensor::PadOp::create(
+          b, nestedLoc, paddedType, extract.getResult(), lowPad, highPad,
+          getPadValue(), /*nofold=*/false);
+      sliceToInsert = paddedSlice.getResult();
+    } else {
+      // Output-only padding (no pad_value): linalg.copy handles OOB positions
+      // as no-ops (0-sized copies leave the output iter_arg unchanged).
+      // This path is reached by tiled ops where hasOutputPadding() is
+      // conservative (dynamic offsets). At runtime the tile is always
+      // in-bounds, so validSize == tileSize and shapes match.
+      auto sliceType = RankedTensorType::get({paddedStaticSize},
+                                             outputType.getElementType());
+      auto destExtract = tensor::ExtractSliceOp::create(
+          b, nestedLoc, sliceType,
+          loopNest.loops.back().getRegionIterArg(0), outOffsets, outSizes,
+          outStrides);
+      auto copy = linalg::CopyOp::create(b, nestedLoc, extract.getResult(),
+                                          destExtract.getResult());
+      sliceToInsert = copy.getResult(0);
+    }
+  }
 
   // Insert the 1D slice into the output tensor.
   auto insert = tensor::InsertSliceOp::create(

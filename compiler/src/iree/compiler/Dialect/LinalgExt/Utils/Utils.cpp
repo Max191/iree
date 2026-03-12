@@ -51,6 +51,15 @@ OpFoldResult addOfrs(OpBuilder &builder, Location loc, OpFoldResult a,
   return affine::makeComposedFoldedAffineApply(builder, loc, addMap, {a, b});
 }
 
+OpFoldResult subOfrs(OpBuilder &builder, Location loc, OpFoldResult a,
+                     OpFoldResult b) {
+  AffineExpr d0, d1;
+  bindDims(builder.getContext(), d0, d1);
+  return affine::makeComposedFoldedAffineApply(
+      builder, loc, AffineMap::get(2, 0, {d0 - d1}, builder.getContext()),
+      {a, b});
+}
+
 OpFoldResult mulOfrs(OpBuilder &builder, Location loc, OpFoldResult a,
                      OpFoldResult b) {
   AffineExpr d0, d1;
@@ -599,16 +608,7 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   // Guard: more than one spatial dim and all outputImage bounds are static.
   DenseSet<unsigned> outputImageDimSet(convDims.outputImage.begin(),
                                        convDims.outputImage.end());
-  bool canCollapseMDims = convDims.outputImage.size() > 1;
-  if (canCollapseMDims) {
-    for (unsigned oiDim : convDims.outputImage) {
-      auto pos = outputMap.getResultPosition(getAffineDimExpr(oiDim, ctx));
-      if (!pos || ShapedType::isDynamic(outputShape[pos.value()])) {
-        canCollapseMDims = false;
-        break;
-      }
-    }
-  }
+  bool canCollapseMDims = false;
 
   int64_t collapsedOutputImageCount =
       canCollapseMDims ? 1 : convDims.outputImage.size();

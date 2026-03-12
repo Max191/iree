@@ -40,6 +40,61 @@ Im2colSourceIndices computeIm2colSourceIndices(OpBuilder &b, Location loc,
                                                 ArrayRef<Value> ivs,
                                                 OpFoldResult innerTileSize);
 
+/// Holds the computed padding bounds for im2col decomposition/vectorization.
+/// For each input dimension, provides the adjusted (unpadded-space) offset and
+/// the clamped valid size within the input bounds.
+struct Im2colPaddingBounds {
+  /// Adjusted offsets: srcIndices.sliceOffsets - padLow, clamped to [0, dim-1].
+  /// Used as read offsets into the unpadded input tensor.
+  SmallVector<OpFoldResult> readOffsets;
+  /// Valid size along the vectorized dimension, accounting for all spatial
+  /// bounds. When any non-vectorized spatial dim is out-of-bounds, this is 0.
+  Value validSize;
+  /// Low-side pad amount along the vectorized dimension (max(-adjusted, 0)).
+  /// Non-zero when padding extends before the input start along the vec dim.
+  Value vecLowPadAmt;
+};
+
+/// Compute padding bounds for im2col decomposition and vectorization.
+///
+/// The padding bounds are determined by when the load/slice for a given output
+/// position falls outside of the input tensor bounds. This encompasses both
+/// input padding (explicit pad_low/pad_high on the convolution input) and
+/// output padding (when an output position maps to coordinates outside the
+/// input, e.g. due to strided convolutions or output alignment padding).
+///
+/// Given source indices in the padded coordinate space, compute:
+///   1. Adjusted read offsets in the unpadded input space (clamped to bounds)
+///   2. Valid size along the vectorized dim, incorporating out-of-bounds checks
+///      for all non-vectorized spatial dims
+///
+/// Only \p padLow is needed; high-side bounds are captured implicitly by the
+/// `inputExtent - readStart` computation in the valid size calculation.
+///
+/// Shared by both decomposition (uses validSize for extract_slice + pad) and
+/// vectorization (uses bounds to create masks).
+Im2colPaddingBounds
+computeIm2colPaddingBounds(OpBuilder &b, Location loc, Im2colOp im2colOp,
+                           const Im2colSourceIndices &srcIndices,
+                           ArrayRef<OpFoldResult> inputSizes,
+                           ArrayRef<OpFoldResult> padLow,
+                           OpFoldResult innerTileSize,
+                           ArrayRef<Value> outputIVs,
+                           ArrayRef<OpFoldResult> outputOffsets,
+                           std::optional<int64_t> vecOutputDim);
+
+/// Returns true if the im2col op has output-side padding, i.e. any output
+/// tensor dimension is larger than the product of its output_sizes. This
+/// happens after FoldOutputPadIntoIm2col enlarges the output for alignment.
+bool hasOutputPadding(Im2colOp im2colOp);
+
+/// Compute the valid (unpadded) size for each canonical output dimension.
+/// Returns the product of output_sizes inner dims for each output dim.
+/// When FoldOutputPadIntoIm2col enlarges the output tensor, output_sizes
+/// remains unchanged, so this product gives the pre-padding valid region.
+SmallVector<OpFoldResult>
+computeOutputValidSizes(OpBuilder &b, Location loc, Im2colOp im2colOp);
+
 /// Choose which output dimension to vectorize for an im2col op.
 /// Returns the output dimension index, or std::nullopt if no dimension can be
 /// vectorized (in which case scalar unrolling should be used).
