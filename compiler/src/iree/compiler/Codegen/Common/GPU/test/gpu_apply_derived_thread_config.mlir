@@ -184,7 +184,7 @@ module {
 
 // CHECK-LABEL: func.func @inferred_im2col
 //       CHECK:   scf.forall ({{.*}}) = (0, 0, 0) to (2, 128, 8) step (1, 1, 4)
-//       CHECK:     iree_linalg_ext.im2col {{.*}} ins(%{{.*}}: tensor<2x34x34x128xf16>) outs({{.*}}: tensor<1x1x4xf16>)
+//       CHECK:     iree_linalg_ext.im2col {{.*}} ins(%{{.*}}: tensor<1x34x34x128xf16>) outs({{.*}}: tensor<1x1x4xf16>)
 //       CHECK:     scf.forall.in_parallel
 //       CHECK:   mapping = [#gpu.thread<linear_dim_2>, #gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]
 
@@ -209,7 +209,7 @@ module {
 
 // CHECK-LABEL: func.func @inferred_im2col_batch_last
 //       CHECK:   scf.forall ({{.*}}) = (0, 0, 0, 0) to (32, 1, 1, 32) step (4, 1, 1, 1)
-//       CHECK:     iree_linalg_ext.im2col {{.*}} ins(%{{.*}}: tensor<16x26x18x32xbf16>) outs({{.*}}: tensor<4x1x1x1xbf16>)
+//       CHECK:     iree_linalg_ext.im2col {{.*}} ins(%{{.*}}: tensor<16x26x18x4xbf16>) outs({{.*}}: tensor<4x1x1x1xbf16>)
 //       CHECK:     scf.forall.in_parallel
 //       CHECK:   mapping = [#gpu.thread<linear_dim_3>, #gpu.thread<linear_dim_2>, #gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]
 

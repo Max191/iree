@@ -608,7 +608,16 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   // Guard: more than one spatial dim and all outputImage bounds are static.
   DenseSet<unsigned> outputImageDimSet(convDims.outputImage.begin(),
                                        convDims.outputImage.end());
-  bool canCollapseMDims = false;
+  bool canCollapseMDims = convDims.outputImage.size() > 1;
+  if (canCollapseMDims) {
+    for (unsigned oiDim : convDims.outputImage) {
+      auto pos = outputMap.getResultPosition(getAffineDimExpr(oiDim, ctx));
+      if (!pos || ShapedType::isDynamic(outputShape[pos.value()])) {
+        canCollapseMDims = false;
+        break;
+      }
+    }
+  }
 
   int64_t collapsedOutputImageCount =
       canCollapseMDims ? 1 : convDims.outputImage.size();
