@@ -1517,6 +1517,159 @@ func.func @im2col_expanded(%arg0: tensor<2x3x34x34x640xf32>) -> tensor<2x3x32x32
 
 // -----
 
+func.func @im2col_padding(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1296x5760xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x1296x5760xf32>
+  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+           offsets = [0, 0, 0] output_sizes = [[2], [36, 36], [3, 3, 640]]
+           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+           input_k_perm = [0, 1, 2]
+           output_perm = [0, 1, 2]
+           input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0] pad_value(%cst : f32)
+           ins(%arg0 : tensor<2x34x34x640xf32>)
+           outs(%0 : tensor<2x1296x5760xf32>) -> tensor<2x1296x5760xf32>
+  return %1 : tensor<2x1296x5760xf32>
+}
+// CHECK-LABEL: func.func @im2col_padding(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>
+// CHECK-DAG:     %[[CST:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:         %[[D0:.+]] = tensor.empty() : tensor<2x1296x5760xf32>
+// CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+// CHECK-SAME:      offsets = [0, 0, 0] output_sizes = {{\[}}[2], [36, 36], [3, 3, 640]]
+// CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+// CHECK-SAME:      input_k_perm = [0, 1, 2]
+// CHECK-SAME:      output_perm = [0, 1, 2]
+// CHECK-SAME:      input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0] pad_value(%[[CST]] : f32)
+// CHECK-SAME:      ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
+// CHECK-SAME:      outs(%[[D0]] : tensor<2x1296x5760xf32>) -> tensor<2x1296x5760xf32>
+// CHECK:         return %[[D1]] : tensor<2x1296x5760xf32>
+
+// -----
+
+func.func @im2col_padding_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s2: index,
+                                   %mOffset: index, %kOffset: index, %padLow: index, %oh: index, %ow: index) -> tensor<?x?x?xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty(%s0, %s1, %s2) : tensor<?x?x?xf32>
+  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+           offsets = [0, %mOffset, %kOffset] output_sizes = [[2], [%oh, %ow], [3, 3, 640]]
+           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+           input_k_perm = [0, 1, 2]
+           output_perm = [0, 1, 2]
+           input_pad_low = [0, %padLow, %padLow, 0] input_pad_high = [0, 1, 1, 0] pad_value(%cst : f32)
+           ins(%arg0 : tensor<?x?x?x?xf32>)
+           outs(%0 : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+  return %1 : tensor<?x?x?xf32>
+}
+// CHECK-LABEL: func.func @im2col_padding_dynamic(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?x?x?xf32>
+// CHECK-SAME:    %{{.+}}: index, %{{.+}}: index, %{{.+}}: index, %[[MOFFSET:.+]]: index, %[[KOFFSET:.+]]: index, %[[PADLOW:.+]]: index, %[[OH:.+]]: index, %[[OW:.+]]: index
+// CHECK-DAG:     %[[CST:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:         %[[D0:.+]] = tensor.empty({{.+}}) : tensor<?x?x?xf32>
+// CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+// CHECK-SAME:      offsets = [0, %[[MOFFSET]], %[[KOFFSET]]] output_sizes = {{\[}}[2], [%[[OH]], %[[OW]]], [3, 3, 640]]
+// CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+// CHECK-SAME:      input_k_perm = [0, 1, 2]
+// CHECK-SAME:      output_perm = [0, 1, 2]
+// CHECK-SAME:      input_pad_low = [0, %[[PADLOW]], %[[PADLOW]], 0] input_pad_high = [0, 1, 1, 0] pad_value(%[[CST]] : f32)
+// CHECK-SAME:      ins(%[[ARG0]] : tensor<?x?x?x?xf32>)
+// CHECK-SAME:      outs(%[[D0]] : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+// CHECK:         return %[[D1]] : tensor<?x?x?xf32>
+
+// -----
+
+func.func @im2col_padding_expanded(%arg0: tensor<2x3x34x34x640xf32>) -> tensor<2x3x36x36x9x640xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x3x36x36x9x640xf32>
+  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+           offsets = [0, 0, 0, 0, 0, 0] output_sizes = [[2], [3], [36], [36], [3, 3], [640]]
+           batch_pos = [0, 1] m_pos = [2, 3] k_pos = [4]
+           input_k_perm = [0, 1, 2]
+           output_perm = [0, 1, 2, 3, 4, 5]
+           input_pad_low = [0, 0, 1, 1, 0] input_pad_high = [0, 0, 1, 1, 0] pad_value(%cst : f32)
+           ins(%arg0 : tensor<2x3x34x34x640xf32>)
+           outs(%0 : tensor<2x3x36x36x9x640xf32>) -> tensor<2x3x36x36x9x640xf32>
+  return %1 : tensor<2x3x36x36x9x640xf32>
+}
+// CHECK-LABEL: func.func @im2col_padding_expanded(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: tensor<2x3x34x34x640xf32>
+// CHECK-DAG:     %[[CST:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:         %[[D0:.+]] = tensor.empty() : tensor<2x3x36x36x9x640xf32>
+// CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+// CHECK-SAME:      offsets = [0, 0, 0, 0, 0, 0] output_sizes = {{\[}}[2], [3], [36], [36], [3, 3], [640]]
+// CHECK-SAME:      batch_pos = [0, 1] m_pos = [2, 3] k_pos = [4]
+// CHECK-SAME:      input_k_perm = [0, 1, 2]
+// CHECK-SAME:      output_perm = [0, 1, 2, 3, 4, 5]
+// CHECK-SAME:      input_pad_low = [0, 0, 1, 1, 0] input_pad_high = [0, 0, 1, 1, 0] pad_value(%[[CST]] : f32)
+// CHECK-SAME:      ins(%[[ARG0]] : tensor<2x3x34x34x640xf32>)
+// CHECK-SAME:      outs(%[[D0]] : tensor<2x3x36x36x9x640xf32>) -> tensor<2x3x36x36x9x640xf32>
+// CHECK:         return %[[D1]] : tensor<2x3x36x36x9x640xf32>
+
+// -----
+
+// Verify that im2col with padding on a batch dimension is valid. This tests
+// the case where a preceding tensor.pad is absorbed into the im2col op,
+// replacing a padded input (e.g., tensor<16x9x9x4xf32>) with the unpadded
+// input (tensor<3x9x9x4xf32>) plus padding attributes on the batch dim.
+func.func @im2col_padding_on_batch_dim(%arg0: tensor<3x9x9x4xf32>) -> tensor<16x81x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<16x81x4xf32>
+  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [1, 1]
+           offsets = [0, 0, 0] output_sizes = [[16], [9, 9], [1, 1, 4]]
+           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+           input_k_perm = [0, 1, 2]
+           output_perm = [0, 1, 2]
+           input_pad_low = [0, 0, 0, 0] input_pad_high = [13, 0, 0, 0] pad_value(%cst : f32)
+           ins(%arg0 : tensor<3x9x9x4xf32>)
+           outs(%0 : tensor<16x81x4xf32>) -> tensor<16x81x4xf32>
+  return %1 : tensor<16x81x4xf32>
+}
+// CHECK-LABEL: func.func @im2col_padding_on_batch_dim(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: tensor<3x9x9x4xf32>
+// CHECK-DAG:     %[[CST:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:         %[[D0:.+]] = tensor.empty() : tensor<16x81x4xf32>
+// CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [1, 1]
+// CHECK-SAME:      offsets = [0, 0, 0] output_sizes = {{\[}}[16], [9, 9], [1, 1, 4]]
+// CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+// CHECK-SAME:      input_k_perm = [0, 1, 2]
+// CHECK-SAME:      output_perm = [0, 1, 2]
+// CHECK-SAME:      input_pad_low = [0, 0, 0, 0] input_pad_high = [13, 0, 0, 0] pad_value(%[[CST]] : f32)
+// CHECK-SAME:      ins(%[[ARG0]] : tensor<3x9x9x4xf32>)
+// CHECK-SAME:      outs(%[[D0]] : tensor<16x81x4xf32>) -> tensor<16x81x4xf32>
+// CHECK:         return %[[D1]] : tensor<16x81x4xf32>
+
+// -----
+
+// Verify that im2col with pad_value but no input_pad_low/input_pad_high is valid.
+// This is the case when only output padding is present (e.g. from GEMM alignment).
+func.func @im2col_pad_value_without_input_padding(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1040x5760xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x1040x5760xf32>
+  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+           offsets = [0, 0, 0] output_sizes = [[2], [32, 32], [3, 3, 640]]
+           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+           input_k_perm = [0, 1, 2]
+           output_perm = [0, 1, 2]
+           pad_value(%cst : f32)
+           ins(%arg0 : tensor<2x34x34x640xf32>)
+           outs(%0 : tensor<2x1040x5760xf32>) -> tensor<2x1040x5760xf32>
+  return %1 : tensor<2x1040x5760xf32>
+}
+// CHECK-LABEL: func.func @im2col_pad_value_without_input_padding(
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>
+// CHECK-DAG:     %[[CST:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:         %[[D0:.+]] = tensor.empty() : tensor<2x1040x5760xf32>
+// CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+// CHECK-SAME:      offsets = [0, 0, 0] output_sizes = {{\[}}[2], [32, 32], [3, 3, 640]]
+// CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+// CHECK-SAME:      input_k_perm = [0, 1, 2]
+// CHECK-SAME:      output_perm = [0, 1, 2]
+// CHECK-SAME:      pad_value(%[[CST]] : f32)
+// CHECK-SAME:      ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
+// CHECK-SAME:      outs(%[[D0]] : tensor<2x1040x5760xf32>) -> tensor<2x1040x5760xf32>
+// CHECK:         return %[[D1]] : tensor<2x1040x5760xf32>
+
+// -----
+
 func.func @winograd_filter_transform(%arg0: tensor<3x3x64x128xf32>) -> tensor<8x8x64x128xf32> {
   %0 = tensor.empty() : tensor<8x8x64x128xf32>
   %1 = iree_linalg_ext.winograd.filter_transform

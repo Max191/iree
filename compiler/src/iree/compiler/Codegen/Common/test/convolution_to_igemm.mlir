@@ -176,8 +176,7 @@ func.func public @conv_with_per_row_bias(
   } -> tensor<1x14x14x16xf32>
   return %result : tensor<1x14x14x16xf32>
 }
-// The broadcast is materialized before the consumer, enabling collapse
-// propagation. The consumer ends up with identity maps on collapsed shapes.
+// The broadcast is materialized before the consumer.
 // CHECK-LABEL: func.func public @conv_with_per_row_bias
 // CHECK-SAME:    %{{.*}}: tensor<1x16x16x4xf32>, %{{.*}}: tensor<3x3x4x16xf32>, %[[BIAS:.+]]: tensor<14xf32>
 // CHECK:         %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}} -> tensor<1x14x14x36xf32>
@@ -269,4 +268,4 @@ func.func public @conv_with_transposed_broadcast(
 // CHECK-SAME:      dimensions = [1, 3]
 // CHECK:         %[[ADD:.+]] = linalg.generic
 // CHECK-SAME:      iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-// CHECK-SAME:      ins(%[[GEMM]], %[[BCAST]] : tensor<1x14x14x16xf32>, tensor<1x14x14x16xf32>)
+// CHECK-SAME:      ins(%{{.*}}, %[[BCAST]] : tensor<1x14x14x16xf32>, tensor<1x14x14x16xf32>)

@@ -229,73 +229,93 @@ public:
         }
       }
     }
+    // Get collapsed K shape from igemmLoopBounds (for the output tensor shape).
+    int64_t reductionBoundIndex =
+        llvm::count(igemmLoopIterators, utils::IteratorType::parallel);
+    SmallVector<int64_t> kShape(igemmLoopBounds.begin() + reductionBoundIndex,
+                                igemmLoopBounds.end());
+
+    // Build per-K-output-dim decomposed sizes from original filter shape.
+    // Each IGEMM reduction group becomes one K output dim, and the output_sizes
+    // inner list for that dim contains the original (pre-collapse) filter sizes.
+    // This is needed for correct delinearization in decomposition/vectorization.
+    DenseSet<unsigned> convReductionDims;
+    for (unsigned d : convDims.filterLoop) {
+      convReductionDims.insert(d);
+    }
+    for (unsigned d : convDims.inputChannel) {
+      convReductionDims.insert(d);
+    }
+
+    SmallVector<SmallVector<int64_t>> kPerDimDecomposedSizes;
+    for (const auto &indices : filterReassocIndices) {
+      // Check if this filter reassociation group is a reduction group.
+      bool isReduction = false;
+      for (int64_t idx : indices) {
+        // Map filter dim position to conv dim via filter map.
+        AffineExpr expr = filterMap.getResult(idx);
+        if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+          if (convReductionDims.contains(dimExpr.getPosition())) {
+            isReduction = true;
+            break;
+          }
+        }
+      }
+      // Assert that all dims in this group are either entirely reduction or
+      // entirely parallel. Mixed groups would produce incorrect im2col layout.
+      assert(llvm::all_of(indices,
+                          [&](int64_t idx) {
+                            AffineExpr expr = filterMap.getResult(idx);
+                            auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+                            if (!dimExpr) {
+                              return true;
+                            }
+                            return convReductionDims.contains(
+                                       dimExpr.getPosition()) == isReduction;
+                          }) &&
+             "filter reassociation group mixes reduction and parallel dims");
+      if (isReduction) {
+        SmallVector<int64_t> groupSizes;
+        for (int64_t idx : indices) {
+          groupSizes.push_back(filterShape[idx]);
+        }
+        kPerDimDecomposedSizes.push_back(std::move(groupSizes));
+      }
+    }
+
     SmallVector<int64_t> inputKPerm =
         computeInputKPerm(inputMap, filterMap, convDims);
 
-    // Build unified offsets and output_sizes for the im2col op.
-    // Canonical output dim order: [batch dims, M (1 dim), K dims].
-    // At conv-to-im2col time all offsets are zero.
-
-    // Identify which original filter dims are parallel (depth + outputChannel).
-    llvm::SmallDenseSet<int64_t, 4> parallelFilterDims;
-    for (auto iterDim : llvm::concat<const unsigned>(convDims.depth,
-                                                      convDims.outputChannel)) {
-      std::optional<int64_t> maybeDim = filterMap.getResultPosition(
-          getAffineDimExpr(iterDim, filterMap.getContext()));
-      if (maybeDim)
-        parallelFilterDims.insert(maybeDim.value());
+    auto loc = linalgOp.getLoc();
+    // Shape of the resulting tensor from im2col.
+    SmallVector<int64_t> colTensorShape;
+    for (int64_t dim : batchPos) {
+      colTensorShape.push_back(inputShape[dim]);
     }
+    colTensorShape.append(mShape);
+    colTensorShape.append(kShape);
 
-    // Collect K output dim inner sizes from filter reassociation indices.
-    // Each reduction group (group not entirely composed of parallel dims)
-    // becomes one K output dim whose inner sizes are the original filter
-    // dim sizes in that group.
-    SmallVector<SmallVector<int64_t>> kInnerSizes;
-    for (const auto &indices : filterReassocIndices) {
-      bool isParallel =
-          indices.size() == 1 && parallelFilterDims.contains(indices[0]);
-      if (!isParallel) {
-        SmallVector<int64_t> innerSizes;
-        for (int64_t idx : indices) {
-          innerSizes.push_back(filterShape[idx]);
-        }
-        kInnerSizes.push_back(innerSizes);
-      }
-    }
-
-    int64_t numOutputDims = batchPos.size() + mShape.size() + kInnerSizes.size();
-    SmallVector<OpFoldResult> offsets(numOutputDims,
-                                      rewriter.getIndexAttr(0));
+    // Build offsets (all zeros) and output_sizes (nested sizes per output dim).
+    int64_t outputRank =
+        static_cast<int64_t>(batchPos.size() + mShape.size() + kShape.size());
+    SmallVector<OpFoldResult> offsets(outputRank, rewriter.getIndexAttr(0));
     SmallVector<SmallVector<OpFoldResult>> outputSizes;
-    // Batch dims: each has a single inner size.
+    // Batch dims: each has a single size equal to the input batch dim size.
     for (int64_t dim : batchPos) {
       outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
     }
-    // M dims: each spatial output dim is a separate output dimension.
-    for (int64_t m : mShape) {
-      outputSizes.push_back({rewriter.getIndexAttr(m)});
+    // M dims: one output dim per spatial dim.
+    for (int64_t s : mShape) {
+      outputSizes.push_back({rewriter.getIndexAttr(s)});
     }
-    // K dims: inner sizes from filter reassociation.
-    for (const auto &innerSizes : kInnerSizes) {
-      outputSizes.push_back(
-          getAsIndexOpFoldResult(getContext(), innerSizes));
-    }
-
-    auto loc = linalgOp.getLoc();
-    // Shape of the resulting tensor from im2col. Each output dim is the
-    // product of its inner sizes.
-    SmallVector<int64_t> colTensorShape;
-    for (const auto &innerSizes : outputSizes) {
-      int64_t dimSize = 1;
-      for (OpFoldResult s : innerSizes) {
-        std::optional<int64_t> constVal = getConstantIntValue(s);
-        if (!constVal) {
-          return rewriter.notifyMatchFailure(
-              linalgOp, "dynamic inner sizes not supported");
-        }
-        dimSize *= *constVal;
+    // K dims: one output_sizes entry per K output dim (IGEMM reduction group).
+    // Each entry contains the decomposed filter dim sizes for that group.
+    for (const auto &groupSizes : kPerDimDecomposedSizes) {
+      SmallVector<OpFoldResult> kSizes;
+      for (int64_t s : groupSizes) {
+        kSizes.push_back(rewriter.getIndexAttr(s));
       }
-      colTensorShape.push_back(dimSize);
+      outputSizes.push_back(std::move(kSizes));
     }
 
     applyPermutationToVector(colTensorShape, outputPerm);
@@ -330,8 +350,8 @@ public:
           linalg::YieldOp::create(nestedBuilder, nestedLoc, add);
         });
     genericGEMMOp->setDiscardableAttrs(getPrunedAttributeList(linalgOp));
-
-    rewriter.replaceOp(linalgOp, genericGEMMOp.getResults().front());
+    Value result = genericGEMMOp.getResults().front();
+    rewriter.replaceOp(linalgOp, result);
     return success();
   }
 
