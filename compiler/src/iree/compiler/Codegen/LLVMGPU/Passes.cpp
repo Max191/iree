@@ -273,7 +273,6 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
                                       bool foldIdentitySlices,
                                       bool decomposeMasks) {
   funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
-  funcPassManager.addPass(IREE::LinalgExt::createDecomposeIm2colPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
   if (enableMasking) {
@@ -287,6 +286,7 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
   options.enableVectorMasking = enableMasking;
   options.vectorizeMapStore = true;
   funcPassManager.addPass(createGenericVectorizationPass(options));
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeIm2colPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
   // Run subset hoisting to convert iter_args to vectors.
