@@ -2230,23 +2230,35 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
       }
 
       // new_pad_low = max(pad_low - tileOff, 0)
-      OpFoldResult lowDiff = affine::makeComposedFoldedAffineApply(
-          builder, loc, subMap,
-          {existingOutPadLow[d], offsets[d]});
-      OpFoldResult tilePadLow = affine::makeComposedFoldedAffineMax(
-          builder, loc, posMaxMap, {lowDiff});
+      // When pad_low is statically zero, skip the computation and keep zero.
+      OpFoldResult tilePadLow;
+      if (isZeroInteger(existingOutPadLow[d])) {
+        tilePadLow = zero;
+      } else {
+        OpFoldResult lowDiff = affine::makeComposedFoldedAffineApply(
+            builder, loc, subMap,
+            {existingOutPadLow[d], offsets[d]});
+        tilePadLow = affine::makeComposedFoldedAffineMax(
+            builder, loc, posMaxMap, {lowDiff});
+      }
 
       // validEnd = origDim - pad_high; overrun = tileOff + tileSize - validEnd
-      OpFoldResult validEnd = affine::makeComposedFoldedAffineApply(
-          builder, loc, subMap,
-          {origDims[d], existingOutPadHigh[d]});
-      OpFoldResult tileEnd = affine::makeComposedFoldedAffineApply(
-          builder, loc, AffineMap::get(2, 0, d0 + d1, ctx),
-          {offsets[d], sizes[d]});
-      OpFoldResult highDiff = affine::makeComposedFoldedAffineApply(
-          builder, loc, subMap, {tileEnd, validEnd});
-      OpFoldResult tilePadHigh = affine::makeComposedFoldedAffineMax(
-          builder, loc, posMaxMap, {highDiff});
+      // When pad_high is statically zero, skip the computation and keep zero.
+      OpFoldResult tilePadHigh;
+      if (isZeroInteger(existingOutPadHigh[d])) {
+        tilePadHigh = zero;
+      } else {
+        OpFoldResult validEnd = affine::makeComposedFoldedAffineApply(
+            builder, loc, subMap,
+            {origDims[d], existingOutPadHigh[d]});
+        OpFoldResult tileEnd = affine::makeComposedFoldedAffineApply(
+            builder, loc, AffineMap::get(2, 0, d0 + d1, ctx),
+            {offsets[d], sizes[d]});
+        OpFoldResult highDiff = affine::makeComposedFoldedAffineApply(
+            builder, loc, subMap, {tileEnd, validEnd});
+        tilePadHigh = affine::makeComposedFoldedAffineMax(
+            builder, loc, posMaxMap, {highDiff});
+      }
 
       newOutPadLow.push_back(tilePadLow);
       newOutPadHigh.push_back(tilePadHigh);
