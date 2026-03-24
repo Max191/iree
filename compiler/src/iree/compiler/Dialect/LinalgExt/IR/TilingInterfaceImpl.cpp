@@ -2217,8 +2217,18 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
 
     SmallVector<OpFoldResult> origDims =
         tensor::getMixedSizes(builder, loc, getOutput());
+    OpFoldResult zero = builder.getIndexAttr(0);
 
     for (int64_t d = 0; d < getOutputRank(); ++d) {
+      // If both low and high padding are statically zero for this dimension,
+      // keep them zero — no need to introduce dynamic padding expressions.
+      if (isZeroInteger(existingOutPadLow[d]) &&
+          isZeroInteger(existingOutPadHigh[d])) {
+        newOutPadLow.push_back(zero);
+        newOutPadHigh.push_back(zero);
+        continue;
+      }
+
       // new_pad_low = max(pad_low - tileOff, 0)
       OpFoldResult lowDiff = affine::makeComposedFoldedAffineApply(
           builder, loc, subMap,
