@@ -319,6 +319,139 @@ struct NarrowVectorBroadcast : OpRewritePattern<vector::BroadcastOp> {
   }
 };
 
+/// Narrow an arith.select through index_cast ops. Each operand may be either
+/// an index_cast from a narrower type or an arith.constant (which can be
+/// rematerialized in the narrow type). At least one operand must be an
+/// index_cast to determine the target narrow type.
+///
+/// Rewrites e.g.:
+///   %t = arith.index_cast %a : i32 to index
+///   %f = arith.constant 0 : index
+///   %s = arith.select %cond, %t, %f : index
+/// to:
+///   %f_narrow = arith.constant 0 : i32
+///   %s_narrow = arith.select %cond, %a, %f_narrow : i32
+///   %s = arith.index_cast %s_narrow : i32 to index
+struct NarrowArithSelect : OpRewritePattern<arith::SelectOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::SelectOp op,
+                                PatternRewriter &rewriter) const override {
+    // The select must operate on index type.
+    Type resultElemTy = getElementTypeOrSelf(op.getResult().getType());
+    if (!isa<IndexType>(resultElemTy)) {
+      return failure();
+    }
+
+    Value trueVal = op.getTrueValue();
+    Value falseVal = op.getFalseValue();
+    Operation *trueDef = trueVal.getDefiningOp();
+    Operation *falseDef = falseVal.getDefiningOp();
+    if (!trueDef || !falseDef) {
+      return failure();
+    }
+
+    // Classify each operand as index_cast or constant.
+    auto isIndexCast = [](Operation *defOp) {
+      return isa<arith::IndexCastOp, arith::IndexCastUIOp>(defOp);
+    };
+    auto isConstant = [](Operation *defOp) {
+      return isa<arith::ConstantOp>(defOp);
+    };
+
+    // At least one must be an index_cast to determine the narrow type.
+    // The other can be an index_cast (same kind) or a constant.
+    Operation *castOp = nullptr;
+    if (isIndexCast(trueDef)) {
+      castOp = trueDef;
+      if (!isIndexCast(falseDef) && !isConstant(falseDef)) {
+        return failure();
+      }
+      // If both are index_cast, they must be the same kind.
+      if (isIndexCast(falseDef) && trueDef->getName() != falseDef->getName()) {
+        return failure();
+      }
+    } else if (isIndexCast(falseDef)) {
+      castOp = falseDef;
+      if (!isConstant(trueDef)) {
+        return failure();
+      }
+    } else {
+      return failure();
+    }
+
+    // Get the narrow type from the cast operand.
+    Value castInput = castOp->getOperand(0);
+    Type narrowElemTy = getElementTypeOrSelf(castInput.getType());
+    if (isa<IndexType>(narrowElemTy)) {
+      return failure();
+    }
+
+    // If both are casts, verify they narrow to the same type.
+    if (isIndexCast(trueDef) && isIndexCast(falseDef)) {
+      Type otherNarrowTy =
+          getElementTypeOrSelf(falseDef->getOperand(0).getType());
+      if (narrowElemTy != otherNarrowTy) {
+        return failure();
+      }
+    }
+
+    Location loc = op.getLoc();
+    Type resultType = op.getResult().getType();
+
+    // Determine the narrow select result type.
+    Type narrowResultType;
+    if (auto vecType = dyn_cast<VectorType>(resultType)) {
+      narrowResultType = VectorType::get(vecType.getShape(), narrowElemTy);
+    } else {
+      narrowResultType = narrowElemTy;
+    }
+
+    // Get or create narrow operands.
+    auto getNarrowOperand = [&](Value val, Operation *defOp) -> Value {
+      if (isIndexCast(defOp)) {
+        return defOp->getOperand(0);
+      }
+      // Must be a constant — rematerialize in the narrow type.
+      auto constOp = cast<arith::ConstantOp>(defOp);
+      if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+        int64_t constVal = intAttr.getInt();
+        return arith::ConstantOp::create(
+            rewriter, loc,
+            IntegerAttr::get(narrowElemTy, constVal));
+      }
+      // Shouldn't reach here for index constants, but handle gracefully.
+      return Value();
+    };
+
+    Value narrowTrue = getNarrowOperand(trueVal, trueDef);
+    Value narrowFalse = getNarrowOperand(falseVal, falseDef);
+    if (!narrowTrue || !narrowFalse) {
+      return failure();
+    }
+
+    // Select in the narrower type.
+    Value narrowSelect = arith::SelectOp::create(
+        rewriter, loc, narrowResultType, op.getCondition(), narrowTrue,
+        narrowFalse);
+
+    // Re-apply the same cast on the select result.
+    Value result =
+        TypeSwitch<Operation *, Value>(castOp)
+            .Case([&](arith::IndexCastOp) {
+              return arith::IndexCastOp::create(rewriter, loc, resultType,
+                                                narrowSelect);
+            })
+            .Case([&](arith::IndexCastUIOp) {
+              return arith::IndexCastUIOp::create(rewriter, loc, resultType,
+                                                  narrowSelect);
+            });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // scf.for induction variable range narrowing
 // If the induction variable of an scf.for can be represented as an I32,
@@ -536,7 +669,7 @@ class OptimizeIntArithmeticPass
       arith::populateIntRangeNarrowingPatterns(patterns, solver, {32});
       patterns.add<NarrowSCFForIvToI32, RemoveIndexCastForAssumeOfI32>(ctx,
                                                                        solver);
-      patterns.add<NarrowVectorBroadcast>(ctx);
+      patterns.add<NarrowVectorBroadcast, NarrowArithSelect>(ctx);
     }
 
     // Populate canonicalization patterns.
