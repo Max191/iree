@@ -164,10 +164,7 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
           isConstantIntValue(padLow[vecInputDim], 0)) &&
          "vectorized input dim must have zero low padding");
 
-  // --- Helper lambdas for affine clamping patterns ---
-  // All use affine ops so that IREE's IntegerDivisibilityAnalysis can track
-  // divisibility through the chain (it tracks affine.apply/min/max and
-  // arith.muli, but NOT arith.subi/maxsi/minsi).
+  // --- Helper lambdas ---
   MLIRContext *ctx = b.getContext();
   AffineExpr d0 = getAffineDimExpr(0, ctx);
   AffineExpr d1 = getAffineDimExpr(1, ctx);
@@ -175,29 +172,10 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
   AffineMap minMap = AffineMap::get(2, 0, {d0, d1}, ctx);
   AffineMap maxZeroMap =
       AffineMap::get(1, 0, {d0, getAffineConstantExpr(0, ctx)}, ctx);
-  AffineMap clampHighToOneMap =
-      AffineMap::get(2, 0, {d0 - d1, getAffineConstantExpr(1, ctx)}, ctx);
-  AffineMap clampLowToOneMap =
-      AffineMap::get(1, 0, {d0 + 1, getAffineConstantExpr(1, ctx)}, ctx);
 
   // max(val, 0).
   auto clampAboveZero = [&](OpFoldResult val) -> OpFoldResult {
     return affine::makeComposedFoldedAffineMax(b, loc, maxZeroMap, {val});
-  };
-
-  // 0/1 factor: 1 when coord ∈ [0, dimSize), 0 otherwise.
-  auto clampToRange = [&](OpFoldResult coord, OpFoldResult dimSize) -> Value {
-    // highOk = max(min(dimSize - coord, 1), 0): 1 when coord < dimSize.
-    OpFoldResult highOk = clampAboveZero(
-        affine::makeComposedFoldedAffineMin(
-            b, loc, clampHighToOneMap, {dimSize, coord}));
-    // lowOk = max(min(coord + 1, 1), 0): 1 when coord >= 0.
-    OpFoldResult lowOk = clampAboveZero(
-        affine::makeComposedFoldedAffineMin(
-            b, loc, clampLowToOneMap, {coord}));
-    Value highOkVal = getValueOrCreateConstantIndexOp(b, loc, highOk);
-    Value lowOkVal = getValueOrCreateConstantIndexOp(b, loc, lowOk);
-    return arith::MulIOp::create(b, loc, highOkVal, lowOkVal);
   };
 
   // min(max(extent - coord, 0), tileSize): how much of tileSize fits within
@@ -211,21 +189,32 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
         b, loc, minMap, {clamped, tileSize});
   };
 
-  // 0/1 factor: 1 when pos >= low, 0 otherwise.
-  auto isAboveLow = [&](OpFoldResult pos, OpFoldResult low) -> Value {
-    OpFoldResult adjusted = subOfrs(b, loc, pos, low);
-    OpFoldResult lowOk = clampAboveZero(
-        affine::makeComposedFoldedAffineMin(b, loc, clampLowToOneMap,
-                                            {adjusted}));
-    return getValueOrCreateConstantIndexOp(b, loc, lowOk);
+  // Boolean: true when coord ∈ [0, dimSize).
+  auto isInRange = [&](OpFoldResult coord, OpFoldResult dimSize) -> Value {
+    Value coordVal = getValueOrCreateConstantIndexOp(b, loc, coord);
+    Value dimSizeVal = getValueOrCreateConstantIndexOp(b, loc, dimSize);
+    Value lowOk = arith::CmpIOp::create(
+        b, loc, arith::CmpIPredicate::sge, coordVal,
+        arith::ConstantIndexOp::create(b, loc, 0));
+    Value highOk = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt,
+                                         coordVal, dimSizeVal);
+    return arith::AndIOp::create(b, loc, lowOk, highOk).getResult();
   };
 
-  // 0/1 factor: 1 when pos < high, 0 otherwise.
-  auto isBelowHigh = [&](OpFoldResult pos, OpFoldResult high) -> Value {
-    OpFoldResult highOk = clampAboveZero(
-        affine::makeComposedFoldedAffineMin(b, loc, clampHighToOneMap,
-                                            {high, pos}));
-    return getValueOrCreateConstantIndexOp(b, loc, highOk);
+  // Boolean: true when pos >= low.
+  auto isGE = [&](OpFoldResult pos, OpFoldResult low) -> Value {
+    Value posVal = getValueOrCreateConstantIndexOp(b, loc, pos);
+    Value lowVal = getValueOrCreateConstantIndexOp(b, loc, low);
+    return arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, posVal,
+                                 lowVal);
+  };
+
+  // Boolean: true when pos < high.
+  auto isLT = [&](OpFoldResult pos, OpFoldResult high) -> Value {
+    Value posVal = getValueOrCreateConstantIndexOp(b, loc, pos);
+    Value highVal = getValueOrCreateConstantIndexOp(b, loc, high);
+    return arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, posVal,
+                                 highVal);
   };
 
   // --- Compute valid_size along the innermost input dimension ---
@@ -235,18 +224,23 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
   Value validSize = getValueOrCreateConstantIndexOp(b, loc, validSizeOfr);
 
   // --- Input-side bounds checking for non-vectorized dims ---
-  // If an adjusted coord is outside [0, dimSize), the valid region is empty,
-  // so multiply validSize by 0. This handles input padding, output-alignment
-  // OOB from non-wrapping delinearization, and batch OOB.
+  // Accumulate a boolean that is true when all non-vectorized coordinates
+  // are in bounds. If any is out of bounds, validSize will be zeroed at the
+  // end via arith.select.
+  Value allInBounds;
+  auto addBoundsCheck = [&](Value check) {
+    if (!allInBounds) {
+      allInBounds = check;
+    } else {
+      allInBounds = arith::AndIOp::create(b, loc, allInBounds, check);
+    }
+  };
+
   auto checkDimBounds = [&](int64_t dim) {
-    // The vectorized input dim's range is already handled above. Skip it
-    // to avoid redundant IR. In scalar mode (no vecOutputDim), all dims
-    // need full bounds checking.
     if (vecOutputDim.has_value() && dim == vecInputDim) {
       return;
     }
-    Value factor = clampToRange(adjustedOffsets[dim], inputSizes[dim]);
-    validSize = arith::MulIOp::create(b, loc, validSize, factor);
+    addBoundsCheck(isInRange(adjustedOffsets[dim], inputSizes[dim]));
   };
   for (int64_t bPos : im2colOp.getBatchPos()) {
     checkDimBounds(bPos);
@@ -273,25 +267,25 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
         tensor::getMixedSizes(b, loc, im2colOp.getOutput());
 
     // Non-vectorized output dims: if pos is outside [padLow, dim - padHigh),
-    // set validSize = 0.
+    // add to the boolean bounds check.
     for (int64_t d = 0; d < outputRank; ++d) {
-      if (vecOutputDim.has_value() && d == vecOutputDim.value())
+      if (vecOutputDim.has_value() && d == vecOutputDim.value()) {
         continue;
+      }
       if (isConstantIntValue(outPadLow[d], 0) &&
-          isConstantIntValue(outPadHigh[d], 0))
+          isConstantIntValue(outPadHigh[d], 0)) {
         continue;
+      }
 
       OpFoldResult localPos = outputIVs[d];
 
       if (!isConstantIntValue(outPadLow[d], 0)) {
-        Value factor = isAboveLow(localPos, outPadLow[d]);
-        validSize = arith::MulIOp::create(b, loc, validSize, factor);
+        addBoundsCheck(isGE(localPos, outPadLow[d]));
       }
       if (!isConstantIntValue(outPadHigh[d], 0)) {
         OpFoldResult validEnd =
             subOfrs(b, loc, outputTensorSizes[d], outPadHigh[d]);
-        Value factor = isBelowHigh(localPos, validEnd);
-        validSize = arith::MulIOp::create(b, loc, validSize, factor);
+        addBoundsCheck(isLT(localPos, validEnd));
       }
     }
 
@@ -308,6 +302,12 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
         validSize = getValueOrCreateConstantIndexOp(b, loc, vsOfr);
       }
     }
+  }
+
+  // Apply the accumulated bounds check: zero validSize if any dim is OOB.
+  if (allInBounds) {
+    Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+    validSize = arith::SelectOp::create(b, loc, allInBounds, validSize, zero);
   }
 
   return validSize;
