@@ -145,9 +145,12 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
 
   // Get padding from the op.
   SmallVector<OpFoldResult> padLow(inputRank, b.getIndexAttr(0));
+  SmallVector<OpFoldResult> padHigh(inputRank, b.getIndexAttr(0));
   SmallVector<OpFoldResult> inputPadLow = im2colOp.getMixedInputPadLow();
+  SmallVector<OpFoldResult> inputPadHigh = im2colOp.getMixedInputPadHigh();
   if (!inputPadLow.empty()) {
     padLow = inputPadLow;
+    padHigh = inputPadHigh;
   }
 
   // Compute adjusted offsets: subtract padLow to get unpadded-space coords.
@@ -236,6 +239,11 @@ Value computeIm2colValidSize(OpBuilder &b, Location loc, Im2colOp im2colOp,
 
   auto checkDimBounds = [&](int64_t dim) {
     if (vecOutputDim.has_value() && dim == vecInputDim) {
+      return;
+    }
+    // Skip bounds check when this dim has no input padding — the offset
+    // is guaranteed to be in [0, dimSize) by construction.
+    if (isZeroInteger(padLow[dim]) && isZeroInteger(padHigh[dim])) {
       return;
     }
     addBoundsCheck(isInRange(adjustedOffsets[dim], inputSizes[dim]));
