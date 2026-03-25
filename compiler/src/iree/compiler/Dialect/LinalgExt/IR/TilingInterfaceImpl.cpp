@@ -2192,12 +2192,41 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
   // Adjust offsets by adding the tiling offsets. The offsets are in canonical
   // [Batch, M, K] order, and output_perm[actual] = canonical, so we use
   // output_perm directly to map actual tensor dims to canonical positions.
+  // Clamp the tile offsets to the unpadded output shape before adding them
+  // to the existing offsets. For dims with output high padding, the valid
+  // range of the tile offset is [0, tileSize - padHigh). Clamping here
+  // ensures that the delinearized coordinates stay within bounds, avoiding
+  // expensive OOB boundary checking downstream.
+  SmallVector<OpFoldResult> clampedOffsets(offsets.begin(), offsets.end());
+  SmallVector<OpFoldResult> preClampOutPadHigh = getMixedOutputPadHigh();
+  if (!preClampOutPadHigh.empty()) {
+    SmallVector<OpFoldResult> outputDims =
+        tensor::getMixedSizes(builder, loc, getOutput());
+    MLIRContext *clampCtx = builder.getContext();
+    AffineExpr cd0 = getAffineDimExpr(0, clampCtx);
+    AffineExpr cd1 = getAffineDimExpr(1, clampCtx);
+    AffineMap clampSubMap = AffineMap::get(2, 0, cd0 - cd1, clampCtx);
+    AffineMap clampMinMap = AffineMap::get(2, 0, {cd0, cd1}, clampCtx);
+    for (int64_t actual = 0; actual < getOutputRank(); ++actual) {
+      if (isConstantIntValue(preClampOutPadHigh[actual], 0)) {
+        continue;
+      }
+      // validEnd = outputDim[actual] - padHigh[actual]
+      OpFoldResult validEnd = affine::makeComposedFoldedAffineApply(
+          builder, loc, clampSubMap,
+          {outputDims[actual], preClampOutPadHigh[actual]});
+      // clampedOffsets[actual] = min(offsets[actual], validEnd)
+      clampedOffsets[actual] = affine::makeComposedFoldedAffineMin(
+          builder, loc, clampMinMap, {offsets[actual], validEnd});
+    }
+  }
+
   SmallVector<OpFoldResult> newOffsets(getMixedOffsets());
   ArrayRef<int64_t> outPerm = getOutputPerm();
   for (int64_t actual = 0; actual < getOutputRank(); ++actual) {
     int64_t canonical = outPerm[actual];
     newOffsets[canonical] =
-        addOfrs(builder, loc, offsets[actual], newOffsets[canonical]);
+        addOfrs(builder, loc, clampedOffsets[actual], newOffsets[canonical]);
   }
 
   // Compute tile-local output padding amounts.
