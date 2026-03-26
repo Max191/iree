@@ -390,7 +390,17 @@ std::optional<int64_t> chooseDimToVectorize(OpBuilder &b, Location loc,
     // along the kernel window, then the actual inner slice size is equal to the
     // size of the corresponding kernel window dimension. Otherwise, the inner
     // slice size is just the size of the input tensor's inner dimension.
+    // Use the padded input size for the contiguity check: the im2col operates
+    // in the padded coordinate space, so the effective innermost dimension
+    // includes both low and high padding.
     OpFoldResult innerSliceSize = inputSizes[innerInputDim];
+    SmallVector<OpFoldResult> inputPadHigh = im2colOp.getMixedInputPadHigh();
+    if (!inputPadLow.empty()) {
+      innerSliceSize =
+          addOfrs(b, loc, innerSliceSize, inputPadLow[innerInputDim]);
+      innerSliceSize =
+          addOfrs(b, loc, innerSliceSize, inputPadHigh[innerInputDim]);
+    }
     if (kDimSet.contains(outputDimToVectorize)) {
       for (auto [kernelSize, mPos] :
            llvm::zip_equal(im2colOp.getMixedKernelSize(), im2colOp.getMPos())) {
