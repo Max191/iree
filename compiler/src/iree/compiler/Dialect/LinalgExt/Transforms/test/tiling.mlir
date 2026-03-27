@@ -1395,10 +1395,10 @@ module attributes { transform.with_named_sequence } {
 }
 // CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0) -> (d0 + 34)>
 // CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0) -> (d0 + 1000)>
-// CHECK-DAG:  #[[PADLOW:.+]] = affine_map<(d0) -> (-d0, 0)>
-// CHECK-DAG:  #[[PADHI_B:.+]] = affine_map<(d0) -> (0, d0 - 1)>
+// Preserve-zero-padding optimization: batch (dim 0) and K (dim 2) have zero
+// output padding on both sides, so pad computation is skipped for those dims.
+// Only M (dim 1) has non-trivial output_pad_high.
 // CHECK-DAG:  #[[PADHI_M:.+]] = affine_map<(d0) -> (0, d0 - 1019)>
-// CHECK-DAG:  #[[PADHI_K:.+]] = affine_map<(d0) -> (0, d0 - 5756)>
 // CHECK:      func.func @im2col_padded(%[[ARG0:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>) -> tensor<2x1040x5760xf32>
 // CHECK-DAG:    %[[C4:.+]] = arith.constant 4 : index
 // CHECK-DAG:    %[[C5:.+]] = arith.constant 5 : index
@@ -1419,19 +1419,14 @@ module attributes { transform.with_named_sequence } {
 // CHECK-SAME:           [1, 5, 4] [1, 1, 1] : tensor<2x1040x5760xf32> to tensor<1x5x4xf32>
 // CHECK-DAG:          %[[MOFFSET:.+]] = affine.apply #[[MAP]](%[[ARG3]])
 // CHECK-DAG:          %[[KOFFSET:.+]] = affine.apply #[[MAP1]](%[[ARG5]])
-// Recomputed output_pad_low and output_pad_high per tile.
-// CHECK-DAG:          %[[PL0:.+]] = affine.max #[[PADLOW]](%[[ARG1]])
-// CHECK-DAG:          %[[PH0:.+]] = affine.max #[[PADHI_B]](%[[ARG1]])
-// CHECK-DAG:          %[[PL1:.+]] = affine.max #[[PADLOW]](%[[ARG3]])
+// Only M dim output_pad_high is recomputed per tile (batch and K are zero).
 // CHECK-DAG:          %[[PH1:.+]] = affine.max #[[PADHI_M]](%[[ARG3]])
-// CHECK-DAG:          %[[PL2:.+]] = affine.max #[[PADLOW]](%[[ARG5]])
-// CHECK-DAG:          %[[PH2:.+]] = affine.max #[[PADHI_K]](%[[ARG5]])
 // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
 // CHECK-SAME:           offsets = [%[[ARG1]], %[[MOFFSET]], %[[KOFFSET]]] output_sizes = {{\[}}[2], [32, 32], [3, 3, 640]]
 // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
 // CHECK-SAME:           input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
 // CHECK-SAME:           input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0]
-// CHECK-SAME:           output_pad_low = [%[[PL0]], %[[PL1]], %[[PL2]]] output_pad_high = [%[[PH0]], %[[PH1]], %[[PH2]]]
+// CHECK-SAME:           output_pad_low = [0, 0, 0] output_pad_high = [0, %[[PH1]], 0]
 // CHECK-SAME:           pad_value(%[[CST]] : f32)
 // CHECK-SAME:           ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
 // CHECK-SAME:           outs(%[[EXTRACTED_SLICE]] : tensor<1x5x4xf32>) -> tensor<1x5x4xf32>

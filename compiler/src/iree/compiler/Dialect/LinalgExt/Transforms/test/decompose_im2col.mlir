@@ -603,9 +603,10 @@ module {
 // Padded im2col with vectorized K dim (tile size 8 = channels).
 // The K dim is vectorized, batch and M are size 1. After canonicalize+cse,
 // the loops are removed and we get straight-line code using affine.min/max
-// factor multiplication for bounds checking. Read offsets are unclamped
-// (offset - padLow), matching the vectorize path.
-//   CHECK-DAG: #[[$OFFSET:.+]] = affine_map<()[s0] -> (s0 - 1)>
+// factor multiplication for bounds checking. Read offsets are clamped
+// with max(0, ...) and min(dimSize-1, ...).
+//   CHECK-DAG: #[[$READ_CLAMP:.+]] = affine_map<()[s0] -> (0, s0 - 1)>
+//   CHECK-DAG: #[[$DIM_MIN:.+]] = affine_map<()[s0] -> (4, s0)>
 //   CHECK-DAG: #[[$HIGH_MIN:.+]] = affine_map<()[s0] -> (-s0 + 6, 1)>
 //   CHECK-DAG: #[[$CLAMP0:.+]] = affine_map<()[s0] -> (0, s0)>
 //   CHECK-DAG: #[[$LOW_MIN:.+]] = affine_map<()[s0] -> (1, s0)>
@@ -616,8 +617,9 @@ module {
 //  CHECK-SAME:     %[[MPADHI:[a-zA-Z0-9_]+]]: index
 //   CHECK-DAG:   %[[C8:.+]] = arith.constant 8 : index
 //   CHECK-DAG:   %[[CST:.+]] = arith.constant 0.000000e+00 : f32
-// Unclamped read offset: offset - padLow.
-//       CHECK:   %[[READ_OFF:.+]] = affine.apply #[[$OFFSET]]()[%[[MOFF]]]
+// Clamped read offset: max(0, offset - padLow), then min(dimSize-1, ...).
+//       CHECK:   %[[READ_MAX:.+]] = affine.max #[[$READ_CLAMP]]()[%[[MOFF]]]
+//       CHECK:   %[[READ_OFF:.+]] = affine.min #[[$DIM_MIN]]()[%[[READ_MAX]]]
 // High bound factor: min(-m_off + 6, 1) clamped to >= 0.
 //       CHECK:   %[[HI_MIN:.+]] = affine.min #[[$HIGH_MIN]]()[%[[MOFF]]]
 //       CHECK:   %[[HI_OK:.+]] = affine.max #[[$CLAMP0]]()[%[[HI_MIN]]]
@@ -663,10 +665,11 @@ module {
 // Input: 1x5x8 (batch=1, spatial=5, channels=8). Kernel [3], stride [1] -> OH=3.
 // output_sizes M = [3], product = 3. The tile is 1 in M, so with dynamic offset
 // positions beyond M=2 should be all-padding (validSize=0).
-// K is vectorized (tile size 8 = channels). Uses factor multiplication pattern.
-//   CHECK-DAG: #[[$HIGH_MIN:.+]] = affine_map<()[s0] -> (-s0 + 5, 1)>
+// K is vectorized (tile size 8 = channels). No input padding, so the "preserve
+// zero padding" optimization skips spatial bounds checks. Only the clamped read
+// offset and the output M bounds check remain.
 //   CHECK-DAG: #[[$CLAMP0:.+]] = affine_map<()[s0] -> (0, s0)>
-//   CHECK-DAG: #[[$LOW_MIN:.+]] = affine_map<()[s0] -> (1, s0 + 1)>
+//   CHECK-DAG: #[[$DIM_MIN:.+]] = affine_map<()[s0] -> (4, s0)>
 //   CHECK-DAG: #[[$MCHECK:.+]] = affine_map<()[s0] -> (-s0 + 1, 1)>
 // CHECK-LABEL: func.func @decompose_output_pad_m
 //  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x5x8xf32>
@@ -674,18 +677,14 @@ module {
 //  CHECK-SAME:     %[[MPADHI:[a-zA-Z0-9_]+]]: index
 //   CHECK-DAG:   %[[C8:.+]] = arith.constant 8 : index
 //   CHECK-DAG:   %[[CST:.+]] = arith.constant 0.000000e+00 : f32
-// Input-side bounds check using factor multiplication.
-//       CHECK:   affine.min #[[$HIGH_MIN]]()[%[[MOFF]]]
-//       CHECK:   affine.max #[[$CLAMP0]]()
-//       CHECK:   affine.min #[[$LOW_MIN]]()[%[[MOFF]]]
-//       CHECK:   affine.max #[[$CLAMP0]]()
-//       CHECK:   arith.muli
-//       CHECK:   arith.muli {{.*}}, %[[C8]] : index
-// Output-side bounds factor: min(1 - m_pad_high, 1) clamped to >= 0.
-//       CHECK:   affine.min #[[$MCHECK]]()[%[[MPADHI]]]
-//       CHECK:   affine.max #[[$CLAMP0]]()
-//       CHECK:   arith.muli
-//       CHECK:   tensor.extract_slice %[[ARG0]]
+// Clamped read offset: max(0, m_off), then min(dimSize-1, ...).
+//       CHECK:   %[[READ_MAX:.+]] = affine.max #[[$CLAMP0]]()[%[[MOFF]]]
+//       CHECK:   %[[READ_OFF:.+]] = affine.min #[[$DIM_MIN]]()[%[[READ_MAX]]]
+// Output M bounds factor: min(1 - m_pad_high, 1) clamped to >= 0.
+//       CHECK:   %[[M_MIN:.+]] = affine.min #[[$MCHECK]]()[%[[MPADHI]]]
+//       CHECK:   %[[M_OK:.+]] = affine.max #[[$CLAMP0]]()[%[[M_MIN]]]
+//       CHECK:   %[[VSIZE:.+]] = arith.muli %[[M_OK]], %[[C8]] : index
+//       CHECK:   tensor.extract_slice %[[ARG0]][0, %[[READ_OFF]], 0] [1, 1, %[[VSIZE]]]
 //       CHECK:   tensor.pad {{.*}} low[0]
 //  CHECK-NEXT:   ^bb0
 //  CHECK-NEXT:     tensor.yield %[[CST]]

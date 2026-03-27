@@ -725,8 +725,9 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
 
   // Step 4: Compute read offsets and extract the input slice.
   // Subtract padLow from source offsets to get real input coordinates.
-  // No clamping needed: when out-of-bounds, validSize is 0 so
-  // extract_slice produces an empty slice and tensor.pad fills the padding.
+  // Clamp to [0, dimSize - 1] to avoid negative indices in extract_slice.
+  // When out-of-bounds, validSize is 0 so extract_slice produces an empty
+  // slice and tensor.pad fills the padding.
   SmallVector<OpFoldResult> readOffsets;
   SmallVector<OpFoldResult> extractSizes(inputRank, one);
   SmallVector<OpFoldResult> extractStrides(inputRank, one);
@@ -737,9 +738,24 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   if (!inputPadLow.empty()) {
     padLow = inputPadLow;
   }
+  SmallVector<OpFoldResult> inputDimSizes =
+      tensor::getMixedSizes(b, nestedLoc, getInput());
+  MLIRContext *clampCtx = b.getContext();
+  AffineExpr cd0 = getAffineDimExpr(0, clampCtx);
+  AffineExpr cd1 = getAffineDimExpr(1, clampCtx);
+  AffineMap maxZeroMap =
+      AffineMap::get(1, 0, {cd0, getAffineConstantExpr(0, clampCtx)}, clampCtx);
+  AffineMap clampHighMap = AffineMap::get(2, 0, {cd0, cd1 - 1}, clampCtx);
   for (int64_t d = 0; d < inputRank; ++d) {
-    readOffsets.push_back(
-        subOfrs(b, nestedLoc, srcIndices.sliceOffsets[d], padLow[d]));
+    OpFoldResult adjusted =
+        subOfrs(b, nestedLoc, srcIndices.sliceOffsets[d], padLow[d]);
+    if (hasPadding()) {
+      adjusted = affine::makeComposedFoldedAffineMax(b, nestedLoc, maxZeroMap,
+                                                     {adjusted});
+      adjusted = affine::makeComposedFoldedAffineMin(
+          b, nestedLoc, clampHighMap, {adjusted, inputDimSizes[d]});
+    }
+    readOffsets.push_back(adjusted);
   }
 
   Value validSize;
