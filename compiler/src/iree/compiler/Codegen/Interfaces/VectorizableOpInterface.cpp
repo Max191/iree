@@ -1218,6 +1218,22 @@ struct Im2colOpVectorizationModel
     Value result = im2colOp.getOutput();
     Value zeroIdx = arith::ConstantIndexOp::create(rewriter, loc, 0);
 
+    // Hoist loop-invariant padding and clamping state.
+    SmallVector<OpFoldResult> padLow(inputRank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> inputPadLow = im2colOp.getMixedInputPadLow();
+    if (!inputPadLow.empty()) {
+      padLow = inputPadLow;
+    }
+    SmallVector<OpFoldResult> inputSizes =
+        tensor::getMixedSizes(rewriter, loc, im2colOp.getInput());
+    // AffineMap for clamping: max(d0, 0) and min(d0, d1 - 1).
+    MLIRContext *ctx = rewriter.getContext();
+    AffineExpr d0 = getAffineDimExpr(0, ctx);
+    AffineExpr d1 = getAffineDimExpr(1, ctx);
+    AffineMap maxZeroMap =
+        AffineMap::get(1, 0, {d0, getAffineConstantExpr(0, ctx)}, ctx);
+    AffineMap clampHighMap = AffineMap::get(2, 0, {d0, d1 - 1}, ctx);
+
     for (int64_t iter = 0; iter < totalIters; ++iter) {
       SmallVector<Value> ivs(outputRank, zeroIdx);
       int64_t remaining = iter;
@@ -1234,15 +1250,19 @@ struct Im2colOpVectorizationModel
       // Convert padded-space source offsets to actual input tensor coordinates
       // by subtracting padLow. When there is no padding, padLow is all zeros
       // and subOfrs folds to identity.
-      SmallVector<OpFoldResult> padLow(inputRank, rewriter.getIndexAttr(0));
-      SmallVector<OpFoldResult> inputPadLow = im2colOp.getMixedInputPadLow();
-      if (!inputPadLow.empty()) {
-        padLow = inputPadLow;
-      }
       SmallVector<Value> readIndices;
       for (int64_t d = 0; d < inputRank; ++d) {
         OpFoldResult adjusted = IREE::LinalgExt::subOfrs(
             rewriter, loc, srcIndices.sliceOffsets[d], padLow[d]);
+        // Clamp to [0, dimSize - 1] so downstream optimizations can prove
+        // buffer accesses are in-bounds. The mask already zeros out OOB reads,
+        // so clamping doesn't affect correctness.
+        if (hasPadding) {
+          adjusted = affine::makeComposedFoldedAffineMax(rewriter, loc,
+                                                         maxZeroMap, {adjusted});
+          adjusted = affine::makeComposedFoldedAffineMin(
+              rewriter, loc, clampHighMap, {adjusted, inputSizes[d]});
+        }
         readIndices.push_back(
             getValueOrCreateConstantIndexOp(rewriter, loc, adjusted));
       }

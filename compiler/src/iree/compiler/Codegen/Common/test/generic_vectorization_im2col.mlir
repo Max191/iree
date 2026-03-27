@@ -178,3 +178,62 @@ func.func @im2col_scalar_fallback_channel_pad_low(
 //   CHECK-NOT:   iree_linalg_ext.im2col
 //       CHECK:   vector.transfer_read %[[INPUT]]{{.*}} {in_bounds = [true]} : tensor<59x91x16x56xbf16>, vector<1xbf16>
 //       CHECK:   vector.transfer_write {{.*}} : vector<1xbf16>, tensor<1x1x1x8xbf16>
+
+// -----
+
+// Output-only padding (GEMM alignment). Vectorizes along K with masked reads.
+// The output has 16 extra M positions filled with pad_value.
+func.func @im2col_vectorize_output_padding(
+    %input: tensor<2x34x34x640xf32>, %m_off: index, %k: index
+) -> tensor<2x2x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x2x4xf32>
+  %k_off = affine.apply affine_map<(d0) -> (d0 * 4)>(%k)
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[2], [32, 32], [3, 3, 640]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          output_pad_low = [0, 0, 0] output_pad_high = [0, 16, 0]
+          pad_value(%cst : f32)
+          ins(%input : tensor<2x34x34x640xf32>)
+          outs(%0 : tensor<2x2x4xf32>) -> tensor<2x2x4xf32>
+  return %1 : tensor<2x2x4xf32>
+}
+// Vectorizes along K (dim 2) with vector width 4. The output M-dim padding
+// produces arith.select between the k-dim mask and all-false for each
+// non-vectorized output dim. No input padding, so reads are from the
+// unpadded tensor with clamped indices.
+// CHECK-LABEL: func.func @im2col_vectorize_output_padding
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<2x34x34x640xf32>
+//   CHECK-DAG:   %[[PAD:.+]] = arith.constant 0.0{{.*}} : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   vector.transfer_read %[[INPUT]]{{.*}}, %[[PAD]], %{{.*}} {in_bounds = [true]} : tensor<2x34x34x640xf32>, vector<4xf32>
+//       CHECK:   vector.transfer_write {{.*}} {in_bounds = [true]} : vector<4xf32>, tensor<2x2x4xf32>
+
+// -----
+
+// Output low-padding on the vectorized dim: falls back to scalar unrolling
+// because chooseDimToVectorize skips dims with non-zero output_pad_low.
+func.func @im2col_scalar_fallback_output_pad_low(
+    %input: tensor<2x34x34x640xf32>, %m_off: index, %k: index
+) -> tensor<2x2x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x2x4xf32>
+  %k_off = affine.apply affine_map<(d0) -> (d0 * 4)>(%k)
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+          offsets = [0, %m_off, %k_off] output_sizes = [[2], [32, 32], [3, 3, 640]]
+          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          output_pad_low = [0, 0, 2] output_pad_high = [0, 0, 0]
+          pad_value(%cst : f32)
+          ins(%input : tensor<2x34x34x640xf32>)
+          outs(%0 : tensor<2x2x4xf32>) -> tensor<2x2x4xf32>
+  return %1 : tensor<2x2x4xf32>
+}
+// Scalar fallback: output_pad_low on the K dim (dim 2) prevents vectorization.
+// CHECK-LABEL: func.func @im2col_scalar_fallback_output_pad_low
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   vector.transfer_read {{.*}} : tensor<2x34x34x640xf32>, vector<1xf32>
+//       CHECK:   vector.transfer_write {{.*}} : vector<1xf32>, tensor<2x2x4xf32>
