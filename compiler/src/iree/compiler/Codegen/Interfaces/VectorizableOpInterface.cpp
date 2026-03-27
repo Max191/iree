@@ -1149,10 +1149,12 @@ static Value computeIm2colPaddingMask(
   return vector::CreateMaskOp::create(b, loc, vecI1Type, validSize);
 }
 
+// Im2col vectorization computes its own vector width via
+// chooseDimToVectorize() based on the op's layout and contiguity
+// constraints, rather than using the driver-provided vectorSizes.
 struct Im2colOpVectorizationModel
     : public VectorizableOpInterface::ExternalModel<Im2colOpVectorizationModel,
                                                     IREE::LinalgExt::Im2colOp> {
-
   bool isVectorizable(Operation *op, ArrayRef<int64_t> vectorSizes,
                       ArrayRef<bool> scalableDims,
                       DictionaryAttr options) const {
