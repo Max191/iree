@@ -3009,16 +3009,6 @@ struct FoldOutputPadIntoIm2col final : public OpRewritePattern<tensor::PadOp> {
     SmallVector<OpFoldResult> lowPad = padOp.getMixedLowPad();
     SmallVector<OpFoldResult> highPad = padOp.getMixedHighPad();
 
-    // The fold replaces pad(im2col(...)) with im2col(bigger_output), writing
-    // from offset 0. This is only valid when lowPad is all-zero; non-zero
-    // lowPad would leave the low-padded region uninitialized.
-    for (auto lp : lowPad) {
-      if (!isConstantIntValue(lp, 0)) {
-        return rewriter.notifyMatchFailure(
-            padOp, "non-zero low padding prevents folding");
-      }
-    }
-
     // This fold is safe because the pad_value is verified to be the same
     // constant above, so padded positions in the larger output match what
     // the downstream consumer (e.g., GEMM) expects.
@@ -3044,11 +3034,8 @@ struct FoldOutputPadIntoIm2col final : public OpRewritePattern<tensor::PadOp> {
         im2colOp.getMixedOutputPadLow();
     SmallVector<OpFoldResult> existingOutPadHigh =
         im2colOp.getMixedOutputPadHigh();
-    SmallVector<OpFoldResult> newOutPadLow(outputRank, rewriter.getIndexAttr(0));
-    // lowPad is verified to be all-zero above, so newOutPadLow stays 0.
-    // highPad is already in actual tensor dim order.
+    SmallVector<OpFoldResult> newOutPadLow(lowPad);
     SmallVector<OpFoldResult> newOutPadHigh(highPad);
-    // Compose with existing output padding if present.
     if (!existingOutPadLow.empty()) {
       for (int64_t i = 0; i < outputRank; ++i) {
         newOutPadLow[i] = addOfrs(rewriter, loc, existingOutPadLow[i],
