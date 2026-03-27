@@ -53,16 +53,10 @@ Im2colSourceIndices computeIm2colSourceIndices(OpBuilder &b, Location loc,
     if (numProduced == 1) {
       allCoords.push_back(getValueOrCreateConstantIndexOp(b, loc, idx));
     } else {
-      // Use non-wrapping delinearize (hasOuterBound=false) so that
-      // positions beyond the product of output_sizes produce out-of-bounds
-      // coordinates instead of wrapping. This lets the bounds computation
-      // naturally handle oversized outputs (e.g. from GEMM alignment).
-      SmallVector<OpFoldResult> innerBasis(innerSizes.begin() + 1,
-                                           innerSizes.end());
       ValueRange delinCoords =
           affine::AffineDelinearizeIndexOp::create(
-              b, loc, getValueOrCreateConstantIndexOp(b, loc, idx), innerBasis,
-              /*hasOuterBound=*/false)
+              b, loc, getValueOrCreateConstantIndexOp(b, loc, idx), innerSizes,
+              /*hasOuterBound=*/true)
               .getResults();
       allCoords.append(delinCoords.begin(), delinCoords.end());
     }

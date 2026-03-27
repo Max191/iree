@@ -31,9 +31,9 @@ module {
 //       CHECK:   %[[bLOOP:.+]] = scf.for %[[b:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT0:.+]] = %[[OUT_TILE]]) -> (tensor<2x?x4xf32>)
 //       CHECK:     %[[mLOOP:.+]] = scf.for %[[m:.+]] = %[[C0]] to %[[mSIZE]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT0]]) -> (tensor<2x?x4xf32>)
 //   CHECK-DAG:       %[[kScaled:.+]] = affine.apply #[[$MAP]]()[%[[K]]]
-//   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kScaled]] into (3, 640) : index, index, index
+//   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kScaled]] into (3, 3, 640) : index, index, index
 //   CHECK-DAG:       %[[mIDX:.+]] = affine.apply #[[$MAP1]](%[[m]])[%[[mOFF]]]
-//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32) : index, index
+//   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32, 32) : index, index
 //   CHECK-DAG:       %[[h:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#0)[%[[kParts]]#0]
 //   CHECK-DAG:       %[[w:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#1)[%[[kParts]]#1]
 //       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[b]], %[[h]], %[[w]], %[[kParts]]#2] [1, 1, 1, 4]
@@ -83,9 +83,9 @@ module {
 //       CHECK:     %[[mLOOP:.+]] = scf.for %[[m:.+]] = %[[C0]] to %[[mSIZE]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT0]]) -> (tensor<2x?x?xf32>)
 //       CHECK:       %[[kLOOP:.+]] = scf.for %[[k:.+]] = %[[C0]] to %[[kSIZE]] step %[[C1]] iter_args(%[[OUT2:.+]] = %[[OUT1]]) -> (tensor<2x?x?xf32>)
 //   CHECK-DAG:         %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[k]])[%[[kOFF]]]
-//   CHECK-DAG:         %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (5, 2) : index, index, index
+//   CHECK-DAG:         %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (640, 5, 2) : index, index, index
 //   CHECK-DAG:         %[[mIDX:.+]] = affine.apply #[[$MAP]](%[[m]])[%[[mOFF]]]
-//   CHECK-DAG:         %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32) : index, index
+//   CHECK-DAG:         %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32, 32) : index, index
 //   CHECK-DAG:         %[[h:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#0, %[[kParts]]#1)
 //   CHECK-DAG:         %[[w:.+]] = affine.apply #[[$MAP2]](%[[mParts]]#1, %[[kParts]]#2)
 //       CHECK:         %[[IN_SLICE2:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[b]], %[[w]], %[[h]]] [1, 1, 1, 1]
@@ -135,7 +135,7 @@ module {
 //       CHECK:       %[[mLOOP1:.+]] = scf.for %[[m1:.+]] = %[[C0]] to %[[mSIZE1]] step %[[C1]] iter_args(%[[OUT2:.+]] = %[[OUT1]]) -> (tensor<2x?x?x2x4xf32>)
 //       CHECK:         %[[kLOOP:.+]] = scf.for %[[k:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT3:.+]] = %[[OUT2]]) -> (tensor<2x?x?x2x4xf32>)
 //   CHECK-DAG:           %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[k]])[%[[kOFF]]]
-//   CHECK-DAG:           %[[kParts:.+]]:2 = affine.delinearize_index %[[kIDX]] into (3) : index, index
+//   CHECK-DAG:           %[[kParts:.+]]:2 = affine.delinearize_index %[[kIDX]] into (3, 3) : index, index
 //   CHECK-DAG:           %[[h:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#0, %[[m0]])[%[[mOFF0]]]
 //   CHECK-DAG:           %[[w:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#1, %[[m1]])[%[[mOFF1]]]
 //       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[b]], %[[h]], %[[w]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<2x34x34x640xf32> to tensor<4xf32>
@@ -307,7 +307,7 @@ module {
 //       CHECK:   %[[OUT_TILE:.+]] = tensor.empty() : tensor<1x2x4xf32>
 //       CHECK:   %[[MLOOP:.+]] = scf.for %[[M:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT_TILE]]) -> (tensor<1x2x4xf32>)
 //       CHECK:     %[[KLOOP:.+]] = scf.for %[[K:.+]] = %[[C0]] to %[[C4]] step %[[C1]] iter_args(%[[OUT2:.+]] = %[[OUT1]]) -> (tensor<1x2x4xf32>)
-//       CHECK:       affine.delinearize_index %[[K]] into (2) : index, index
+//       CHECK:       affine.delinearize_index %[[K]] into (2, 2) : index, index
 //       CHECK:       tensor.extract_slice %[[ARG0]]
 //       CHECK:       linalg.copy
 //       CHECK:       tensor.insert_slice {{.*}} into %[[OUT2]][0, %[[M]], %[[K]]] [1, 1, 1] [1, 1, 1] : tensor<1xf32> into tensor<1x2x4xf32>
@@ -382,7 +382,7 @@ module {
 //       CHECK:   %[[mLOOP1:.+]] = scf.for %[[M1:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT0]])
 //       CHECK:     %[[kLOOP:.+]] = scf.for %[[K:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT2:.+]] = %[[OUT1]])
 //   CHECK-DAG:       %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[K]])[%[[ARG3]]]
-//   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (24, 16) : index, index, index
+//   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (16, 24, 16) : index, index, index
 //   CHECK-DAG:       %[[h:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#1, %[[M0]])[%[[ARG1]]]
 //   CHECK-DAG:       %[[w:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#2, %[[M1]])[%[[ARG2]]]
 //       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[h]], %[[w]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<16x26x18x4xf32> to tensor<4xf32>
@@ -429,7 +429,7 @@ module {
 //       CHECK:   %[[LOOP1:.+]] = scf.for %[[IV1:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[ARG5:.+]] = %[[ARG4]])
 //       CHECK:     %[[LOOP2:.+]] = scf.for %[[IV2:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[ARG6:.+]] = %[[ARG5]])
 //   CHECK-DAG:       %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[IV0]])[%[[ARG3]]]
-//   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (24, 16) : index, index, index
+//   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (16, 24, 16) : index, index, index
 //   CHECK-DAG:       %[[h:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#1, %[[IV1]])[%[[ARG1]]]
 //   CHECK-DAG:       %[[w:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#2, %[[IV2]])[%[[ARG2]]]
 //       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[h]], %[[w]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<16x26x18x4xf32> to tensor<4xf32>
@@ -477,7 +477,7 @@ module {
 //       CHECK:       %[[LOOP3:.+]] = scf.for %[[IV3:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[ARG7:.+]] = %[[ARG6]])
 //       CHECK:         %[[LOOP4:.+]] = scf.for %[[IV4:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[ARG8:.+]] = %[[ARG7]])
 //   CHECK-DAG:           %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[IV0]])[%[[ARG3]]]
-//   CHECK-DAG:           %[[kParts:.+]]:2 = affine.delinearize_index %[[kIDX]] into (24) : index, index
+//   CHECK-DAG:           %[[kParts:.+]]:2 = affine.delinearize_index %[[kIDX]] into (16, 24) : index, index
 //   CHECK-DAG:           %[[h:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#1, %[[IV2]])[%[[ARG1]]]
 //   CHECK-DAG:           %[[w:.+]] = affine.apply #[[$MAP1]](%[[IV1]], %[[IV3]])[%[[ARG2]]]
 //       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kParts]]#0, %[[h]], %[[w]], %[[IV4]], 0] [1, 1, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<16x26x18x2x4xf32> to tensor<4xf32>
@@ -513,7 +513,7 @@ module {
 }
 // CHECK-LABEL: func.func @im2col_multiple_k_pos
 //  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9_]+]]: tensor<16x52x32x96xbf16>
-//       CHECK:       %[[kParts:.+]]:3 = affine.delinearize_index {{.*}} into (48, 32)
+//       CHECK:       %[[kParts:.+]]:3 = affine.delinearize_index {{.*}} into (16, 48, 32)
 //       CHECK:       tensor.extract_slice %[[ARG0]][%[[kParts]]#0, {{.*}}, %[[kParts]]#2, 0]
 //   CHECK-NOT:   iree_linalg_ext.im2col
 
@@ -585,7 +585,7 @@ module {
 //       CHECK:     %[[LOOP1:.+]] = scf.for %[[IV1:.+]] = %[[C0]] to %[[C3]] step %[[C1]] iter_args(%[[A1:.+]] = %[[A0]])
 //       CHECK:       %[[LOOP2:.+]] = scf.for %[[IV2:.+]] = %[[C0]] to %[[C4]] step %[[C1]] iter_args(%[[A2:.+]] = %[[A1]])
 //   CHECK-DAG:         %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[IV2]])[%[[K]]]
-//   CHECK-DAG:         %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (8, 8) : index, index, index
+//   CHECK-DAG:         %[[kParts:.+]]:3 = affine.delinearize_index %[[kIDX]] into (4, 8, 8) : index, index, index
 // Verify dilation factor 2 is applied to spatial offset computation.
 //   CHECK-DAG:         %[[h:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#1, %[[IV0]])[%[[M0]]]
 //   CHECK-DAG:         %[[w:.+]] = affine.apply #[[$MAP1]](%[[kParts]]#2, %[[IV1]])[%[[M1]]]
