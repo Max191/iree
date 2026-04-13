@@ -198,6 +198,38 @@ struct IGEMMGenericConvDetails {
   }
 };
 
+/// Final im2col metadata after any legal GEMM-driven collapsing has been
+/// folded back into the im2col op.
+struct Im2colOpInfo {
+  SmallVector<int64_t> strides;
+  SmallVector<int64_t> dilations;
+  SmallVector<int64_t> kernelSizes;
+  SmallVector<SmallVector<int64_t>> outputSizes;
+  SmallVector<int64_t> batchPos;
+  SmallVector<int64_t> mPos;
+  SmallVector<int64_t> kPos;
+  SmallVector<int64_t> inputKPerm;
+  SmallVector<int64_t> outputPerm;
+};
+
+/// Final lowering metadata for a convolution converted to im2col + generic
+/// IGEMM. `igemmDetails` is the flattened GEMM view used by lowering-config
+/// selection. `im2colInfo` and `outputReassocIndices` drive emission of the
+/// final flattened ops.
+struct IGEMMConvLoweringDetails {
+  IGEMMGenericConvDetails igemmDetails;
+  Im2colOpInfo im2colInfo;
+  SmallVector<ReassociationIndices> outputReassocIndices;
+};
+
+/// Populate the final im2col+IGEMM lowering details for a convolution
+/// operation. Legal GEMM dim collapsing is driven from the fully expanded
+/// GEMM metadata. When `allowParallelDimCollapse` is false, only reduction/K
+/// dimensions are flattened.
+FailureOr<IGEMMConvLoweringDetails>
+getIGEMMConvLoweringDetails(linalg::LinalgOp linalgOp,
+                            bool allowParallelDimCollapse = false);
+
 /// Populate `IGEMMGenericConvDetails` for a given convolution operation.
 FailureOr<IGEMMGenericConvDetails>
 getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp);

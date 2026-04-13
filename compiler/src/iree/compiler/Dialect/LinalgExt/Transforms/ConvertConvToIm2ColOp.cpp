@@ -21,10 +21,6 @@ namespace mlir::iree_compiler::IREE::LinalgExt {
 #define GEN_PASS_DEF_CONVERTCONVTOIM2COLOPPASS
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h.inc"
 
-static bool hasAllOneValues(ArrayRef<int64_t> attr) {
-  return llvm::all_of(attr, [](int64_t element) { return element == 1; });
-}
-
 static Value createAdd(Location loc, Value x, Value y, OpBuilder &builder) {
   bool isInt = isa<IntegerType>(x.getType());
   if (isInt) {
@@ -53,82 +49,6 @@ static SmallVector<NamedAttribute> getPrunedAttributeList(linalg::LinalgOp op) {
     }
   }
   return prunedAttributeList;
-}
-
-// Computes `inputKPerm` that maps the input spatial and channel dimension order
-// to filter's.
-static SmallVector<int64_t>
-computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
-                  const mlir::linalg::ConvolutionDimensions &convDims) {
-  // Get reduction dims from input and filter in order of appearance.
-  auto reductionDims =
-      llvm::concat<const unsigned>(convDims.inputChannel, convDims.filterLoop);
-  SmallVector<int64_t> inputReductionDims;
-  for (AffineExpr dimExpr : inputMap.getResults()) {
-    for (unsigned reductionDim : reductionDims) {
-      if (dimExpr.isFunctionOfDim(reductionDim)) {
-        inputReductionDims.push_back(reductionDim);
-      }
-    }
-  }
-  SmallVector<int64_t> filterReductionDims;
-  for (AffineExpr dimExpr : filterMap.getResults()) {
-    for (unsigned reductionDim : reductionDims) {
-      if (dimExpr.isFunctionOfDim(reductionDim)) {
-        filterReductionDims.push_back(reductionDim);
-      }
-    }
-  }
-
-  // Compute the permutation that maps inputSharedDims to filterSharedDims.
-  SmallVector<int64_t> inputKPerm;
-  for (int64_t dim : filterReductionDims) {
-    auto it = llvm::find(inputReductionDims, dim);
-    assert(it != inputReductionDims.end() &&
-           "Filter dimension not found in input shared dimensions");
-    inputKPerm.push_back(std::distance(inputReductionDims.begin(), it));
-  }
-  return inputKPerm;
-}
-
-static SmallVector<unsigned> getInputSemanticDimsInOrder(
-    AffineMap inputMap, ArrayRef<unsigned> promotedBatchDims,
-    ArrayRef<unsigned> outputImageDims, ArrayRef<unsigned> inputChannelDims) {
-  llvm::SmallDenseSet<unsigned, 4> promotedBatchDimSet(
-      promotedBatchDims.begin(), promotedBatchDims.end());
-  llvm::SmallDenseSet<unsigned, 4> outputImageDimSet(outputImageDims.begin(),
-                                                     outputImageDims.end());
-  llvm::SmallDenseSet<unsigned, 4> inputChannelDimSet(inputChannelDims.begin(),
-                                                      inputChannelDims.end());
-  llvm::SmallDenseSet<unsigned, 8> capturedDims;
-  SmallVector<unsigned> inputOrderDims;
-  for (AffineExpr inputExpr : inputMap.getResults()) {
-    llvm::SmallDenseSet<unsigned, 4> dimsForInput;
-    inputExpr.walk([&](AffineExpr expr) {
-      if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
-        dimsForInput.insert(dimExpr.getPosition());
-      }
-    });
-
-    auto appendFirstMatching = [&](const llvm::SmallDenseSet<unsigned, 4> &set) {
-      for (unsigned dim : dimsForInput) {
-        if (set.contains(dim) && capturedDims.insert(dim).second) {
-          inputOrderDims.push_back(dim);
-          return true;
-        }
-      }
-      return false;
-    };
-
-    if (appendFirstMatching(promotedBatchDimSet)) {
-      continue;
-    }
-    if (appendFirstMatching(outputImageDimSet)) {
-      continue;
-    }
-    (void)appendFirstMatching(inputChannelDimSet);
-  }
-  return inputOrderDims;
 }
 
 namespace {
@@ -182,23 +102,25 @@ public:
       return rewriter.notifyMatchFailure(linalgOp, "controlFn failed.");
     }
 
-    auto igemmConvDetailsOrFailure =
-        LinalgExt::getIGEMMGenericConvDetails(linalgOp);
-    if (failed(igemmConvDetailsOrFailure)) {
+    auto loweringDetailsOrFailure =
+        LinalgExt::getIGEMMConvLoweringDetails(
+            linalgOp, /*allowParallelDimCollapse=*/false);
+    if (failed(loweringDetailsOrFailure)) {
       return rewriter.notifyMatchFailure(linalgOp,
-                                         "Failed to extract IGEMM details");
+                                         "Failed to extract IGEMM lowering details");
     }
 
+    LinalgExt::IGEMMConvLoweringDetails loweringDetails =
+        *loweringDetailsOrFailure;
     LinalgExt::IGEMMGenericConvDetails igemmConvDetails =
-        *igemmConvDetailsOrFailure;
+        loweringDetails.igemmDetails;
+    const LinalgExt::Im2colOpInfo &im2colInfo = loweringDetails.im2colInfo;
 
     SmallVector<AffineMap> igemmContractionMaps =
         igemmConvDetails.igemmContractionMaps;
-    mlir::linalg::ConvolutionDimensions convDims = igemmConvDetails.convDims;
     SmallVector<ReassociationIndices> filterReassocIndices =
         igemmConvDetails.filterReassocIndices;
     bool isOutputChannelFirst = igemmConvDetails.isOutputChannelFirst;
-    SmallVector<int64_t> igemmLoopBounds = igemmConvDetails.igemmLoopBounds;
     SmallVector<utils::IteratorType> igemmLoopIterators =
         igemmConvDetails.igemmLoopIterators;
 
@@ -206,203 +128,54 @@ public:
     Value filter = linalgOp.getDpsInputs()[1];
     Value output = linalgOp.getDpsInits()[0];
     auto inputType = cast<ShapedType>(input.getType());
-    auto filterType = cast<ShapedType>(filter.getType());
     auto outputType = cast<ShapedType>(output.getType());
-
-    ArrayRef<int64_t> filterShape = filterType.getShape();
-    ArrayRef<int64_t> outputShape = outputType.getShape();
-    ArrayRef<int64_t> inputShape = inputType.getShape();
-    SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
-    AffineMap inputMap = indexingMaps[0];
-    AffineMap filterMap = indexingMaps[1];
-    AffineMap outputMap = indexingMaps[2];
-
-    SmallVector<OpFoldResult> spatialKernelSizes;
-    for (auto filterLoop : convDims.filterLoop) {
-      std::optional<int64_t> maybeDim = filterMap.getResultPosition(
-          getAffineDimExpr(filterLoop, filterMap.getContext()));
-      if (!maybeDim) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "Failed to infer filter shape.");
-      }
-      spatialKernelSizes.push_back(
-          rewriter.getIndexAttr(filterShape[maybeDim.value()]));
-    }
-
-    // True GEMM batch dims are only the convolution depth/group dims. The
-    // convolution batch dims participate in the GEMM M space instead.
-    SmallVector<int64_t> outputPerm = igemmConvDetails.im2colOutputPerm;
-    SmallVector<unsigned> im2colBatchIterDims(convDims.depth.begin(),
-                                              convDims.depth.end());
-    SmallVector<int64_t> batchPos(im2colBatchIterDims.size());
-    for (auto [idx, convDim] : llvm::enumerate(im2colBatchIterDims)) {
-      AffineExpr convDimExpr = getAffineDimExpr(convDim, getContext());
-      int64_t im2colInputDim = inputMap.getResultPosition(convDimExpr).value();
-      batchPos[idx] = im2colInputDim;
-    }
-
-    SmallVector<int64_t> mPos;
-    SmallVector<int64_t> mShape;
-    SmallVector<int64_t> im2colStrides;
-    SmallVector<int64_t> im2colDilations;
-    SmallVector<OpFoldResult> kernelSizes;
-    SmallVector<unsigned> im2colMDims;
-    im2colMDims.append(convDims.batch.begin(), convDims.batch.end());
-    im2colMDims.append(convDims.outputImage.begin(), convDims.outputImage.end());
-    DenseMap<unsigned, unsigned> outputImageToPos;
-    for (auto [idx, dim] : llvm::enumerate(convDims.outputImage)) {
-      outputImageToPos[dim] = idx;
-    }
-    DenseMap<unsigned, unsigned> filterLoopToPos;
-    for (auto [idx, dim] : llvm::enumerate(convDims.filterLoop)) {
-      filterLoopToPos[dim] = idx;
-    }
-
-    for (unsigned mDim : im2colMDims) {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(mDim)) {
-          mPos.push_back(idx);
-        }
-      }
-      for (auto [idx, e] : llvm::enumerate(outputMap.getResults())) {
-        if (e.isFunctionOfDim(mDim)) {
-          mShape.push_back(outputShape[idx]);
-        }
-      }
-      if (llvm::is_contained(convDims.batch, mDim)) {
-        im2colStrides.push_back(1);
-        im2colDilations.push_back(1);
-        kernelSizes.push_back(rewriter.getIndexAttr(1));
-        continue;
-      }
-      unsigned spatialIdx = outputImageToPos.lookup(mDim);
-      im2colStrides.push_back(convDims.strides[spatialIdx]);
-      im2colDilations.push_back(convDims.dilations[spatialIdx]);
-      kernelSizes.push_back(spatialKernelSizes[spatialIdx]);
-    }
-
-    SmallVector<int64_t> kPos;
-    for (auto reductionDim : convDims.inputChannel) {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(reductionDim)) {
-          kPos.push_back(idx);
-        }
-      }
-    }
-    // Build unified offsets and output_sizes for the im2col op.
-    // Canonical output dim order: [batch dims, M (1 dim), K dims].
-    // At conv-to-im2col time all offsets are zero.
-
-    // Identify which original filter dims are parallel (depth + outputChannel).
-    llvm::SmallDenseSet<int64_t, 4> parallelFilterDims;
-    for (auto iterDim :
-         llvm::concat<const unsigned>(convDims.depth, convDims.outputChannel)) {
-      std::optional<int64_t> maybeDim = filterMap.getResultPosition(
-          getAffineDimExpr(iterDim, filterMap.getContext()));
-      if (maybeDim) {
-        parallelFilterDims.insert(maybeDim.value());
-      }
-    }
-
-    // Collect K output dim inner sizes from filter reassociation indices.
-    // Each reduction group (group not entirely composed of parallel dims)
-    // becomes one K output dim whose inner sizes are the original filter
-    // dim sizes in that group.
-    SmallVector<SmallVector<int64_t>> kInnerSizes;
-    SmallVector<unsigned> outputKSemanticDims(convDims.batch.begin(),
-                                              convDims.batch.end());
-    bool insertedSyntheticBatchKDims = false;
-    for (const auto &indices : filterReassocIndices) {
-      bool isParallel =
-          indices.size() == 1 && parallelFilterDims.contains(indices[0]);
-      if (!isParallel) {
-        SmallVector<int64_t> innerSizes;
-        if (!insertedSyntheticBatchKDims) {
-          innerSizes.append(convDims.batch.size(), 1);
-          insertedSyntheticBatchKDims = true;
-        }
-        for (int64_t idx : indices) {
-          unsigned convDim =
-              cast<AffineDimExpr>(filterMap.getResult(idx)).getPosition();
-          innerSizes.push_back(filterShape[idx]);
-          if (filterLoopToPos.contains(convDim)) {
-            outputKSemanticDims.push_back(
-                convDims.outputImage[filterLoopToPos.lookup(convDim)]);
-            continue;
-          }
-          outputKSemanticDims.push_back(convDim);
-        }
-        kInnerSizes.push_back(innerSizes);
-      }
-    }
-    if (!insertedSyntheticBatchKDims && !convDims.batch.empty()) {
-      kInnerSizes.push_back(SmallVector<int64_t>(convDims.batch.size(), 1));
-    }
-
-    SmallVector<unsigned> inputOrderSemanticDims = getInputSemanticDimsInOrder(
-        inputMap, convDims.batch, convDims.outputImage, convDims.inputChannel);
-    SmallVector<int64_t> inputKPerm;
-    inputKPerm.reserve(outputKSemanticDims.size());
-    for (unsigned dim : outputKSemanticDims) {
-      auto it = llvm::find(inputOrderSemanticDims, dim);
-      assert(it != inputOrderSemanticDims.end() &&
-             "expected K dim to be representable in input order");
-      inputKPerm.push_back(std::distance(inputOrderSemanticDims.begin(), it));
-    }
-
-    int64_t numOutputDims =
-        batchPos.size() + mShape.size() + kInnerSizes.size();
-    SmallVector<OpFoldResult> offsets(numOutputDims, rewriter.getIndexAttr(0));
+    auto loc = linalgOp.getLoc();
+    SmallVector<OpFoldResult> kernelSizes =
+        getAsIndexOpFoldResult(getContext(), im2colInfo.kernelSizes);
+    SmallVector<OpFoldResult> offsets(im2colInfo.outputSizes.size(),
+                                      rewriter.getIndexAttr(0));
     SmallVector<SmallVector<OpFoldResult>> outputSizes;
-    // Batch dims: each has a single inner size.
-    for (int64_t dim : batchPos) {
-      outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
-    }
-    // M dims: each spatial output dim is a separate output dimension.
-    for (int64_t m : mShape) {
-      outputSizes.push_back({rewriter.getIndexAttr(m)});
-    }
-    // K dims: inner sizes from filter reassociation.
-    for (const auto &innerSizes : kInnerSizes) {
+    outputSizes.reserve(im2colInfo.outputSizes.size());
+    for (ArrayRef<int64_t> innerSizes : im2colInfo.outputSizes) {
       outputSizes.push_back(getAsIndexOpFoldResult(getContext(), innerSizes));
     }
 
-    auto loc = linalgOp.getLoc();
-    // Shape of the resulting tensor from im2col. Each output dim is the
-    // product of its inner sizes.
     SmallVector<int64_t> colTensorShape;
-    for (const auto &innerSizes : outputSizes) {
+    for (ArrayRef<int64_t> innerSizes : im2colInfo.outputSizes) {
       int64_t dimSize = 1;
-      for (OpFoldResult s : innerSizes) {
-        std::optional<int64_t> constVal = getConstantIntValue(s);
-        if (!constVal) {
-          return rewriter.notifyMatchFailure(
-              linalgOp, "dynamic inner sizes not supported");
-        }
-        dimSize *= *constVal;
+      for (int64_t size : innerSizes) {
+        dimSize *= size;
       }
       colTensorShape.push_back(dimSize);
     }
-
-    applyPermutationToVector(colTensorShape, outputPerm);
+    applyPermutationToVector(colTensorShape, im2colInfo.outputPerm);
     Value colTensor = tensor::EmptyOp::create(rewriter, loc, colTensorShape,
                                               inputType.getElementType());
     Value img2ColTensor =
         IREE::LinalgExt::Im2colOp::create(
-            rewriter, loc, input, /*output=*/colTensor, im2colStrides,
-            im2colDilations, kernelSizes, offsets, outputSizes, batchPos, mPos,
-            kPos, inputKPerm, outputPerm)
+            rewriter, loc, input, /*output=*/colTensor, im2colInfo.strides,
+            im2colInfo.dilations, kernelSizes, offsets, outputSizes,
+            im2colInfo.batchPos, im2colInfo.mPos, im2colInfo.kPos,
+            im2colInfo.inputKPerm, im2colInfo.outputPerm)
             .getResult(0);
 
     Value reshapedFilter = tensor::CollapseShapeOp::create(
         rewriter, loc, filter, filterReassocIndices);
 
+    Value gemmOutput = output;
+    ShapedType gemmOutputType = outputType;
+    if (!loweringDetails.outputReassocIndices.empty()) {
+      gemmOutput = tensor::CollapseShapeOp::create(
+          rewriter, loc, output, loweringDetails.outputReassocIndices);
+      gemmOutputType = cast<ShapedType>(gemmOutput.getType());
+    }
+
     auto genericGEMMOp = linalg::GenericOp::create(
-        rewriter, loc, outputType,
+        rewriter, loc, gemmOutputType,
         /*inputs=*/
         isOutputChannelFirst ? ValueRange{reshapedFilter, img2ColTensor}
                              : ValueRange{img2ColTensor, reshapedFilter},
-        /*outputs=*/ValueRange{output}, igemmContractionMaps,
+        /*outputs=*/ValueRange{gemmOutput}, igemmContractionMaps,
         igemmLoopIterators,
         [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
           Value lhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[0],
@@ -417,7 +190,13 @@ public:
         });
     genericGEMMOp->setDiscardableAttrs(getPrunedAttributeList(linalgOp));
 
-    rewriter.replaceOp(linalgOp, genericGEMMOp.getResults().front());
+    Value result = genericGEMMOp.getResults().front();
+    if (!loweringDetails.outputReassocIndices.empty()) {
+      result = tensor::ExpandShapeOp::create(
+          rewriter, loc, outputType, result,
+          loweringDetails.outputReassocIndices);
+    }
+    rewriter.replaceOp(linalgOp, result);
     return success();
   }
 
