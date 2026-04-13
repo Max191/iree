@@ -3,6 +3,9 @@
 // RUN:   --mlir-print-ir-module-scope \
 // RUN:   --mlir-print-ir-after=iree-codegen-gpu-convert-thread-forall-to-subgroup-lane-pcf \
 // RUN:   --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(builtin.module(func.func(iree-llvmgpu-lower-executable-target{for-rocdl=true})))))" %s 2>&1 | FileCheck %s
+// RUN: iree-opt --split-input-file --iree-gpu-test-target=gfx942 \
+// RUN:   --mlir-disable-threading \
+// RUN:   --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(builtin.module(func.func(iree-llvmgpu-lower-executable-target{for-rocdl=true}), iree-pcf-resolve-tokens, iree-pcf-convert-sref-to-memref, iree-pcf-lower-structural-pcf, canonicalize, cse))))" %s | FileCheck %s --check-prefix=LOWERED
 
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   #hal.pipeline.binding<storage_buffer>,
@@ -55,3 +58,12 @@ hal.executable public @main {
 // CHECK-SAME: scope(#iree_gpu.subgroup_scope)
 // CHECK: pcf.generic
 // CHECK-SAME: scope(#iree_gpu.lane_scope)
+
+// LOWERED-LABEL: func.func @thread_forall_to_pcf_pipeline
+// LOWERED-NOT: pcf.
+// LOWERED: memref.alloc() {alignment = 16 : i64} : memref<64x4xf16, #gpu.address_space<workgroup>>
+// LOWERED: gpu.subgroup_id : index
+// LOWERED: gpu.lane_id
+// LOWERED: memref.copy
+// LOWERED: vector.transfer_read
+// LOWERED: vector.transfer_write

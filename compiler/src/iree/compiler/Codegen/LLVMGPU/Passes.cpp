@@ -16,6 +16,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Passes.h"
+#include "iree/compiler/Codegen/Dialect/PCF/Transforms/Passes.h"
 #include "iree/compiler/Codegen/LLVMGPU/LLVMGPUConstraintGenerator.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
 #include "iree/compiler/Codegen/LLVMGPU/ROCDLPasses.h"
@@ -1080,6 +1081,19 @@ addLowerAndOptimizeAddressComputationPasses(FunctionLikeNest &funcPassManager) {
 
 static void addLowerToLLVMGPUPasses(OpPassManager &modulePassManager,
                                     bool forROCDL, bool preserveDebugInfo) {
+  // Lower PCF ops to memref/scf/cf before the generic LLVMGPU lowering kicks
+  // in. By this point the TileAndFuse PCF path has already been bufferized and
+  // the late IREE GPU lowering has expanded barrier_region ops, which matches
+  // the preconditions of the shared-exec lowering sequence.
+  if (forROCDL) {
+    FunctionLikeNest(modulePassManager)
+        .addPass(IREE::PCF::createResolveTokensPass)
+        .addPass(IREE::PCF::createConvertSRefToMemRefPass)
+        .addPass(IREE::PCF::createLowerStructuralPCFPass)
+        .addPass(createCanonicalizerPass)
+        .addPass(createCSEPass);
+  }
+
   modulePassManager.addPass(
       createConvertHALDescriptorTypeToGPUAddressSpacePass());
   modulePassManager.addPass(createCanonicalizerPass());

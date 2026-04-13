@@ -29,6 +29,7 @@ struct LowerIREEGPUOpsPass final
 void LowerIREEGPUOpsPass::runOnOperation() {
   MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
+  populateIREEGPULowerBarrierRegionPatterns(patterns);
   populateIREEGPULowerValueBarrierPatterns(patterns);
   populateIREEGPULowerInnerTiledPatterns(patterns);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
