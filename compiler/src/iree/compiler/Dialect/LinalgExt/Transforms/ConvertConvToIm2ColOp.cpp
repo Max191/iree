@@ -91,6 +91,46 @@ computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
   return inputKPerm;
 }
 
+static SmallVector<unsigned> getInputSemanticDimsInOrder(
+    AffineMap inputMap, ArrayRef<unsigned> promotedBatchDims,
+    ArrayRef<unsigned> outputImageDims, ArrayRef<unsigned> inputChannelDims) {
+  llvm::SmallDenseSet<unsigned, 4> promotedBatchDimSet(
+      promotedBatchDims.begin(), promotedBatchDims.end());
+  llvm::SmallDenseSet<unsigned, 4> outputImageDimSet(outputImageDims.begin(),
+                                                     outputImageDims.end());
+  llvm::SmallDenseSet<unsigned, 4> inputChannelDimSet(inputChannelDims.begin(),
+                                                      inputChannelDims.end());
+  llvm::SmallDenseSet<unsigned, 8> capturedDims;
+  SmallVector<unsigned> inputOrderDims;
+  for (AffineExpr inputExpr : inputMap.getResults()) {
+    llvm::SmallDenseSet<unsigned, 4> dimsForInput;
+    inputExpr.walk([&](AffineExpr expr) {
+      if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+        dimsForInput.insert(dimExpr.getPosition());
+      }
+    });
+
+    auto appendFirstMatching = [&](const llvm::SmallDenseSet<unsigned, 4> &set) {
+      for (unsigned dim : dimsForInput) {
+        if (set.contains(dim) && capturedDims.insert(dim).second) {
+          inputOrderDims.push_back(dim);
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (appendFirstMatching(promotedBatchDimSet)) {
+      continue;
+    }
+    if (appendFirstMatching(outputImageDimSet)) {
+      continue;
+    }
+    (void)appendFirstMatching(inputChannelDimSet);
+  }
+  return inputOrderDims;
+}
+
 namespace {
 
 using ControlFnTy = std::function<bool(Operation *)>;
@@ -177,7 +217,7 @@ public:
     AffineMap filterMap = indexingMaps[1];
     AffineMap outputMap = indexingMaps[2];
 
-    SmallVector<OpFoldResult> kernelSizes;
+    SmallVector<OpFoldResult> spatialKernelSizes;
     for (auto filterLoop : convDims.filterLoop) {
       std::optional<int64_t> maybeDim = filterMap.getResultPosition(
           getAffineDimExpr(filterLoop, filterMap.getContext()));
@@ -185,40 +225,60 @@ public:
         return rewriter.notifyMatchFailure(linalgOp,
                                            "Failed to infer filter shape.");
       }
-      kernelSizes.push_back(
+      spatialKernelSizes.push_back(
           rewriter.getIndexAttr(filterShape[maybeDim.value()]));
     }
 
-    // Batch dims for the im2col also include the depth/group dimensions of the
-    // conv.
+    // True GEMM batch dims are only the convolution depth/group dims. The
+    // convolution batch dims participate in the GEMM M space instead.
     SmallVector<int64_t> outputPerm = igemmConvDetails.im2colOutputPerm;
-    auto im2colBatchIterDims =
-        llvm::to_vector(llvm::concat<unsigned>(convDims.depth, convDims.batch));
+    SmallVector<unsigned> im2colBatchIterDims(convDims.depth.begin(),
+                                              convDims.depth.end());
     SmallVector<int64_t> batchPos(im2colBatchIterDims.size());
-    for (int64_t convDim : im2colBatchIterDims) {
+    for (auto [idx, convDim] : llvm::enumerate(im2colBatchIterDims)) {
       AffineExpr convDimExpr = getAffineDimExpr(convDim, getContext());
       int64_t im2colInputDim = inputMap.getResultPosition(convDimExpr).value();
-
-      AffineExpr igemmDimExpr = igemmConvDetails.convToIgemmDimMap.at(convDim);
-      int64_t igemmInputDim = igemmConvDetails.getIgemmInputImageMap()
-                                  .getResultPosition(igemmDimExpr)
-                                  .value();
-      batchPos[outputPerm[igemmInputDim]] = im2colInputDim;
+      batchPos[idx] = im2colInputDim;
     }
 
     SmallVector<int64_t> mPos;
     SmallVector<int64_t> mShape;
-    for (auto outputImage : convDims.outputImage) {
+    SmallVector<int64_t> im2colStrides;
+    SmallVector<int64_t> im2colDilations;
+    SmallVector<OpFoldResult> kernelSizes;
+    SmallVector<unsigned> im2colMDims;
+    im2colMDims.append(convDims.batch.begin(), convDims.batch.end());
+    im2colMDims.append(convDims.outputImage.begin(), convDims.outputImage.end());
+    DenseMap<unsigned, unsigned> outputImageToPos;
+    for (auto [idx, dim] : llvm::enumerate(convDims.outputImage)) {
+      outputImageToPos[dim] = idx;
+    }
+    DenseMap<unsigned, unsigned> filterLoopToPos;
+    for (auto [idx, dim] : llvm::enumerate(convDims.filterLoop)) {
+      filterLoopToPos[dim] = idx;
+    }
+
+    for (unsigned mDim : im2colMDims) {
       for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(outputImage)) {
+        if (e.isFunctionOfDim(mDim)) {
           mPos.push_back(idx);
         }
       }
       for (auto [idx, e] : llvm::enumerate(outputMap.getResults())) {
-        if (e.isFunctionOfDim(outputImage)) {
+        if (e.isFunctionOfDim(mDim)) {
           mShape.push_back(outputShape[idx]);
         }
       }
+      if (llvm::is_contained(convDims.batch, mDim)) {
+        im2colStrides.push_back(1);
+        im2colDilations.push_back(1);
+        kernelSizes.push_back(rewriter.getIndexAttr(1));
+        continue;
+      }
+      unsigned spatialIdx = outputImageToPos.lookup(mDim);
+      im2colStrides.push_back(convDims.strides[spatialIdx]);
+      im2colDilations.push_back(convDims.dilations[spatialIdx]);
+      kernelSizes.push_back(spatialKernelSizes[spatialIdx]);
     }
 
     SmallVector<int64_t> kPos;
@@ -229,9 +289,6 @@ public:
         }
       }
     }
-    SmallVector<int64_t> inputKPerm =
-        computeInputKPerm(inputMap, filterMap, convDims);
-
     // Build unified offsets and output_sizes for the im2col op.
     // Canonical output dim order: [batch dims, M (1 dim), K dims].
     // At conv-to-im2col time all offsets are zero.
@@ -252,16 +309,45 @@ public:
     // becomes one K output dim whose inner sizes are the original filter
     // dim sizes in that group.
     SmallVector<SmallVector<int64_t>> kInnerSizes;
+    SmallVector<unsigned> outputKSemanticDims(convDims.batch.begin(),
+                                              convDims.batch.end());
+    bool insertedSyntheticBatchKDims = false;
     for (const auto &indices : filterReassocIndices) {
       bool isParallel =
           indices.size() == 1 && parallelFilterDims.contains(indices[0]);
       if (!isParallel) {
         SmallVector<int64_t> innerSizes;
+        if (!insertedSyntheticBatchKDims) {
+          innerSizes.append(convDims.batch.size(), 1);
+          insertedSyntheticBatchKDims = true;
+        }
         for (int64_t idx : indices) {
+          unsigned convDim =
+              cast<AffineDimExpr>(filterMap.getResult(idx)).getPosition();
           innerSizes.push_back(filterShape[idx]);
+          if (filterLoopToPos.contains(convDim)) {
+            outputKSemanticDims.push_back(
+                convDims.outputImage[filterLoopToPos.lookup(convDim)]);
+            continue;
+          }
+          outputKSemanticDims.push_back(convDim);
         }
         kInnerSizes.push_back(innerSizes);
       }
+    }
+    if (!insertedSyntheticBatchKDims && !convDims.batch.empty()) {
+      kInnerSizes.push_back(SmallVector<int64_t>(convDims.batch.size(), 1));
+    }
+
+    SmallVector<unsigned> inputOrderSemanticDims = getInputSemanticDimsInOrder(
+        inputMap, convDims.batch, convDims.outputImage, convDims.inputChannel);
+    SmallVector<int64_t> inputKPerm;
+    inputKPerm.reserve(outputKSemanticDims.size());
+    for (unsigned dim : outputKSemanticDims) {
+      auto it = llvm::find(inputOrderSemanticDims, dim);
+      assert(it != inputOrderSemanticDims.end() &&
+             "expected K dim to be representable in input order");
+      inputKPerm.push_back(std::distance(inputOrderSemanticDims.begin(), it));
     }
 
     int64_t numOutputDims =
@@ -303,9 +389,9 @@ public:
                                               inputType.getElementType());
     Value img2ColTensor =
         IREE::LinalgExt::Im2colOp::create(
-            rewriter, loc, input, /*output=*/colTensor, convDims.strides,
-            convDims.dilations, kernelSizes, offsets, outputSizes, batchPos,
-            mPos, kPos, inputKPerm, outputPerm)
+            rewriter, loc, input, /*output=*/colTensor, im2colStrides,
+            im2colDilations, kernelSizes, offsets, outputSizes, batchPos, mPos,
+            kPos, inputKPerm, outputPerm)
             .getResult(0);
 
     Value reshapedFilter = tensor::CollapseShapeOp::create(

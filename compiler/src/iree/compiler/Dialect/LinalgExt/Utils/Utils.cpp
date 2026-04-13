@@ -636,14 +636,17 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
     return mapped;
   };
 
+  SmallVector<unsigned> gemmBatchDims(convDims.depth.begin(),
+                                      convDims.depth.end());
+  SmallVector<unsigned> gemmMDims(convDims.batch.begin(), convDims.batch.end());
+  gemmMDims.append(convDims.outputImage.begin(), convDims.outputImage.end());
+
   // Prepare the input map.
   SmallVector<AffineExpr> inputDims;
-  // Add the batch dims.
-  inputDims.append(remapDims(convDims.batch));
-  // Add the depth (group) dims.
-  inputDims.append(remapDims(convDims.depth));
-  // Add the M dims.
-  inputDims.append(remapDims(convDims.outputImage));
+  // Add the true GEMM batch dims first (depth/group dims).
+  inputDims.append(remapDims(gemmBatchDims));
+  // Add all GEMM M dims next, including convolution batch dims.
+  inputDims.append(remapDims(gemmMDims));
   // Add the reduction dims at the end.
   inputDims.append(dims.begin() + numParallelDims, dims.end());
   auto inputMapGEMM =
