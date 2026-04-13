@@ -690,6 +690,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
                             /*enableMasking=*/true,
                             /*foldIdentitySlices=*/true,
                             /*decomposeMasks=*/false);
+  funcPassManager.addPass(createGPUConvertThreadForallToSubgroupLanePCFPass());
   funcPassManager.addPass(createCleanupBufferAllocViewPass());
   funcPassManager.addPass(createGPUCombineValueSemanticBarriersPass());
 

@@ -149,3 +149,93 @@ func.func @test_barrier_chain_to_pcf(%arg0: tensor<128x128xf16>,
 //  CHECK-SAME:         : !pcf.sref<8x16x4xf16, #iree_gpu.subgroup_scope> to !pcf.sref<16x4xf16, #iree_gpu.subgroup_scope>
 //       CHECK:       pcf.read_slice %[[SUB]]
 //  CHECK-SAME:         : !pcf.sref<16x4xf16, #iree_gpu.subgroup_scope> to vector<16x4xf16>
+
+// -----
+
+// Test the post-vectorization barrier refill pattern where the barrier body
+// directly updates shared memory with tensor.extract_slice/linalg.copy/
+// tensor.insert_slice and later vector.transfer_read ops consume the barrier
+// results. The shared memory update chain should become pcf.write_slice and the
+// vector reads should become pcf.read_slice.
+
+func.func @test_vectorized_barrier_chain_to_pcf(%lhs: tensor<64x4xf16>,
+    %rhs: tensor<64x4xf16>, %init: tensor<64x64xf32>) -> tensor<64x64xf32> {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.0 : f16
+  %acc = arith.constant dense<0.000000e+00> : vector<8x4xf32>
+  %result = scf.forall (%i, %j) in (8, 16) shared_outs(%out = %init)
+      -> tensor<64x64xf32> {
+    %row8 = affine.apply affine_map<(d0) -> (d0 * 8)>(%i)
+    %row4 = affine.apply affine_map<(d0) -> (d0 * 4)>(%j)
+    %out_slice = tensor.extract_slice %out[%row8, %row4] [8, 4] [1, 1]
+        : tensor<64x64xf32> to tensor<8x4xf32>
+    %lhs_alloc = bufferization.alloc_tensor()
+        {memory_space = #gpu.address_space<workgroup>}
+        : tensor<64x4xf16>
+    %rhs_alloc = bufferization.alloc_tensor()
+        {memory_space = #gpu.address_space<workgroup>}
+        : tensor<64x4xf16>
+    %barrier:2 = iree_gpu.barrier_region ins(%lhs_alloc, %rhs_alloc :
+          tensor<64x4xf16>, tensor<64x4xf16>) {
+    ^bb0(%shared_lhs: tensor<64x4xf16>, %shared_rhs: tensor<64x4xf16>):
+      %lhs_src = tensor.extract_slice %lhs[%row8, %c0] [1, 2] [1, 1]
+          : tensor<64x4xf16> to tensor<1x2xf16>
+      %lhs_dst = tensor.extract_slice %shared_lhs[%row8, %c0] [1, 2] [1, 1]
+          : tensor<64x4xf16> to tensor<1x2xf16>
+      %lhs_copy = linalg.copy
+          {lowering_config = #iree_gpu.derived_thread_config}
+          ins(%lhs_src : tensor<1x2xf16>)
+          outs(%lhs_dst : tensor<1x2xf16>) -> tensor<1x2xf16>
+      %lhs_updated = tensor.insert_slice %lhs_copy into
+          %shared_lhs[%row8, %c0] [1, 2] [1, 1]
+          : tensor<1x2xf16> into tensor<64x4xf16>
+      %rhs_src = tensor.extract_slice %rhs[%row4, %c0] [1, 2] [1, 1]
+          : tensor<64x4xf16> to tensor<1x2xf16>
+      %rhs_dst = tensor.extract_slice %shared_rhs[%row4, %c0] [1, 2] [1, 1]
+          : tensor<64x4xf16> to tensor<1x2xf16>
+      %rhs_copy = linalg.copy
+          {lowering_config = #iree_gpu.derived_thread_config}
+          ins(%rhs_src : tensor<1x2xf16>)
+          outs(%rhs_dst : tensor<1x2xf16>) -> tensor<1x2xf16>
+      %rhs_updated = tensor.insert_slice %rhs_copy into
+          %shared_rhs[%row4, %c0] [1, 2] [1, 1]
+          : tensor<1x2xf16> into tensor<64x4xf16>
+      iree_gpu.yield %lhs_updated, %rhs_updated
+          : tensor<64x4xf16>, tensor<64x4xf16>
+    } : tensor<64x4xf16>, tensor<64x4xf16>
+    %lhs_read = vector.transfer_read %barrier#0[%row8, %c0], %cst
+        {in_bounds = [true, true]}
+        : tensor<64x4xf16>, vector<8x4xf16>
+    %rhs_read = vector.transfer_read %barrier#1[%row4, %c0], %cst
+        {in_bounds = [true, true]}
+        : tensor<64x4xf16>, vector<4x4xf16>
+    %contract = vector.contract
+        {indexing_maps = [
+            affine_map<(d0, d1, d2) -> (d0, d2)>,
+            affine_map<(d0, d1, d2) -> (d1, d2)>,
+            affine_map<(d0, d1, d2) -> (d0, d1)>
+          ],
+         iterator_types = ["parallel", "parallel", "reduction"],
+         kind = #vector.kind<add>} %lhs_read, %rhs_read, %acc
+         : vector<8x4xf16>, vector<4x4xf16> into vector<8x4xf32>
+    %written = vector.transfer_write %contract, %out_slice[%c0, %c0]
+        {in_bounds = [true, true]}
+        : vector<8x4xf32>, tensor<8x4xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %written into %out[%row8, %row4] [8, 4]
+          [1, 1] : tensor<8x4xf32> into tensor<64x64xf32>
+    }
+  } {mapping = [#gpu.thread<linear_dim_1>, #gpu.thread<linear_dim_0>]}
+  return %result : tensor<64x64xf32>
+}
+
+// CHECK-LABEL: func.func @test_vectorized_barrier_chain_to_pcf
+//   CHECK-DAG:   %[[LHS_ALLOC:.+]] = pcf.alloc() : !pcf.sref<64x4xf16, #iree_gpu.subgroup_scope>
+//   CHECK-DAG:   %[[RHS_ALLOC:.+]] = pcf.alloc() : !pcf.sref<64x4xf16, #iree_gpu.subgroup_scope>
+//       CHECK:   %[[BARRIER:.+]]:2 = iree_gpu.barrier_region ins(%[[LHS_ALLOC]], %[[RHS_ALLOC]]
+//       CHECK:   ^bb0(%[[SHARED_LHS:.+]]: !pcf.sref<64x4xf16, #iree_gpu.subgroup_scope>, %[[SHARED_RHS:.+]]: !pcf.sref<64x4xf16, #iree_gpu.subgroup_scope>):
+//       CHECK:     pcf.write_slice
+//       CHECK:     pcf.write_slice
+//       CHECK:     iree_gpu.yield %[[SHARED_LHS]], %[[SHARED_RHS]]
+//       CHECK:   %[[LHS_READ:.+]] = pcf.read_slice %[[BARRIER]]#0
+//       CHECK:   %[[RHS_READ:.+]] = pcf.read_slice %[[BARRIER]]#1

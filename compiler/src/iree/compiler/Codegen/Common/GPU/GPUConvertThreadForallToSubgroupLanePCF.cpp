@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -147,6 +148,74 @@ static IREE::PCF::ScopeAttrInterface findOutermostScope(Operation *op) {
   return result;
 }
 
+/// Rewrites direct tensor.extract_slice reads from a barrier_region block arg as
+/// pcf.read_slice operations. The extract ops must be collected while the
+/// barrier block arg is still tensor-typed, but are rewritten after the block
+/// arg has been retargeted to pcf.sref.
+static void convertBarrierBlockArgReads(IRRewriter &rewriter,
+                                        BlockArgument tensorBlockArg,
+                                        ArrayRef<tensor::ExtractSliceOp> extractOps) {
+  for (tensor::ExtractSliceOp extractOp : extractOps) {
+    rewriter.setInsertionPoint(extractOp);
+    ShapedType resultType = extractOp.getResultType();
+
+    auto pcfRead = IREE::PCF::ReadSliceOp::create(
+        rewriter, extractOp.getLoc(), resultType, tensorBlockArg,
+        extractOp.getMixedOffsets(), extractOp.getMixedSizes(),
+        extractOp.getMixedStrides());
+    rewriter.replaceOp(extractOp, pcfRead.getResult());
+  }
+}
+
+/// Rewrites direct tensor.insert_slice updates into a barrier_region block arg
+/// as pcf.write_slice operations. The insert ops must be collected while the
+/// barrier block arg is still tensor-typed, but are rewritten after the block
+/// arg has been retargeted to pcf.sref.
+static void convertBarrierBlockArgWrites(IRRewriter &rewriter,
+                                         BlockArgument tensorBlockArg,
+                                         Value srefDest,
+                                         ArrayRef<tensor::InsertSliceOp> insertOps) {
+  for (tensor::InsertSliceOp insertOp : insertOps) {
+    rewriter.setInsertionPoint(insertOp);
+    IREE::PCF::WriteSliceOp::create(
+        rewriter, insertOp.getLoc(), insertOp.getSource(), srefDest,
+        insertOp.getMixedOffsets(), insertOp.getMixedSizes(),
+        insertOp.getMixedStrides());
+
+    insertOp.getResult().replaceAllUsesWith(tensorBlockArg);
+    rewriter.eraseOp(insertOp);
+  }
+}
+
+/// Folds `linalg.copy` producers into `pcf.write_slice` sources. This cleans up
+/// the post-vectorization refill pattern after direct barrier block arg reads
+/// have already been rewritten to `pcf.read_slice`.
+static void foldCopiesIntoPcfWrites(IRRewriter &rewriter, Operation *funcOp) {
+  SmallVector<IREE::PCF::WriteSliceOp> writeOps;
+  funcOp->walk([&](IREE::PCF::WriteSliceOp writeOp) { writeOps.push_back(writeOp); });
+
+  for (IREE::PCF::WriteSliceOp writeOp : writeOps) {
+    auto copyOp = writeOp.getSource().getDefiningOp<linalg::CopyOp>();
+    if (!copyOp || copyOp.getInputs().size() != 1 || copyOp.getOutputs().size() != 1 ||
+        !copyOp->hasOneUse()) {
+      continue;
+    }
+
+    Value copyInput = copyOp.getInputs().front();
+    Operation *copyDestProducer = copyOp.getOutputs().front().getDefiningOp();
+
+    writeOp->setOperand(0, copyInput);
+
+    if (copyOp->use_empty()) {
+      rewriter.eraseOp(copyOp);
+    }
+    if (copyDestProducer && copyDestProducer->use_empty() &&
+        isa<IREE::PCF::ReadSliceOp, tensor::ExtractSliceOp>(copyDestProducer)) {
+      rewriter.eraseOp(copyDestProducer);
+    }
+  }
+}
+
 /// Convert barrier_region chains from tensor to sref semantics.
 /// Pattern: bufferization.alloc_tensor → barrier_region → consumer chain.
 /// Converts to: pcf.alloc → barrier_region(sref) → pcf ops.
@@ -265,16 +334,35 @@ static void convertBarrierChainToSref(IRRewriter &rewriter,
       }
 
       // Phase B: Now safe to change the block arg type and barrier operand.
+      SmallVector<tensor::ExtractSliceOp> barrierBlockArgReads;
+      body.walk([&](tensor::ExtractSliceOp extractOp) {
+        if (extractOp.getSource() == blockArg) {
+          barrierBlockArgReads.push_back(extractOp);
+        }
+      });
+      SmallVector<tensor::InsertSliceOp> barrierBlockArgWrites;
+      body.walk([&](tensor::InsertSliceOp insertOp) {
+        if (insertOp.getDest() == blockArg) {
+          barrierBlockArgWrites.push_back(insertOp);
+        }
+      });
+
       barrierOp.setOperand(inputIdx, srefAlloc);
       blockArg.setType(srefType);
 
+      // Rewrite direct tensor read/write chains on the barrier block arg into
+      // pcf.read_slice/pcf.write_slice. This is the post-vectorization form
+      // where the barrier body directly refills shared memory and later vector
+      // reads consume the barrier results.
+      convertBarrierBlockArgReads(rewriter, blockArg, barrierBlockArgReads);
+      convertBarrierBlockArgWrites(rewriter, blockArg, srefAlloc,
+                                   barrierBlockArgWrites);
+
       // Update the yield op to yield the sref block arg.
       auto yieldOp = cast<IREE::GPU::YieldOp>(body.getTerminator());
-      for (auto [idx, yieldOperand] :
-           llvm::enumerate(yieldOp.getOperands())) {
-        if (yieldOperand.getType() == tensorType) {
-          yieldOp.setOperand(idx, blockArg);
-        }
+      if (inputIdx < yieldOp.getNumOperands() &&
+          yieldOp.getOperand(inputIdx).getType() == tensorType) {
+        yieldOp.setOperand(inputIdx, blockArg);
       }
 
       // Update barrier_region result types to sref and convert consumers.
@@ -334,6 +422,10 @@ struct GPUConvertThreadForallToSubgroupLanePCFPass final
     // Walk the whole function since alloc_tensors may live outside the
     // pcf.generic nests (e.g. at workgroup scope).
     convertBarrierChainToSref(rewriter, getOperation());
+
+    // Phase 3: Fold temporary tensor copies introduced by refill patterns into
+    // the pcf.write_slice operations that now materialize those writes.
+    foldCopiesIntoPcfWrites(rewriter, getOperation());
   }
 };
 
