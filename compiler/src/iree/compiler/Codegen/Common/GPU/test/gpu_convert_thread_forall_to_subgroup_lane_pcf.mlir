@@ -239,3 +239,6 @@ func.func @test_vectorized_barrier_chain_to_pcf(%lhs: tensor<64x4xf16>,
 //       CHECK:     iree_gpu.yield %[[SHARED_LHS]], %[[SHARED_RHS]]
 //       CHECK:   %[[LHS_READ:.+]] = pcf.read_slice %[[BARRIER]]#0
 //       CHECK:   %[[RHS_READ:.+]] = pcf.read_slice %[[BARRIER]]#1
+//       CHECK:   %[[CONTRACT:.+]] = vector.contract
+//   CHECK-NOT:   vector.transfer_write
+//       CHECK:   pcf.write_slice %[[CONTRACT]]

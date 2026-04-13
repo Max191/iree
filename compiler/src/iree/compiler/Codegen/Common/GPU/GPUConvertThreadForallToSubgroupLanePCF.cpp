@@ -216,6 +216,54 @@ static void foldCopiesIntoPcfWrites(IRRewriter &rewriter, Operation *funcOp) {
   }
 }
 
+/// Returns true if `writeOp` writes a vector to a tensor of the same shape,
+/// fully overwriting the tensor result.
+static bool isFullTensorWrite(vector::TransferWriteOp writeOp) {
+  if (writeOp.hasOutOfBoundsDim() || writeOp.getMask()) {
+    return false;
+  }
+  if (!writeOp.getPermutationMap().isIdentity()) {
+    return false;
+  }
+
+  auto resultType = dyn_cast<RankedTensorType>(writeOp->getResult(0).getType());
+  if (!resultType) {
+    return false;
+  }
+  VectorType vectorType = writeOp.getVectorType();
+  if (resultType.getRank() != vectorType.getRank()) {
+    return false;
+  }
+  if (resultType.getShape() != vectorType.getShape()) {
+    return false;
+  }
+  return llvm::all_of(writeOp.getIndices(), [](Value index) {
+    return matchPattern(index, m_Zero());
+  });
+}
+
+/// Folds a full-tensor vector.transfer_write into a downstream pcf.write_slice
+/// so that the write_slice directly writes the vector value.
+static void foldTransferWritesIntoPcfWrites(IRRewriter &rewriter,
+                                            Operation *funcOp) {
+  SmallVector<IREE::PCF::WriteSliceOp> writeOps;
+  funcOp->walk([&](IREE::PCF::WriteSliceOp writeOp) { writeOps.push_back(writeOp); });
+
+  for (IREE::PCF::WriteSliceOp writeOp : writeOps) {
+    auto transferWrite =
+        writeOp.getSource().getDefiningOp<vector::TransferWriteOp>();
+    if (!transferWrite || !transferWrite->hasOneUse() ||
+        !isFullTensorWrite(transferWrite)) {
+      continue;
+    }
+
+    writeOp->setOperand(0, transferWrite.getVector());
+    if (transferWrite->use_empty()) {
+      rewriter.eraseOp(transferWrite);
+    }
+  }
+}
+
 /// Convert barrier_region chains from tensor to sref semantics.
 /// Pattern: bufferization.alloc_tensor → barrier_region → consumer chain.
 /// Converts to: pcf.alloc → barrier_region(sref) → pcf ops.
@@ -426,6 +474,7 @@ struct GPUConvertThreadForallToSubgroupLanePCFPass final
     // Phase 3: Fold temporary tensor copies introduced by refill patterns into
     // the pcf.write_slice operations that now materialize those writes.
     foldCopiesIntoPcfWrites(rewriter, getOperation());
+    foldTransferWritesIntoPcfWrites(rewriter, getOperation());
   }
 };
 
