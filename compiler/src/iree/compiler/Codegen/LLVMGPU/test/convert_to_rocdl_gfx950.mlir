@@ -44,6 +44,30 @@ module {
 
 // -----
 
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>
+]>
+module {
+  func.func @num_subgroups_lowering() {
+    %c0 = arith.constant 0 : index
+    %out = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) : memref<1xi32>
+    %num_subgroups = gpu.num_subgroups : index
+    %num_subgroups_i32 = arith.index_castui %num_subgroups : index to i32
+    memref.store %num_subgroups_i32, %out[%c0] : memref<1xi32>
+    return
+  }
+}
+
+// CHECK-LABEL: llvm.func @num_subgroups_lowering
+//   CHECK-NOT: gpu.num_subgroups
+//       CHECK: llvm.call @__ockl_get_local_size(
+//       CHECK: llvm.call @__ockl_get_local_size(
+//       CHECK: llvm.call @__ockl_get_local_size(
+//       CHECK: rocdl.wavefrontsize
+//       CHECK: llvm.udiv
+
+// -----
+
 // Verify that arith.truncf f32 to bf16 is NOT expanded on gfx950, which has
 // native bf16 conversion instructions (v_cvt_pk_bf16_f32).
 #pipeline_layout = #hal.pipeline.layout<bindings = [
