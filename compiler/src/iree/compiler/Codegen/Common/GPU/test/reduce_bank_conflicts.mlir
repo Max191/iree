@@ -130,6 +130,72 @@ func.func @pad_alloc_collapse_outer_shape(%v: vector<4xf32>) {
 
 // -----
 
+// CHECK-LABEL: func.func @pad_alloc_pcf_generic
+// CHECK:         %[[A:.*]] = memref.alloc() : memref<4x32x66xf32, #gpu.address_space<workgroup>>
+// CHECK:         %[[S0:.*]] = memref.subview %[[A]][0, 0, 0] [4, 32, 64] [1, 1, 1] :
+// CHECK-SAME:      memref<4x32x66xf32, #gpu.address_space<workgroup>> to memref<4x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>
+// CHECK:         %[[G:.*]] = pcf.generic scope(#pcf.test_scope)
+// CHECK:           execute(%{{.*}} = %[[S0]])[%{{.*}}: index, %{{.*}}: index]
+// CHECK:                : (!pcf.sref<4x32x64xf32, #pcf.test_scope>)
+// CHECK:               -> (memref<4x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>) {
+// CHECK:         %[[S1:.*]] = memref.subview %[[G]][0, 0, 0] [1, 32, 64] [1, 1, 1] :
+// CHECK-SAME:      memref<4x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>> to memref<1x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>
+// CHECK:           vector.transfer_write %{{.*}}, %[[S1]][%{{.*}}, %{{.*}}, %{{.*}}] {in_bounds = [true]} :
+// CHECK-SAME:      vector<4xf32>, memref<1x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>
+func.func @pad_alloc_pcf_generic(%a: memref<1024x1024xf32>) {
+  %0 = memref.alloc() : memref<4x32x64xf32, #gpu.address_space<workgroup>>
+  %1 = pcf.generic scope(#pcf.test_scope)
+    execute(%ref = %0)[%id: index, %n: index]
+         : (!pcf.sref<4x32x64xf32, #pcf.test_scope>)
+        -> (memref<4x32x64xf32, #gpu.address_space<workgroup>>) {
+    pcf.return
+  }
+  %2 = memref.subview %1[0, 0, 0] [1, 32, 64] [1, 1, 1] :
+    memref<4x32x64xf32, #gpu.address_space<workgroup>> to memref<1x32x64xf32, strided<[2048, 64, 1]>, #gpu.address_space<workgroup>>
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %3 = vector.transfer_read %a[%c0, %c0], %cst {in_bounds = [true]} :
+    memref<1024x1024xf32>, vector<4xf32>
+  vector.transfer_write %3, %2[%c0, %c0, %c0] {in_bounds = [true]} :
+    vector<4xf32>, memref<1x32x64xf32, strided<[2048, 64, 1]>, #gpu.address_space<workgroup>>
+  return
+}
+
+// -----
+
+// CHECK-LABEL: func.func @pad_alloc_pcf_loop
+// CHECK:         %[[A:.*]] = memref.alloc() : memref<4x32x66xf32, #gpu.address_space<workgroup>>
+// CHECK:         %[[S0:.*]] = memref.subview %[[A]][0, 0, 0] [4, 32, 64] [1, 1, 1] :
+// CHECK-SAME:      memref<4x32x66xf32, #gpu.address_space<workgroup>> to memref<4x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>
+// CHECK:         %[[L:.*]] = pcf.loop scope(#pcf.test_scope) count(%{{.*}})
+// CHECK:           execute(%{{.*}} = %[[S0]])[%{{.*}}: index]
+// CHECK:                : (!pcf.sref<4x32x64xf32, #pcf.test_scope>)
+// CHECK:               -> (memref<4x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>) {
+// CHECK:         %[[S1:.*]] = memref.subview %[[L]][0, 0, 0] [1, 32, 64] [1, 1, 1] :
+// CHECK-SAME:      memref<4x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>> to memref<1x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>
+// CHECK:           vector.transfer_write %{{.*}}, %[[S1]][%{{.*}}, %{{.*}}, %{{.*}}] {in_bounds = [true]} :
+// CHECK-SAME:      vector<4xf32>, memref<1x32x64xf32, strided<[2112, 66, 1]>, #gpu.address_space<workgroup>>
+func.func @pad_alloc_pcf_loop(%a: memref<1024x1024xf32>, %n: index) {
+  %0 = memref.alloc() : memref<4x32x64xf32, #gpu.address_space<workgroup>>
+  %1 = pcf.loop scope(#pcf.test_scope) count(%n)
+    execute(%ref = %0)[%id: index]
+         : (!pcf.sref<4x32x64xf32, #pcf.test_scope>)
+        -> (memref<4x32x64xf32, #gpu.address_space<workgroup>>) {
+    pcf.return
+  }
+  %2 = memref.subview %1[0, 0, 0] [1, 32, 64] [1, 1, 1] :
+    memref<4x32x64xf32, #gpu.address_space<workgroup>> to memref<1x32x64xf32, strided<[2048, 64, 1]>, #gpu.address_space<workgroup>>
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %3 = vector.transfer_read %a[%c0, %c0], %cst {in_bounds = [true]} :
+    memref<1024x1024xf32>, vector<4xf32>
+  vector.transfer_write %3, %2[%c0, %c0, %c0] {in_bounds = [true]} :
+    vector<4xf32>, memref<1x32x64xf32, strided<[2048, 64, 1]>, #gpu.address_space<workgroup>>
+  return
+}
+
+// -----
+
 // CHECK-LABEL: func.func @pad_alloc_negative
 // CHECK:         memref.alloc(%{{.*}}) : memref<?x32x64xf32, #gpu.address_space<workgroup>
 func.func @pad_alloc_negative(%a: memref<1024x1024xf32>, %i: index, %v: vector<4xf32>) {

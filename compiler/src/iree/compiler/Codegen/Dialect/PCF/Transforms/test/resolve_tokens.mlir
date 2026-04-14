@@ -109,3 +109,27 @@ func.func @convert_alloc(%d0: index) -> !pcf.sref<?x5xi32, sync(#pcf.test_scope)
 //  CHECK-SAME:   %[[D0:[A-Za-z0-9]+]]: index
 //       CHECK:   %[[ALLOC:.+]] = pcf.alloc(%[[D0]]) : !pcf.sref<?x5xi32, #pcf.test_scope>
 //       CHECK:   return %[[ALLOC]] : !pcf.sref<?x5xi32, #pcf.test_scope>
+
+// -----
+
+func.func @convert_shape_and_read_ops(%ref: !pcf.sref<8x16x4xf16, sync(#pcf.test_scope)>, %i: index) {
+  %sub = pcf.subview %ref[%i, 0, 0] [1, 16, 4] [1, 1, 1]
+    : !pcf.sref<8x16x4xf16, sync(#pcf.test_scope)> to !pcf.sref<16x4xf16, sync(#pcf.test_scope)>
+  %expanded = pcf.expand_shape %sub [[0], [1, 2]]
+    : !pcf.sref<16x4xf16, sync(#pcf.test_scope)> into !pcf.sref<16x2x2xf16, sync(#pcf.test_scope)>
+  %read = pcf.read_slice %expanded[0, 0, 0] [4, 2, 2] [1, 1, 1]
+    : !pcf.sref<16x2x2xf16, sync(#pcf.test_scope)> to tensor<4x2x2xf16>
+  util.optimization_barrier %read : tensor<4x2x2xf16>
+  return
+}
+
+// CHECK-LABEL: @convert_shape_and_read_ops
+//  CHECK-SAME:   %[[REF:[A-Za-z0-9_]+]]: !pcf.sref<8x16x4xf16, #pcf.test_scope>
+//  CHECK-SAME:   %[[I:[A-Za-z0-9_]+]]: index
+//       CHECK:   %[[SUB:.+]] = pcf.subview %[[REF]][%[[I]], 0, 0] [1, 16, 4] [1, 1, 1]
+//  CHECK-SAME:     : !pcf.sref<8x16x4xf16, #pcf.test_scope> to !pcf.sref<16x4xf16, #pcf.test_scope>
+//       CHECK:   %[[EXP:.+]] = pcf.expand_shape %[[SUB]]
+//  CHECK-SAME:     : !pcf.sref<16x4xf16, #pcf.test_scope> into !pcf.sref<16x2x2xf16, #pcf.test_scope>
+//       CHECK:   %[[READ:.+]] = pcf.read_slice %[[EXP]][0, 0, 0] [4, 2, 2] [1, 1, 1]
+//  CHECK-SAME:     : !pcf.sref<16x2x2xf16, #pcf.test_scope> to tensor<4x2x2xf16>
+//       CHECK:   util.optimization_barrier %[[READ]]

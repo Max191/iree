@@ -242,3 +242,36 @@ func.func @test_vectorized_barrier_chain_to_pcf(%lhs: tensor<64x4xf16>,
 //       CHECK:   %[[CONTRACT:.+]] = vector.contract
 //   CHECK-NOT:   vector.transfer_write
 //       CHECK:   pcf.write_slice %[[CONTRACT]]
+
+// -----
+
+func.func @test_tied_init_transfer_read_to_pcf_read(
+    %init: tensor<1x4x1x1xf32>) -> tensor<1x4x1x1xf32> {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.0 : f32
+  %result = scf.forall (%i) in (64) shared_outs(%acc = %init)
+      -> tensor<1x4x1x1xf32> {
+    %read = vector.transfer_read %acc[%c0, %c0, %c0, %c0], %cst
+        {in_bounds = [true, true, true, true]}
+        : tensor<1x4x1x1xf32>, vector<1x4x1x1xf32>
+    %written = vector.transfer_write %read, %acc[%c0, %c0, %c0, %c0]
+        {in_bounds = [true, true, true, true]}
+        : vector<1x4x1x1xf32>, tensor<1x4x1x1xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %written into
+          %acc[%c0, %c0, %c0, %c0] [1, 4, 1, 1] [1, 1, 1, 1]
+          : tensor<1x4x1x1xf32> into tensor<1x4x1x1xf32>
+    }
+  } {mapping = [#gpu.thread<linear_dim_0>]}
+  return %result : tensor<1x4x1x1xf32>
+}
+
+// CHECK-LABEL: func.func @test_tied_init_transfer_read_to_pcf_read
+//       CHECK:   %[[RESULT:.+]] = pcf.generic
+//  CHECK-SAME:     scope(#iree_gpu.subgroup_scope)
+//       CHECK:     execute(%ref = %arg0)
+//   CHECK-NOT:     vector.transfer_read %arg0
+//       CHECK:       %[[READ:.+]] = pcf.read_slice %ref[%c0, %c0, %c0, %c0] [1, 4, 1, 1] [1, 1, 1, 1]
+//   CHECK-NOT:     vector.transfer_write
+//       CHECK:       pcf.write_slice %[[READ]] into %ref[%c0, %c0, %c0, %c0] [1, 4, 1, 1] [1, 1, 1, 1]
+//       CHECK:   return %[[RESULT]]

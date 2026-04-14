@@ -40,6 +40,20 @@ namespace mlir::iree_compiler::IREE::PCF {
 #include "iree/compiler/Codegen/Dialect/PCF/Transforms/Passes.h.inc"
 namespace {
 
+static SmallVector<ReassociationIndices>
+getReassociationIndices(ArrayAttr reassociationAttr) {
+  SmallVector<ReassociationIndices> reassociation;
+  reassociation.reserve(reassociationAttr.size());
+  for (Attribute groupAttr : reassociationAttr) {
+    ReassociationIndices group;
+    for (Attribute indexAttr : cast<ArrayAttr>(groupAttr)) {
+      group.push_back(cast<IntegerAttr>(indexAttr).getInt());
+    }
+    reassociation.push_back(std::move(group));
+  }
+  return reassociation;
+}
+
 class LoadDependentDialectExtension : public DialectExtensionBase {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LoadDependentDialectExtension)
@@ -281,6 +295,55 @@ ChangeStatus StridedLayoutValueElement::updateOpResult(
             MemRefType::get(resultType.getShape(), resultType.getElementType(),
                             MemRefLayoutAttrInterface{}, memSpace.value()));
         newState.indicateOptimisticFixpoint();
+      })
+      .Case([&](PCF::SubviewOp subviewOp) {
+        auto sourceState = solver.getElementFor<StridedLayoutValueElement>(
+            *this, Position::forValue(subviewOp.getSource()),
+            DFX::Resolution::REQUIRED);
+        if (!sourceState.isValidState()) {
+          newState.invalidate();
+          return;
+        }
+        MemRefType sourceType = sourceState.getAssumed();
+        if (!sourceType) {
+          return;
+        }
+        MemRefType resultType = memref::SubViewOp::inferRankReducedResultType(
+            subviewOp.getResultType().getShape(), sourceType,
+            subviewOp.getMixedOffsets(), subviewOp.getMixedSizes(),
+            subviewOp.getMixedStrides());
+        newState.setAssumed(resultType);
+        if (sourceState.isAtFixpoint()) {
+          newState.indicateOptimisticFixpoint();
+        }
+      })
+      .Case([&](PCF::ExpandShapeOp expandOp) {
+        auto sourceState = solver.getElementFor<StridedLayoutValueElement>(
+            *this, Position::forValue(expandOp.getSrc()),
+            DFX::Resolution::REQUIRED);
+        if (!sourceState.isValidState()) {
+          newState.invalidate();
+          return;
+        }
+        MemRefType sourceType = sourceState.getAssumed();
+        if (!sourceType) {
+          return;
+        }
+        FailureOr<MemRefType> resultType =
+            memref::ExpandShapeOp::computeExpandedType(
+                sourceType,
+                cast<PCF::ShapedRefType>(expandOp.getResult().getType())
+                    .getShape(),
+                getReassociationIndices(expandOp.getReassociation()));
+        if (failed(resultType)) {
+          expandOp->emitOpError("failed to infer converted expand_shape type");
+          newState.invalidate();
+          return;
+        }
+        newState.setAssumed(*resultType);
+        if (sourceState.isAtFixpoint()) {
+          newState.indicateOptimisticFixpoint();
+        }
       })
       .Case([&](RegionBranchOpInterface regionOp) {
         // For region branch ops get the result layout from the union of
@@ -885,6 +948,46 @@ struct ConvertGetMemrefOp final : OpConversionPattern<PCF::GetMemrefOp> {
   }
 };
 
+/// Converts `pcf.subview` to `memref.subview`.
+struct ConvertSubviewOp final : OpConversionPattern<PCF::SubviewOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(PCF::SubviewOp subviewOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType =
+        getTypeConverter()->convertType<MemRefType>(subviewOp.getResult());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(subviewOp,
+                                         "failed to convert subview result");
+    }
+    rewriter.replaceOpWithNewOp<memref::SubViewOp>(
+        subviewOp, resultType, adaptor.getSource(), subviewOp.getMixedOffsets(),
+        subviewOp.getMixedSizes(), subviewOp.getMixedStrides());
+    return success();
+  }
+};
+
+/// Converts `pcf.expand_shape` to `memref.expand_shape`.
+struct ConvertExpandShapeOp final : OpConversionPattern<PCF::ExpandShapeOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(PCF::ExpandShapeOp expandOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType =
+        getTypeConverter()->convertType<MemRefType>(expandOp.getResult());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(
+          expandOp, "failed to convert expand_shape result");
+    }
+    rewriter.replaceOpWithNewOp<memref::ExpandShapeOp>(
+        expandOp, resultType, adaptor.getSrc(), expandOp.getReassociation(),
+        expandOp.getOutputShape(), resultType.getShape());
+    return success();
+  }
+};
+
 /// Converts `pcf.alloc` to a `memref.alloc` with the requested memref type.
 /// The memory space was determined during the analysis using the scope and
 /// the alignment is set based on the preferred allocation alignment, also per
@@ -1192,7 +1295,8 @@ void ConvertSRefToMemRefPass::runOnOperation() {
   config.allowPatternRollback = false;
 
   patterns.add<ConvertGenericOp, ConvertLoopOp, ConvertWriteSliceOp,
-               ConvertReadSliceOp, ConvertGetMemrefOp, ConvertAllocOp,
+               ConvertReadSliceOp, ConvertGetMemrefOp, ConvertSubviewOp,
+               ConvertExpandShapeOp, ConvertAllocOp,
                ConvertOptimizationBarrier>(typeConverter, context);
 
   // Function related conversion patterns need the analysis to lookup function

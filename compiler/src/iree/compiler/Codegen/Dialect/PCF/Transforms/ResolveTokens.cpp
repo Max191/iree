@@ -71,6 +71,14 @@ static SmallVector<Value> flattenValues(ArrayRef<ValueRange> values) {
   return result;
 }
 
+static SmallVector<Value> withForwardedTokens(Value leading,
+                                              ValueRange expandedSRef) {
+  SmallVector<Value> result;
+  result.push_back(leading);
+  llvm::append_range(result, expandedSRef.drop_front());
+  return result;
+}
+
 /// Helper function for converting branch ops. This function converts the
 /// signature of the given block. If the new block signature is different from
 /// `expectedTypes`, returns "failure".
@@ -207,6 +215,80 @@ struct ConvertWriteSliceOp final : OpConversionPattern<PCF::WriteSliceOp> {
   }
 };
 
+struct ConvertSubviewOp final : OpConversionPattern<PCF::SubviewOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(PCF::SubviewOp subviewOp, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(
+            getTypeConverter()->convertType(subviewOp.getResultType(), resultTypes))) {
+      return failure();
+    }
+    auto newSubview = PCF::SubviewOp::create(
+        rewriter, subviewOp.getLoc(), resultTypes.front(),
+        adaptor.getSource().front(), subviewOp.getMixedOffsets(),
+        subviewOp.getMixedSizes(), subviewOp.getMixedStrides());
+    rewriter.replaceOp(subviewOp,
+                       withForwardedTokens(newSubview.getResult(),
+                                           adaptor.getSource()));
+    return success();
+  }
+};
+
+struct ConvertExpandShapeOp final : OpConversionPattern<PCF::ExpandShapeOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(PCF::ExpandShapeOp expandOp, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(
+            getTypeConverter()->convertType(expandOp.getResult().getType(), resultTypes))) {
+      return failure();
+    }
+    auto newExpand = PCF::ExpandShapeOp::create(
+        rewriter, expandOp.getLoc(), resultTypes.front(),
+        adaptor.getSrc().front(), expandOp.getReassociation(),
+        expandOp.getOutputShape());
+    rewriter.replaceOp(expandOp,
+                       withForwardedTokens(newExpand.getResult(),
+                                           adaptor.getSrc()));
+    return success();
+  }
+};
+
+struct ConvertReadSliceOp final : OpConversionPattern<PCF::ReadSliceOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(PCF::ReadSliceOp readOp, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto newRead = PCF::ReadSliceOp::create(
+        rewriter, readOp.getLoc(), readOp.getResultType(),
+        adaptor.getSource().front(), readOp.getMixedOffsets(),
+        readOp.getMixedSizes(), readOp.getMixedStrides());
+    rewriter.replaceOp(readOp, newRead.getResult());
+    return success();
+  }
+};
+
+struct ConvertGetMemrefOp final : OpConversionPattern<PCF::GetMemrefOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(PCF::GetMemrefOp getMemrefOp, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto newGetMemref = PCF::GetMemrefOp::create(
+        rewriter, getMemrefOp.getLoc(), getMemrefOp.getResultType(),
+        adaptor.getSource().front(), getMemrefOp.getMixedOffsets(),
+        getMemrefOp.getMixedSizes(), getMemrefOp.getMixedStrides());
+    rewriter.replaceOp(getMemrefOp, newGetMemref.getResult());
+    return success();
+  }
+};
+
 /// Convert the destination block signature if necessary.
 struct ConvertBranchOp final : OpConversionPattern<cf::BranchOp> {
   using Base::Base;
@@ -286,7 +368,9 @@ void ResolveTokensPass::runOnOperation() {
 
   patterns
       .add<ConvertGenericOp, ConvertLoopOp, ConvertAllocOp, ConvertWriteSliceOp,
-           ConvertOptimizationBarrier, ConvertBranchOp>(typeConverter, context);
+           ConvertSubviewOp, ConvertExpandShapeOp, ConvertReadSliceOp,
+           ConvertGetMemrefOp, ConvertOptimizationBarrier, ConvertBranchOp>(
+          typeConverter, context);
 
   // Verify that all operand, result, and region argument types have been
   // converted.

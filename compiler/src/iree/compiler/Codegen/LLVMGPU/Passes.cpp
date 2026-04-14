@@ -270,10 +270,9 @@ static void tileAndBufferize(OpPassManager &funcPassManager) {
   addBufferizePasses(funcPassManager);
 }
 
-static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
-                                      bool vectorizeCopies, bool enableMasking,
-                                      bool foldIdentitySlices,
-                                      bool decomposeMasks) {
+static void addGPUVectorizationCorePasses(OpPassManager &funcPassManager,
+                                          bool vectorizeCopies,
+                                          bool enableMasking) {
   funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
@@ -295,6 +294,11 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeIm2colPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
+}
+
+static void addGPUVectorizationCleanupPasses(OpPassManager &funcPassManager,
+                                             bool foldIdentitySlices,
+                                             bool decomposeMasks) {
   // Run subset hoisting to convert iter_args to vectors.
   OptimizeTensorInsertExtractSlicesPassOptions optimizeSlicesOptions;
   optimizeSlicesOptions.foldIdentitySlices = foldIdentitySlices;
@@ -305,6 +309,16 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
   MaterializeVectorMaskingPassOptions maskingOptions;
   maskingOptions.decomposeMasks = decomposeMasks;
   funcPassManager.addPass(createMaterializeVectorMaskingPass(maskingOptions));
+}
+
+static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
+                                      bool vectorizeCopies, bool enableMasking,
+                                      bool foldIdentitySlices,
+                                      bool decomposeMasks) {
+  addGPUVectorizationCorePasses(funcPassManager, vectorizeCopies,
+                                enableMasking);
+  addGPUVectorizationCleanupPasses(funcPassManager, foldIdentitySlices,
+                                   decomposeMasks);
 }
 
 //===---------------------------------------------------------------------===//
@@ -687,11 +701,12 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createGPUCombineValueSemanticBarriersPass());
 
   // Step 6. Vectorize.
-  addGPUVectorizationPasses(funcPassManager, /*vectorizeCopies=*/false,
-                            /*enableMasking=*/true,
-                            /*foldIdentitySlices=*/true,
-                            /*decomposeMasks=*/false);
+  addGPUVectorizationCorePasses(funcPassManager, /*vectorizeCopies=*/false,
+                                /*enableMasking=*/true);
   funcPassManager.addPass(createGPUConvertThreadForallToSubgroupLanePCFPass());
+  addGPUVectorizationCleanupPasses(funcPassManager,
+                                   /*foldIdentitySlices=*/true,
+                                   /*decomposeMasks=*/false);
   funcPassManager.addPass(createCleanupBufferAllocViewPass());
   funcPassManager.addPass(createGPUCombineValueSemanticBarriersPass());
 
@@ -1086,12 +1101,11 @@ static void addLowerToLLVMGPUPasses(OpPassManager &modulePassManager,
   // the late IREE GPU lowering has expanded barrier_region ops, which matches
   // the preconditions of the shared-exec lowering sequence.
   if (forROCDL) {
-    FunctionLikeNest(modulePassManager)
-        .addPass(IREE::PCF::createResolveTokensPass)
-        .addPass(IREE::PCF::createConvertSRefToMemRefPass)
-        .addPass(IREE::PCF::createLowerStructuralPCFPass)
-        .addPass(createCanonicalizerPass)
-        .addPass(createCSEPass);
+    modulePassManager.addPass(IREE::PCF::createResolveTokensPass());
+    modulePassManager.addPass(IREE::PCF::createConvertSRefToMemRefPass());
+    modulePassManager.addPass(IREE::PCF::createLowerStructuralPCFPass());
+    modulePassManager.addPass(createCanonicalizerPass());
+    modulePassManager.addPass(createCSEPass());
   }
 
   modulePassManager.addPass(

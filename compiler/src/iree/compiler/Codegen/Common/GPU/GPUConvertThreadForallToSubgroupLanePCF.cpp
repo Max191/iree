@@ -133,6 +133,104 @@ static void convertSrefConsumerChain(IRRewriter &rewriter, Value srefVal,
   }
 }
 
+/// Returns true if `value` is only consumed by a read-only tensor chain that
+/// eventually terminates in vector.transfer_read operations.
+static bool hasReadOnlyTensorConsumerChain(Value value) {
+  if (value.use_empty()) {
+    return false;
+  }
+  for (OpOperand &use : value.getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<vector::TransferReadOp>(user)) {
+      continue;
+    }
+    if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(user)) {
+      if (!hasReadOnlyTensorConsumerChain(expandOp.getResult())) {
+        return false;
+      }
+      continue;
+    }
+    if (auto extractOp = dyn_cast<tensor::ExtractSliceOp>(user)) {
+      if (!hasReadOnlyTensorConsumerChain(extractOp.getResult())) {
+        return false;
+      }
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/// Rewrites tensor uses of a tied init inside a pcf.generic body to read from
+/// the corresponding region ref sref instead. This preserves the accumulator
+/// tile as a PCF read path instead of letting later tensor optimizations fold
+/// back to the outer tensor value.
+static void convertTiedInitConsumerChain(IRRewriter &rewriter, Value tensorVal,
+                                         Value srefVal,
+                                         IREE::PCF::ShapedRefType srefType,
+                                         IREE::PCF::ScopeAttrInterface scope,
+                                         Operation *regionRoot) {
+  for (OpOperand &use : llvm::make_early_inc_range(tensorVal.getUses())) {
+    Operation *user = use.getOwner();
+    if (user == regionRoot || !regionRoot->isProperAncestor(user)) {
+      continue;
+    }
+
+    if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(user)) {
+      if (!hasReadOnlyTensorConsumerChain(expandOp.getResult())) {
+        continue;
+      }
+      rewriter.setInsertionPoint(expandOp);
+      RankedTensorType resultTensorType = expandOp.getResultType();
+      IREE::PCF::ShapedRefType expandedSrefType =
+          getSrefType(resultTensorType, scope, srefType.getSyncScope());
+      auto pcfExpand = IREE::PCF::ExpandShapeOp::create(
+          rewriter, expandOp.getLoc(), expandedSrefType, srefVal,
+          expandOp.getReassociation(), expandOp.getOutputShape());
+      rewriter.replaceOp(expandOp, pcfExpand.getResult());
+      convertSrefConsumerChain(rewriter, pcfExpand.getResult(), expandedSrefType,
+                               scope);
+      continue;
+    }
+
+    if (auto extractOp = dyn_cast<tensor::ExtractSliceOp>(user)) {
+      if (!hasReadOnlyTensorConsumerChain(extractOp.getResult())) {
+        continue;
+      }
+      rewriter.setInsertionPoint(extractOp);
+      RankedTensorType resultTensorType = extractOp.getResultType();
+      IREE::PCF::ShapedRefType subviewSrefType =
+          getSrefType(resultTensorType, scope, srefType.getSyncScope());
+      auto pcfSubview = IREE::PCF::SubviewOp::create(
+          rewriter, extractOp.getLoc(), subviewSrefType, srefVal,
+          extractOp.getMixedOffsets(), extractOp.getMixedSizes(),
+          extractOp.getMixedStrides());
+      rewriter.replaceOp(extractOp, pcfSubview.getResult());
+      convertSrefConsumerChain(rewriter, pcfSubview.getResult(), subviewSrefType,
+                               scope);
+      continue;
+    }
+
+    if (auto readOp = dyn_cast<vector::TransferReadOp>(user)) {
+      rewriter.setInsertionPoint(readOp);
+      VectorType vecType = readOp.getVectorType();
+      SmallVector<OpFoldResult> offsets = llvm::map_to_vector(
+          readOp.getIndices(), [](Value v) -> OpFoldResult { return v; });
+      SmallVector<OpFoldResult> sizes;
+      for (int64_t dim : vecType.getShape()) {
+        sizes.push_back(rewriter.getIndexAttr(dim));
+      }
+      SmallVector<OpFoldResult> strides(vecType.getRank(),
+                                        rewriter.getIndexAttr(1));
+      auto pcfRead = IREE::PCF::ReadSliceOp::create(
+          rewriter, readOp.getLoc(), vecType, srefVal, offsets, sizes,
+          strides);
+      rewriter.replaceOp(readOp, pcfRead.getResult());
+      continue;
+    }
+  }
+}
+
 /// Find the outermost ancestor pcf.generic and return its scope.
 /// For workgroup shared memory, we want the outermost scope (e.g.
 /// subgroup_scope) rather than the innermost (e.g. lane_scope).
@@ -464,6 +562,22 @@ struct GPUConvertThreadForallToSubgroupLanePCFPass final
       }
       createdGenerics.push_back(*result);
       rewriter.replaceOp(forallOp, result->getResults());
+    }
+
+    // Rewrite tensor reads of tied init values inside the created generic bodies
+    // to read through the corresponding region refs instead.
+    for (IREE::PCF::GenericOp genericOp : createdGenerics) {
+      for (int64_t resultIdx = 0, e = genericOp.getNumResults(); resultIdx < e;
+           ++resultIdx) {
+        OpOperand *tiedInit = genericOp.getTiedInit(resultIdx);
+        if (!tiedInit || !isa<RankedTensorType>(tiedInit->get().getType())) {
+          continue;
+        }
+        BlockArgument refArg = genericOp.getRegionRefArgs()[resultIdx];
+        auto refType = cast<IREE::PCF::ShapedRefType>(refArg.getType());
+        convertTiedInitConsumerChain(rewriter, tiedInit->get(), refArg, refType,
+                                     genericOp.getScope(), genericOp);
+      }
     }
 
     // Phase 2: Convert barrier_region chains to PCF ops.

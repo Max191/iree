@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
+#include "iree/compiler/Codegen/Dialect/PCF/IR/PCFOps.h"
 #include "iree/compiler/Codegen/Interfaces/ProcessorOpInterfaces.h"
 #include "iree/compiler/Codegen/Interfaces/UKernelOpInterface.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -1452,13 +1453,41 @@ void addConfigDenormalFpMathF32(MLIRContext *context,
 // Replace Memref users (transitively)
 //===---------------------------------------------------------------------===//
 
+template <typename PCFOpTy>
+static std::optional<SmallVector<Type>>
+computePCFTiedReplacementResultTypes(PCFOpTy pcfOp, OpOperand &use,
+                                     MemRefType replacementType) {
+  OpResult tiedResult = pcfOp.getTiedResult(use);
+  if (!tiedResult) {
+    return std::nullopt;
+  }
+
+  auto currentResultType = dyn_cast<ShapedType>(tiedResult.getType());
+  if (!currentResultType) {
+    return std::nullopt;
+  }
+
+  // The region ref arguments only encode shape and element type. If those
+  // change, additional IR updates would be required beyond result type
+  // propagation.
+  if (currentResultType.getShape() != replacementType.getShape() ||
+      currentResultType.getElementType() != replacementType.getElementType()) {
+    return std::nullopt;
+  }
+
+  SmallVector<Type> newResultTypes;
+  llvm::append_range(newResultTypes, pcfOp->getResultTypes());
+  newResultTypes[tiedResult.getResultNumber()] = replacementType;
+  return newResultTypes;
+}
+
 /// Computes the result types for a non-trivial use replacement. This function
 /// determines what the new result types should be when replacing a memref
 /// operand with one of a different type.
 ///
 /// Returns nullopt if:
 /// - The operation is not one of the supported types (CastOp, SubViewOp,
-///   ExpandShapeOp, CollapseShapeOp)
+///   ExpandShapeOp, CollapseShapeOp, GenericOp, LoopOp)
 /// - The replacement type computation fails (e.g., for ExpandShapeOp or
 ///   CollapseShapeOp with incompatible layouts)
 static std::optional<SmallVector<Type>>
@@ -1516,16 +1545,75 @@ computeNonTrivialReplacementResultTypes(OpOperand &use, Type replacementType) {
                 newSourceType, collapseOp.getReassociationIndices());
         return SmallVector<Type>{newResultType};
       })
+      .Case([&](IREE::PCF::GenericOp genericOp) {
+        return computePCFTiedReplacementResultTypes(genericOp, use,
+                                                    newSourceType);
+      })
+      .Case([&](IREE::PCF::LoopOp loopOp) {
+        return computePCFTiedReplacementResultTypes(loopOp, use,
+                                                    newSourceType);
+      })
       .Default([](Operation *) { return std::nullopt; });
 }
 
 /// Checks whether a non-trivial replacement would be needed for this operation.
-/// Returns true if the operation is one of the known memref reshaping
-/// operations (CastOp, SubViewOp, ExpandShapeOp, CollapseShapeOp) that requires
-/// result type propagation when the source type changes.
-static bool isNonTrivialMemrefReshapeOp(Operation *op) {
+/// Returns true if the operation requires result type propagation when the
+/// source memref type changes.
+static bool requiresMemrefTypePropagation(Operation *op) {
   return isa<memref::CastOp, memref::SubViewOp, memref::ExpandShapeOp,
-             memref::CollapseShapeOp>(op);
+             memref::CollapseShapeOp, IREE::PCF::GenericOp,
+             IREE::PCF::LoopOp>(op);
+}
+
+static SmallVector<Value> getReplacementOperands(ValueRange operands,
+                                                 unsigned beginIndex,
+                                                 OpOperand &use,
+                                                 Value replacement) {
+  SmallVector<Value> newOperands = llvm::to_vector(operands);
+  newOperands[use.getOperandNumber() - beginIndex] = replacement;
+  return newOperands;
+}
+
+static SmallVector<Value> replacePCFGenericUse(RewriterBase &rewriter,
+                                               IREE::PCF::GenericOp genericOp,
+                                               OpOperand &use,
+                                               Value replacement,
+                                               ArrayRef<Type> resultTypes) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(genericOp);
+  auto newGeneric = IREE::PCF::GenericOp::create(
+      rewriter, genericOp.getLoc(), resultTypes, genericOp.getScope(),
+      getReplacementOperands(genericOp.getInits(),
+                             genericOp.getInits().getBeginOperandIndex(), use,
+                             replacement),
+      genericOp.getDynamicSizes(), genericOp.getIsTied(),
+      genericOp.getNumIterators(), genericOp.getSyncOnReturn());
+  newGeneric->setDiscardableAttrs(genericOp->getDiscardableAttrDictionary());
+  newGeneric.setNumLeadingArgs(genericOp.getNumLeadingArgs());
+  newGeneric.setNumIndexArgs(genericOp.getNumIndexArgs());
+  rewriter.eraseBlock(&newGeneric.getRegion().front());
+  newGeneric.getInitializer().takeBody(genericOp.getInitializer());
+  newGeneric.getRegion().takeBody(genericOp.getRegion());
+  return llvm::to_vector_of<Value>(newGeneric->getResults());
+}
+
+static SmallVector<Value> replacePCFLoopUse(RewriterBase &rewriter,
+                                            IREE::PCF::LoopOp loopOp,
+                                            OpOperand &use, Value replacement,
+                                            ArrayRef<Type> resultTypes) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(loopOp);
+  auto newLoop = IREE::PCF::LoopOp::create(
+      rewriter, loopOp.getLoc(), resultTypes, loopOp.getScope(),
+      loopOp.getCount(),
+      getReplacementOperands(loopOp.getInits(),
+                             loopOp.getInits().getBeginOperandIndex(), use,
+                             replacement),
+      loopOp.getDynamicSizes(), loopOp.getIsTied(), loopOp.getSyncOnReturn());
+  newLoop->setDiscardableAttrs(loopOp->getDiscardableAttrDictionary());
+  rewriter.eraseBlock(&newLoop.getRegion().front());
+  newLoop.getRegion().takeBody(loopOp.getRegion());
+  return llvm::to_vector_of<Value>(newLoop->getResults());
 }
 
 /// Replaces a `use` with the `replacement` for cases where a simple
@@ -1547,6 +1635,18 @@ replaceNonTrivialUse(RewriterBase &rewriter, OpOperand &use,
       isa<memref::CastOp>(user)) {
     LDBG() << "\t\tReplacing no-op memref.cast : " << *user;
     return SmallVector<Value>({replacement});
+  }
+
+  if (auto genericOp = dyn_cast<IREE::PCF::GenericOp>(user)) {
+    LDBG() << "\tReplacing PCF generic user : " << *user;
+    return replacePCFGenericUse(rewriter, genericOp, use, replacement,
+                                *resultTypes);
+  }
+
+  if (auto loopOp = dyn_cast<IREE::PCF::LoopOp>(user)) {
+    LDBG() << "\tReplacing PCF loop user : " << *user;
+    return replacePCFLoopUse(rewriter, loopOp, use, replacement,
+                             *resultTypes);
   }
 
   LDBG() << "\tReplacing in user by creating new user : " << *user;
@@ -1578,8 +1678,8 @@ LogicalResult canReplaceMemrefUsesAndPropagateType(Value origValue,
                << *user;
         return failure();
       }
-      // Non-reshape operations can accept the new operand type directly.
-      if (!isNonTrivialMemrefReshapeOp(user)) {
+      // Most operations can accept the new operand type directly.
+      if (!requiresMemrefTypePropagation(user)) {
         continue;
       }
 

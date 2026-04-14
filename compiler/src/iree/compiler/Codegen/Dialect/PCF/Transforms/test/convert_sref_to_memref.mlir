@@ -351,6 +351,55 @@ func.func @convert_get_memref(%arg0: memref<?x?xi32, strided<[?, 1]>, 3>, %s0: i
 
 // -----
 
+func.func @convert_expand_shape(%arg0: memref<128x4xf16>) {
+  pcf.generic scope(#pcf.test_scope)
+    execute(%ref = %arg0)[%id: index, %n: index]
+         : (!pcf.sref<128x4xf16, #pcf.test_scope>)
+        -> (memref<128x4xf16>) {
+    %expanded = pcf.expand_shape %ref [[0, 1], [2]]
+      : !pcf.sref<128x4xf16, #pcf.test_scope> into !pcf.sref<8x16x4xf16, #pcf.test_scope>
+    util.optimization_barrier %expanded : !pcf.sref<8x16x4xf16, #pcf.test_scope>
+    pcf.return
+  }
+  return
+}
+
+// CHECK-LABEL: @convert_expand_shape
+//  CHECK-SAME:     %[[ARG0:[A-Za-z0-9_]+]]: memref<128x4xf16>
+//       CHECK:   pcf.generic
+//  CHECK-NEXT:     execute[{{.*}}] {
+//       CHECK:     %[[EXP:.+]] = memref.expand_shape %[[ARG0]] {{\[}}[0, 1], [2]] output_shape [8, 16, 4]
+//  CHECK-SAME:       : memref<128x4xf16> into memref<8x16x4xf16>
+//       CHECK:     util.optimization_barrier %[[EXP]]
+//       CHECK:     pcf.return
+
+// -----
+
+func.func @convert_subview(%arg0: memref<8x16x4xf16>, %i: index) {
+  pcf.generic scope(#pcf.test_scope)
+    execute(%ref = %arg0)[%id: index, %n: index]
+         : (!pcf.sref<8x16x4xf16, #pcf.test_scope>)
+        -> (memref<8x16x4xf16>) {
+    %sub = pcf.subview %ref[%i, 0, 0] [1, 16, 4] [1, 1, 1]
+      : !pcf.sref<8x16x4xf16, #pcf.test_scope> to !pcf.sref<16x4xf16, #pcf.test_scope>
+    util.optimization_barrier %sub : !pcf.sref<16x4xf16, #pcf.test_scope>
+    pcf.return
+  }
+  return
+}
+
+// CHECK-LABEL: @convert_subview
+//  CHECK-SAME:     %[[ARG0:[A-Za-z0-9_]+]]: memref<8x16x4xf16>
+//  CHECK-SAME:     %[[I:[A-Za-z0-9_]+]]: index
+//       CHECK:   pcf.generic
+//  CHECK-NEXT:     execute[{{.*}}] {
+//       CHECK:     %[[SV:.+]] = memref.subview %[[ARG0]][%[[I]], 0, 0] [1, 16, 4] [1, 1, 1] :
+//  CHECK-SAME:       memref<8x16x4xf16> to memref<16x4xf16, strided<[4, 1], offset: ?>>
+//       CHECK:     util.optimization_barrier %[[SV]]
+//       CHECK:     pcf.return
+
+// -----
+
 func.func @convert_tensor_read_slice(%arg0: memref<?x?xi32>) {
   pcf.generic scope(#pcf.test_scope)
     execute(%ref = %arg0)[%id: index, %n: index]
