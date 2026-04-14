@@ -251,14 +251,14 @@ static IREE::PCF::ScopeAttrInterface findOutermostScope(Operation *op) {
 /// barrier block arg is still tensor-typed, but are rewritten after the block
 /// arg has been retargeted to pcf.sref.
 static void convertBarrierBlockArgReads(IRRewriter &rewriter,
-                                        BlockArgument tensorBlockArg,
+                                        Value srefSource,
                                         ArrayRef<tensor::ExtractSliceOp> extractOps) {
   for (tensor::ExtractSliceOp extractOp : extractOps) {
     rewriter.setInsertionPoint(extractOp);
     ShapedType resultType = extractOp.getResultType();
 
     auto pcfRead = IREE::PCF::ReadSliceOp::create(
-        rewriter, extractOp.getLoc(), resultType, tensorBlockArg,
+        rewriter, extractOp.getLoc(), resultType, srefSource,
         extractOp.getMixedOffsets(), extractOp.getMixedSizes(),
         extractOp.getMixedStrides());
     rewriter.replaceOp(extractOp, pcfRead.getResult());
@@ -270,7 +270,7 @@ static void convertBarrierBlockArgReads(IRRewriter &rewriter,
 /// barrier block arg is still tensor-typed, but are rewritten after the block
 /// arg has been retargeted to pcf.sref.
 static void convertBarrierBlockArgWrites(IRRewriter &rewriter,
-                                         BlockArgument tensorBlockArg,
+                                         Value replacementValue,
                                          Value srefDest,
                                          ArrayRef<tensor::InsertSliceOp> insertOps) {
   for (tensor::InsertSliceOp insertOp : insertOps) {
@@ -280,8 +280,70 @@ static void convertBarrierBlockArgWrites(IRRewriter &rewriter,
         insertOp.getMixedOffsets(), insertOp.getMixedSizes(),
         insertOp.getMixedStrides());
 
-    insertOp.getResult().replaceAllUsesWith(tensorBlockArg);
+    insertOp.getResult().replaceAllUsesWith(replacementValue);
     rewriter.eraseOp(insertOp);
+  }
+}
+
+using ScfForIterArg = std::pair<scf::ForOp, unsigned>;
+
+/// Returns the scf.for iter_args that directly use `value`.
+static SmallVector<ScfForIterArg> collectDirectForUsers(Value value) {
+  SmallVector<ScfForIterArg> forUsers;
+  for (OpOperand &use : llvm::make_early_inc_range(value.getUses())) {
+    auto forOp = dyn_cast<scf::ForOp>(use.getOwner());
+    if (!forOp) {
+      continue;
+    }
+    unsigned operandNumber = use.getOperandNumber();
+    if (operandNumber < forOp.getNumControlOperands()) {
+      continue;
+    }
+    forUsers.push_back(
+        {forOp, operandNumber - forOp.getNumControlOperands()});
+  }
+  return forUsers;
+}
+
+/// Converts an scf.for loop-carried tensor value that aliases a barrier-region
+/// block arg into a loop-carried sref. Direct slice reads/writes of the iter
+/// arg are rewritten to pcf.read_slice/pcf.write_slice so the loop remains
+/// valid after the carrier type changes.
+static void convertLoopCarriedBarrierRef(IRRewriter &rewriter, scf::ForOp forOp,
+                                         unsigned iterArgIdx,
+                                         IREE::PCF::ShapedRefType srefType) {
+  BlockArgument iterArg = forOp.getRegionIterArgs()[iterArgIdx];
+
+  SmallVector<tensor::ExtractSliceOp> directReads;
+  SmallVector<tensor::InsertSliceOp> directWrites;
+  for (OpOperand &use : llvm::make_early_inc_range(iterArg.getUses())) {
+    Operation *user = use.getOwner();
+    if (auto extractOp = dyn_cast<tensor::ExtractSliceOp>(user);
+        extractOp && extractOp.getSource() == iterArg) {
+      directReads.push_back(extractOp);
+      continue;
+    }
+    if (auto insertOp = dyn_cast<tensor::InsertSliceOp>(user);
+        insertOp && insertOp.getDest() == iterArg) {
+      directWrites.push_back(insertOp);
+    }
+  }
+  SmallVector<ScfForIterArg> nestedForUsers = collectDirectForUsers(iterArg);
+
+  iterArg.setType(srefType);
+  forOp.getResult(iterArgIdx).setType(srefType);
+
+  for (auto [nestedFor, nestedIterArgIdx] : nestedForUsers) {
+    convertLoopCarriedBarrierRef(rewriter, nestedFor, nestedIterArgIdx,
+                                 srefType);
+  }
+
+  convertBarrierBlockArgReads(rewriter, iterArg, directReads);
+  convertBarrierBlockArgWrites(rewriter, iterArg, iterArg, directWrites);
+
+  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (yieldOp.getOperand(iterArgIdx).getType() != srefType) {
+    yieldOp.setOperand(iterArgIdx, iterArg);
   }
 }
 
@@ -479,6 +541,12 @@ static void convertBarrierChainToSref(IRRewriter &rewriter,
         }
       }
 
+      // Direct scf.for users also need to be updated when the barrier carrier
+      // changes from tensor to sref. Unlike scf.forall, scf.for can carry the
+      // sref directly, so we only need to retarget the loop-carried iter arg
+      // and rewrite its direct slice reads/writes.
+      SmallVector<ScfForIterArg> directForUsers = collectDirectForUsers(blockArg);
+
       // Phase B: Now safe to change the block arg type and barrier operand.
       SmallVector<tensor::ExtractSliceOp> barrierBlockArgReads;
       body.walk([&](tensor::ExtractSliceOp extractOp) {
@@ -495,6 +563,10 @@ static void convertBarrierChainToSref(IRRewriter &rewriter,
 
       barrierOp.setOperand(inputIdx, srefAlloc);
       blockArg.setType(srefType);
+
+      for (auto [forOp, iterArgIdx] : directForUsers) {
+        convertLoopCarriedBarrierRef(rewriter, forOp, iterArgIdx, srefType);
+      }
 
       // Rewrite direct tensor read/write chains on the barrier block arg into
       // pcf.read_slice/pcf.write_slice. This is the post-vectorization form

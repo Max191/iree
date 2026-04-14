@@ -245,6 +245,55 @@ func.func @test_vectorized_barrier_chain_to_pcf(%lhs: tensor<64x4xf16>,
 
 // -----
 
+func.func @test_barrier_scf_for_carried_ref(%src: tensor<4x4xf16>,
+    %init: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %result = scf.forall (%i) in (1) shared_outs(%out = %init)
+      -> tensor<4x4xf32> {
+    %out_slice = tensor.extract_slice %out[%c0, %c0] [4, 4] [1, 1]
+        : tensor<4x4xf32> to tensor<4x4xf32>
+    %alloc = bufferization.alloc_tensor()
+        {memory_space = #gpu.address_space<workgroup>}
+        : tensor<4x4xf16>
+    %barrier = iree_gpu.barrier_region ins(%alloc : tensor<4x4xf16>) {
+    ^bb0(%shared: tensor<4x4xf16>):
+      %loop = scf.for %j = %c0 to %c4 step %c1
+          iter_args(%acc = %shared) -> (tensor<4x4xf16>) {
+        %src_slice = tensor.extract_slice %src[%j, %c0] [1, 4] [1, 1]
+            : tensor<4x4xf16> to tensor<1x4xf16>
+        %dst_slice = tensor.extract_slice %acc[%j, %c0] [1, 4] [1, 1]
+            : tensor<4x4xf16> to tensor<1x4xf16>
+        %copied = linalg.copy
+            {lowering_config = #iree_gpu.derived_thread_config}
+            ins(%src_slice : tensor<1x4xf16>)
+            outs(%dst_slice : tensor<1x4xf16>) -> tensor<1x4xf16>
+        %updated = tensor.insert_slice %copied into %acc[%j, %c0] [1, 4]
+            [1, 1] : tensor<1x4xf16> into tensor<4x4xf16>
+        scf.yield %updated : tensor<4x4xf16>
+      }
+      iree_gpu.yield %loop : tensor<4x4xf16>
+    } : tensor<4x4xf16>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %out_slice into %out[%c0, %c0] [4, 4]
+          [1, 1] : tensor<4x4xf32> into tensor<4x4xf32>
+    }
+  } {mapping = [#gpu.thread<linear_dim_0>]}
+  return %result : tensor<4x4xf32>
+}
+
+// CHECK-LABEL: func.func @test_barrier_scf_for_carried_ref
+//       CHECK:   %[[ALLOC:.+]] = pcf.alloc() : !pcf.sref<4x4xf16, #iree_gpu.subgroup_scope>
+//       CHECK:   %[[BARRIER:.+]] = iree_gpu.barrier_region ins(%[[ALLOC]]
+//       CHECK:   ^bb0(%[[SHARED:.+]]: !pcf.sref<4x4xf16, #iree_gpu.subgroup_scope>):
+//       CHECK:     %[[LOOP:.+]] = scf.for %[[J:.+]] = %c0 to %c4 step %c1 iter_args(%[[ACC:.+]] = %[[SHARED]]) -> (!pcf.sref<4x4xf16, #iree_gpu.subgroup_scope>) {
+//       CHECK:       pcf.write_slice
+//       CHECK:       scf.yield %[[ACC]] : !pcf.sref<4x4xf16, #iree_gpu.subgroup_scope>
+//       CHECK:     iree_gpu.yield %[[LOOP]] : !pcf.sref<4x4xf16, #iree_gpu.subgroup_scope>
+
+// -----
+
 func.func @test_tied_init_transfer_read_to_pcf_read(
     %init: tensor<1x4x1x1xf32>) -> tensor<1x4x1x1xf32> {
   %c0 = arith.constant 0 : index
