@@ -102,6 +102,56 @@ populateLowerGlobalSubgroupBarrierPatterns(RewritePatternSet &patterns,
   patterns.add<LowerGlobalSubgroupBarrier>(patterns.getContext(), chipset);
 }
 
+/// Expands gpu.num_subgroups to ceildiv(workgroup_thread_count, subgroup_size)
+/// so the existing gpu.block_dim and gpu.subgroup_size lowerings can take over.
+/// This materializes ceildiv(dimX * dimY * dimZ, subgroup_size).
+struct LowerNumSubgroupsOp final : OpRewritePattern<gpu::NumSubgroupsOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(gpu::NumSubgroupsOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Type indexType = rewriter.getIndexType();
+
+    auto asMaybeIndexAttr = [&](std::optional<uint32_t> bound) -> IntegerAttr {
+      if (!bound) {
+        return IntegerAttr();
+      }
+      return IntegerAttr::get(
+          indexType, static_cast<int64_t>(static_cast<uint64_t>(*bound)));
+    };
+
+    auto getBlockDim = [&](gpu::Dimension dim) -> Value {
+      auto maybeKnownDim =
+          gpu::getKnownDimensionSizeAround(op, gpu::DimensionKind::Block, dim);
+      if (IntegerAttr knownDim = asMaybeIndexAttr(maybeKnownDim)) {
+        return arith::ConstantOp::create(rewriter, loc, knownDim);
+      }
+      return gpu::BlockDimOp::create(rewriter, loc, dim);
+    };
+
+    Value dimX = getBlockDim(gpu::Dimension::x);
+    Value dimY = getBlockDim(gpu::Dimension::y);
+    Value dimZ = getBlockDim(gpu::Dimension::z);
+    // The `upper_bound` on `gpu.num_subgroups` bounds this quotient, not
+    // subgroup size, so there is no equivalent attribute to forward to
+    // `gpu.subgroup_size`.
+    Value subgroupSize = gpu::SubgroupSizeOp::create(
+        rewriter, loc, indexType, /*upper_bound=*/nullptr);
+
+    Value xy = arith::MulIOp::create(rewriter, loc, dimX, dimY);
+    Value xyz = arith::MulIOp::create(rewriter, loc, xy, dimZ);
+    Value numSubgroups =
+        arith::CeilDivUIOp::create(rewriter, loc, xyz, subgroupSize);
+    rewriter.replaceOp(op, numSubgroups);
+    return success();
+  }
+};
+
+static void populateLowerNumSubgroupsPatterns(RewritePatternSet &patterns) {
+  patterns.add<LowerNumSubgroupsOp>(patterns.getContext());
+}
+
 /// Hacky pattern to swap `s_setprio` operations with `amdgpu.mfma` ops.
 /// This is needed for ping-pong scheduling patterns to prevent off
 /// waves from interrupting the MFMA region of the high priority wave.
@@ -320,6 +370,7 @@ struct ConvertToROCDLPass final
       RewritePatternSet patterns(&getContext());
       populateGpuRewritePatterns(patterns);
       populateGpuPromoteShuffleToAMDGPUPatterns(patterns, maybeChipset);
+      populateLowerNumSubgroupsPatterns(patterns);
       if (failed(applyPatternsGreedily(m, std::move(patterns), config))) {
         return signalPassFailure();
       }

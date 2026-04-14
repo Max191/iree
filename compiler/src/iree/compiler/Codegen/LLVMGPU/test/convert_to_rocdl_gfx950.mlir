@@ -44,6 +44,79 @@ module {
 
 // -----
 
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>
+]>
+module {
+  // Lower gpu.num_subgroups to ceildiv(thread_count, subgroup_size) through
+  // the existing block_dim and subgroup_size ROCDL lowerings.
+  func.func @num_subgroups_lowering() {
+    %c0 = arith.constant 0 : index
+    %out = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) : memref<1xi32>
+    %num_subgroups = gpu.num_subgroups : index
+    %num_subgroups_i32 = arith.index_castui %num_subgroups : index to i32
+    memref.store %num_subgroups_i32, %out[%c0] : memref<1xi32>
+    return
+  }
+}
+
+// CHECK-LABEL: llvm.func @num_subgroups_lowering
+//   CHECK-NOT: gpu.num_subgroups
+//       CHECK: llvm.call @__ockl_get_local_size(
+//       CHECK: llvm.call @__ockl_get_local_size(
+//       CHECK: llvm.call @__ockl_get_local_size(
+//       CHECK: rocdl.wavefrontsize
+//       CHECK: arith.ceildivui
+
+// -----
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>
+]>
+module {
+  // Known function block sizes should fold block_dim operands before ROCDL
+  // lowering instead of emitting runtime local-size queries.
+  func.func @num_subgroups_known_block_size()
+      attributes {gpu.known_block_size = array<i32: 8, 4, 2>} {
+    %c0 = arith.constant 0 : index
+    %out = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) : memref<1xi32>
+    %num_subgroups = gpu.num_subgroups : index
+    %num_subgroups_i32 = arith.index_castui %num_subgroups : index to i32
+    memref.store %num_subgroups_i32, %out[%c0] : memref<1xi32>
+    return
+  }
+}
+
+// CHECK-LABEL: llvm.func @num_subgroups_known_block_size
+//   CHECK-NOT: __ockl_get_local_size
+//       CHECK: rocdl.wavefrontsize
+//       CHECK: arith.ceildivui
+
+// -----
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>
+]>
+module {
+  // The upper_bound on gpu.num_subgroups bounds the result quotient. The
+  // expanded arithmetic intentionally has no equivalent attribute to forward.
+  func.func @num_subgroups_upper_bound() {
+    %c0 = arith.constant 0 : index
+    %out = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) : memref<1xi32>
+    %num_subgroups = gpu.num_subgroups upper_bound 8 : index
+    %num_subgroups_i32 = arith.index_castui %num_subgroups : index to i32
+    memref.store %num_subgroups_i32, %out[%c0] : memref<1xi32>
+    return
+  }
+}
+
+// CHECK-LABEL: llvm.func @num_subgroups_upper_bound
+//   CHECK-NOT: gpu.num_subgroups
+//       CHECK: rocdl.wavefrontsize
+//       CHECK: arith.ceildivui
+
+// -----
+
 // Verify that arith.truncf f32 to bf16 is NOT expanded on gfx950, which has
 // native bf16 conversion instructions (v_cvt_pk_bf16_f32).
 #pipeline_layout = #hal.pipeline.layout<bindings = [
