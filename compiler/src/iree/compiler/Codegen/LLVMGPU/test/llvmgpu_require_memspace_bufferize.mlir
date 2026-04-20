@@ -1,6 +1,8 @@
-// RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-llvmgpu-bufferization-pipeline))" --split-input-file %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-llvmgpu-test-require-memspace-bufferization-pipeline))" --split-input-file --verify-diagnostics %s | FileCheck %s
 
-func.func @bufferize_alloc_tensor_in_lane_pcf() {
+// These alloc_tensor cases intentionally mirror llvmgpu_bufferize.mlir to pin
+// the required-memory-space allocation hook to the same PCF scope behavior.
+func.func @require_memspace_alloc_tensor_in_lane_pcf() {
   pcf.generic scope(#iree_gpu.lane_scope)
     execute[%id: index, %n: index] {
     %c0 = arith.constant 0 : index
@@ -14,14 +16,14 @@ func.func @bufferize_alloc_tensor_in_lane_pcf() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_alloc_tensor_in_lane_pcf
+// CHECK-LABEL: func.func @require_memspace_alloc_tensor_in_lane_pcf
 //       CHECK:   pcf.generic scope(#iree_gpu.lane_scope)
 //       CHECK:     %[[ALLOC:.+]] = memref.alloca() : memref<4xf32, #gpu.address_space<private>>
 //       CHECK:     vector.transfer_write %{{.*}}, %[[ALLOC]]
 
 // -----
 
-func.func @bufferize_alloc_tensor_in_subgroup_pcf() {
+func.func @require_memspace_alloc_tensor_in_subgroup_pcf() {
   pcf.generic scope(#iree_gpu.subgroup_scope)
     execute[%id: index, %n: index] {
     %c0 = arith.constant 0 : index
@@ -35,14 +37,14 @@ func.func @bufferize_alloc_tensor_in_subgroup_pcf() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_alloc_tensor_in_subgroup_pcf
+// CHECK-LABEL: func.func @require_memspace_alloc_tensor_in_subgroup_pcf
 //       CHECK:   pcf.generic scope(#iree_gpu.subgroup_scope)
 //       CHECK:     %[[ALLOC:.+]] = memref.alloc() : memref<4xf32, #gpu.address_space<workgroup>>
 //       CHECK:     vector.transfer_write %{{.*}}, %[[ALLOC]]
 
 // -----
 
-func.func @bufferize_alloc_tensor_in_lane_pcf_loop() {
+func.func @require_memspace_alloc_tensor_in_lane_pcf_loop() {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   pcf.loop scope(#iree_gpu.lane_scope) count(%c1)
@@ -57,14 +59,14 @@ func.func @bufferize_alloc_tensor_in_lane_pcf_loop() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_alloc_tensor_in_lane_pcf_loop
+// CHECK-LABEL: func.func @require_memspace_alloc_tensor_in_lane_pcf_loop
 //       CHECK:   pcf.loop scope(#iree_gpu.lane_scope)
 //       CHECK:     %[[ALLOC:.+]] = memref.alloca() : memref<4xf32, #gpu.address_space<private>>
 //       CHECK:     vector.transfer_write %{{.*}}, %[[ALLOC]]
 
 // -----
 
-func.func @bufferize_alloc_tensor_in_subgroup_pcf_loop() {
+func.func @require_memspace_alloc_tensor_in_subgroup_pcf_loop() {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   pcf.loop scope(#iree_gpu.subgroup_scope) count(%c1)
@@ -79,14 +81,14 @@ func.func @bufferize_alloc_tensor_in_subgroup_pcf_loop() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_alloc_tensor_in_subgroup_pcf_loop
+// CHECK-LABEL: func.func @require_memspace_alloc_tensor_in_subgroup_pcf_loop
 //       CHECK:   pcf.loop scope(#iree_gpu.subgroup_scope)
 //       CHECK:     %[[ALLOC:.+]] = memref.alloc() : memref<4xf32, #gpu.address_space<workgroup>>
 //       CHECK:     vector.transfer_write %{{.*}}, %[[ALLOC]]
 
 // -----
 
-func.func @bufferize_inner_lane_over_outer_subgroup_pcf() {
+func.func @require_memspace_inner_lane_over_outer_subgroup_pcf() {
   pcf.generic scope(#iree_gpu.subgroup_scope)
     execute[%subgroup_id: index, %num_subgroups: index] {
     pcf.generic scope(#iree_gpu.lane_scope)
@@ -104,7 +106,7 @@ func.func @bufferize_inner_lane_over_outer_subgroup_pcf() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_inner_lane_over_outer_subgroup_pcf
+// CHECK-LABEL: func.func @require_memspace_inner_lane_over_outer_subgroup_pcf
 //       CHECK:   pcf.generic scope(#iree_gpu.subgroup_scope)
 //       CHECK:     pcf.generic scope(#iree_gpu.lane_scope)
 //       CHECK:       %[[ALLOC:.+]] = memref.alloca() : memref<4xf32, #gpu.address_space<private>>
@@ -112,7 +114,7 @@ func.func @bufferize_inner_lane_over_outer_subgroup_pcf() {
 
 // -----
 
-func.func @bufferize_thread_forall_over_outer_subgroup_pcf() {
+func.func @require_memspace_thread_forall_over_outer_subgroup_pcf() {
   pcf.generic scope(#iree_gpu.subgroup_scope)
     execute[%subgroup_id: index, %num_subgroups: index] {
     scf.forall (%thread_id) in (1) {
@@ -128,7 +130,7 @@ func.func @bufferize_thread_forall_over_outer_subgroup_pcf() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_thread_forall_over_outer_subgroup_pcf
+// CHECK-LABEL: func.func @require_memspace_thread_forall_over_outer_subgroup_pcf
 //       CHECK:   pcf.generic scope(#iree_gpu.subgroup_scope)
 //       CHECK:     scf.forall
 //       CHECK:       %[[ALLOC:.+]] = memref.alloca() : memref<4xf32, #gpu.address_space<private>>
@@ -136,7 +138,7 @@ func.func @bufferize_thread_forall_over_outer_subgroup_pcf() {
 
 // -----
 
-func.func @bufferize_alloc_tensor_without_gpu_context_defaults_workgroup() {
+func.func @require_memspace_alloc_tensor_without_gpu_context_defaults_private() {
   %c0 = arith.constant 0 : index
   %cst = arith.constant dense<0.0> : vector<4xf32>
   %alloc = bufferization.alloc_tensor() : tensor<4xf32>
@@ -146,45 +148,69 @@ func.func @bufferize_alloc_tensor_without_gpu_context_defaults_workgroup() {
   return
 }
 
-// CHECK-LABEL: func.func @bufferize_alloc_tensor_without_gpu_context_defaults_workgroup
-//       CHECK:   %[[ALLOC:.+]] = memref.alloc() : memref<4xf32, #gpu.address_space<workgroup>>
+// CHECK-LABEL: func.func @require_memspace_alloc_tensor_without_gpu_context_defaults_private
+//       CHECK:   %[[ALLOC:.+]] = memref.alloca() : memref<4xf32, #gpu.address_space<private>>
 //       CHECK:   vector.transfer_write %{{.*}}, %[[ALLOC]]
 
 // -----
 
-#pipeline_layout = #hal.pipeline.layout<bindings = [
-  #hal.pipeline.binding<storage_buffer>,
-  #hal.pipeline.binding<storage_buffer>
-]>
-func.func @bufferize_with_thread_private_memory(%arg0: index) {
-  %c0 = arith.constant 0 : index
-  %cst = arith.constant 0.000000e+00 : f16
-  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<320xf16>>
-  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x320x64x64xf16>>
-  %2 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [%arg0, %arg0, %arg0, %arg0], sizes = [1, 1, 8, 64], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x320x64x64xf16>> -> tensor<1x1x8x64xf16>
-  %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [%arg0], sizes = [1], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<320xf16>> -> tensor<1xf16>
-  %4 = scf.forall (%arg1, %arg2) in (2, 16) shared_outs(%arg3 = %2) -> (tensor<1x1x8x64xf16>) {
-    %5 = affine.apply affine_map<(d0) -> (d0 * 4)>(%arg1)
-    %6 = affine.apply affine_map<(d0) -> (d0 * 4)>(%arg2)
-    %extracted_slice = tensor.extract_slice %arg3[0, 0, %5, %6] [1, 1, 4, 4] [1, 1, 1, 1] : tensor<1x1x8x64xf16> to tensor<1x1x4x4xf16>
-    %alloc_tensor = bufferization.alloc_tensor() : tensor<1x1x4x4xf16>
-    %copy = bufferization.materialize_in_destination %extracted_slice in %alloc_tensor : (tensor<1x1x4x4xf16>, tensor<1x1x4x4xf16>) -> tensor<1x1x4x4xf16>
-    %7 = vector.transfer_read %3[%c0], %cst {in_bounds = [true]} : tensor<1xf16>, vector<1xf16>
-    %8 = vector.broadcast %7 : vector<1xf16> to vector<1x1x4x4xf16>
-    %9 = vector.transfer_read %arg3[%c0, %c0, %5, %6], %cst {in_bounds = [true, true, true, true]} : tensor<1x1x8x64xf16>, vector<1x1x4x4xf16>
-    %10 = arith.addf %9, %8 : vector<1x1x4x4xf16>
-    %11 = vector.transfer_write %10, %copy[%c0, %c0, %c0, %c0] {in_bounds = [true, true, true, true]} : vector<1x1x4x4xf16>, tensor<1x1x4x4xf16>
-    scf.forall.in_parallel {
-      tensor.parallel_insert_slice %11 into %arg3[0, 0, %5, %6] [1, 1, 4, 4] [1, 1, 1, 1] : tensor<1x1x4x4xf16> into tensor<1x1x8x64xf16>
-    }
-  } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
-  iree_tensor_ext.dispatch.tensor.store %4, %1, offsets = [%arg0, %arg0, %arg0, %arg0], sizes = [1, 1, 8, 64], strides = [1, 1, 1, 1] : tensor<1x1x8x64xf16> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x320x64x64xf16>>
+func.func @require_memspace_descriptor_write_in_lane_pcf(
+    %arg0: memref<4xf32, #hal.descriptor_type<storage_buffer>>) {
+  pcf.generic scope(#iree_gpu.lane_scope)
+    execute[%id: index, %n: index] {
+    %c0 = arith.constant 0 : index
+    %c3 = arith.constant 3 : index
+    %cst = arith.constant dense<0.0> : vector<2xf32>
+    %tensor = bufferization.to_tensor %arg0 restrict : memref<4xf32, #hal.descriptor_type<storage_buffer>> to tensor<4xf32>
+    %written = vector.transfer_write %cst, %tensor[%c0] {in_bounds = [true]} : vector<2xf32>, tensor<4xf32>
+    %element = tensor.extract %written[%c3] : tensor<4xf32>
+    util.optimization_barrier %element : f32
+    pcf.return
+  }
   return
 }
-// CHECK-LABEL: func.func @bufferize_with_thread_private_memory
-//       CHECK:   scf.forall {{.*}} in (2, 16) {
-//       CHECK:     %[[ALLOC:.+]] = memref.alloca() : memref<1x1x4x4xf16, #gpu.address_space<private>>
+
+// CHECK-LABEL: func.func @require_memspace_descriptor_write_in_lane_pcf
+//       CHECK:   pcf.generic scope(#iree_gpu.lane_scope)
+//       CHECK:     %[[ALLOC:.+]] = memref.alloca() : memref<4xf32, #gpu.address_space<private>>
 //       CHECK:     memref.copy %{{.*}}, %[[ALLOC]]
-//  CHECK-SAME:       memref<1x1x4x4xf16, strided<[1310720, 4096, 64, 1], offset: ?>, #hal.descriptor_type<storage_buffer>>
-//  CHECK-SAME:       to memref<1x1x4x4xf16, #gpu.address_space<private>>
-//       CHECK:   } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
+//       CHECK:     vector.transfer_write %{{.*}}, %[[ALLOC]]
+
+// -----
+
+func.func @require_memspace_descriptor_write_in_subgroup_pcf(
+    %arg0: memref<4xf32, #hal.descriptor_type<storage_buffer>>) {
+  pcf.generic scope(#iree_gpu.subgroup_scope)
+    execute[%id: index, %n: index] {
+    %c0 = arith.constant 0 : index
+    %c3 = arith.constant 3 : index
+    %cst = arith.constant dense<0.0> : vector<2xf32>
+    %tensor = bufferization.to_tensor %arg0 restrict : memref<4xf32, #hal.descriptor_type<storage_buffer>> to tensor<4xf32>
+    %written = vector.transfer_write %cst, %tensor[%c0] {in_bounds = [true]} : vector<2xf32>, tensor<4xf32>
+    %element = tensor.extract %written[%c3] : tensor<4xf32>
+    util.optimization_barrier %element : f32
+    pcf.return
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @require_memspace_descriptor_write_in_subgroup_pcf
+//       CHECK:   pcf.generic scope(#iree_gpu.subgroup_scope)
+//       CHECK:     %[[ALLOC:.+]] = memref.alloc() : memref<4xf32, #gpu.address_space<workgroup>>
+//       CHECK:     memref.copy %{{.*}}, %[[ALLOC]]
+//       CHECK:     vector.transfer_write %{{.*}}, %[[ALLOC]]
+
+// -----
+
+func.func @require_memspace_descriptor_without_context_fails(
+    %arg0: memref<4xf32, #hal.descriptor_type<storage_buffer>>) {
+  %c0 = arith.constant 0 : index
+  %c3 = arith.constant 3 : index
+  %cst = arith.constant dense<0.0> : vector<2xf32>
+  %tensor = bufferization.to_tensor %arg0 restrict : memref<4xf32, #hal.descriptor_type<storage_buffer>> to tensor<4xf32>
+  // expected-error @+1 {{failed to bufferize op}}
+  %written = vector.transfer_write %cst, %tensor[%c0] {in_bounds = [true]} : vector<2xf32>, tensor<4xf32>
+  %element = tensor.extract %written[%c3] : tensor<4xf32>
+  util.optimization_barrier %element : f32
+  return
+}

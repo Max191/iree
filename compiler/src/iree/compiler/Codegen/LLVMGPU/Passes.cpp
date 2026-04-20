@@ -16,6 +16,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Passes.h"
+#include "iree/compiler/Codegen/Dialect/PCF/IR/PCFOps.h"
 #include "iree/compiler/Codegen/LLVMGPU/LLVMGPUConstraintGenerator.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
 #include "iree/compiler/Codegen/LLVMGPU/ROCDLPasses.h"
@@ -141,23 +142,61 @@ static bool hasThreadMapping(scf::ForallOp forall) {
                       llvm::IsaPred<gpu::GPUThreadMappingAttr>);
 }
 
+static std::optional<gpu::AddressSpace> getPCFScopeAddressSpace(
+    Attribute scope) {
+  if (isa<IREE::GPU::LaneScopeAttr>(scope)) {
+    return gpu::AddressSpace::Private;
+  }
+  if (isa<IREE::GPU::SubgroupScopeAttr>(scope)) {
+    return gpu::AddressSpace::Workgroup;
+  }
+  return std::nullopt;
+}
+
+// Walks outward from the insertion point and returns the innermost contextual
+// GPU allocation space. A thread-mapped scf.forall inside an outer PCF
+// subgroup scope is still private because the allocation is per mapped thread.
+static std::optional<gpu::AddressSpace>
+getContextualAllocationAddressSpace(OpBuilder &builder) {
+  Block *insertionBlock = builder.getInsertionBlock();
+  assert(insertionBlock &&
+         "bufferization allocation callback requires an insertion block");
+  for (Operation *parent = insertionBlock->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto genericOp = dyn_cast<IREE::PCF::GenericOp>(parent)) {
+      if (auto addressSpace = getPCFScopeAddressSpace(genericOp.getScope())) {
+        return addressSpace;
+      }
+      continue;
+    }
+    if (auto loopOp = dyn_cast<IREE::PCF::LoopOp>(parent)) {
+      if (auto addressSpace = getPCFScopeAddressSpace(loopOp.getScope())) {
+        return addressSpace;
+      }
+      continue;
+    }
+    if (auto forallOp = dyn_cast<scf::ForallOp>(parent);
+        forallOp && hasThreadMapping(forallOp)) {
+      return gpu::AddressSpace::Private;
+    }
+  }
+  return std::nullopt;
+}
+
 // All pipelines that use this allocation function distribute scf.forall ops
-// after bufferizing. This means that to differentiate between an allocation in
-// function memory and workgroup memory, we need to look for a parent
-// scf.forall op with a thread mapping. If not present, we allocate workgroup
-// memory. Pipelines that choose to distribute in a different order will have
-// to use a different allocation function.
+// after bufferizing. To differentiate between private and workgroup memory, we
+// use the innermost enclosing PCF lane or subgroup scope, or a thread-mapped
+// scf.forall. If none are present, we allocate workgroup memory. Pipelines that
+// choose to distribute in a different order will have to use a different
+// allocation function.
 static FailureOr<Value> gpuAllocationFn(OpBuilder &builder, Location loc,
                                         MemRefType memRefType,
                                         ValueRange dynamicSizes,
                                         unsigned alignment) {
-  Block *insertionBlock = builder.getInsertionBlock();
-  Operation *parent = insertionBlock->getParentOp();
-  scf::ForallOp enclosingForall = dyn_cast<scf::ForallOp>(parent);
-  if (!enclosingForall) {
-    enclosingForall = parent->getParentOfType<scf::ForallOp>();
-  }
-  if (enclosingForall && hasThreadMapping(enclosingForall)) {
+  std::optional<gpu::AddressSpace> contextualAddressSpace =
+      getContextualAllocationAddressSpace(builder);
+  if (contextualAddressSpace &&
+      *contextualAddressSpace == gpu::AddressSpace::Private) {
     auto addressSpace = gpu::AddressSpaceAttr::get(
         builder.getContext(), gpu::GPUDialect::getPrivateAddressSpace());
     auto allocType =
@@ -166,7 +205,6 @@ static FailureOr<Value> gpuAllocationFn(OpBuilder &builder, Location loc,
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
-
   auto addressSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
   auto allocType =
@@ -176,9 +214,8 @@ static FailureOr<Value> gpuAllocationFn(OpBuilder &builder, Location loc,
       .getResult();
 }
 
-// Barriers are only needed when copying to/from workgroup memory. The only
-// other kind of memory that can be allocated is function memory, which is local
-// to a thread.
+// Barriers are only needed when copying to/from workgroup memory. Private
+// memory is local to a thread and does not need a barrier.
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
   bool needsBarrier = false;
@@ -355,11 +392,21 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
                                                        ValueRange dynamicSizes,
                                                        unsigned alignment) {
   Attribute memorySpace = memRefType.getMemorySpace();
+  std::optional<gpu::AddressSpace> contextualAddressSpace =
+      getContextualAllocationAddressSpace(builder);
   // Bail out if the memref type specifies a nonnull memory space that is not
-  // #gpu.address_space.
+  // #gpu.address_space, except descriptor-space tensors that need a local copy
+  // during bufferization.
+  bool rewriteMemorySpace = false;
   if (memorySpace &&
       !isa<gpu::AddressSpaceAttr, amdgpu::AddressSpaceAttr>(memorySpace)) {
-    return failure();
+    if (!isa<IREE::HAL::DescriptorTypeAttr>(memorySpace) ||
+        !contextualAddressSpace) {
+      return failure();
+    }
+    memorySpace = gpu::AddressSpaceAttr::get(builder.getContext(),
+                                             *contextualAddressSpace);
+    rewriteMemorySpace = true;
   }
 
   MemRefType allocType = memRefType;
@@ -368,21 +415,43 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
   auto workgroupSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
   if (!memorySpace) {
+    // The required-memory-space path treats unexpected unannotated temporaries
+    // as private unless an enclosing GPU context says otherwise. This differs
+    // from gpuAllocationFn, which preserves the older workgroup default.
+    gpu::AddressSpace inferredAddressSpace =
+        contextualAddressSpace.value_or(gpu::AddressSpace::Private);
     allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
-                        AffineMap(), privateSpace);
-    memorySpace = privateSpace;
+                        AffineMap(),
+                        gpu::AddressSpaceAttr::get(builder.getContext(),
+                                                   inferredAddressSpace));
+    memorySpace = allocType.getMemorySpace();
+  } else if (rewriteMemorySpace) {
+    // Descriptor-backed tensors are materialized into dense local scratch
+    // buffers in the contextual GPU memory space.
+    allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), memorySpace);
   }
 
   if (memorySpace == privateSpace) {
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
-  allocType =
-      MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
-                      AffineMap(), workgroupSpace);
+  if (memorySpace != workgroupSpace) {
+    allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), workgroupSpace);
+  }
   return memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
       .getResult();
+}
+
+static LogicalResult gpuComprehensiveBufferizeMemCpyFn(OpBuilder &builder,
+                                                       Location loc, Value from,
+                                                       Value to) {
+  memref::CopyOp::create(builder, loc, from, to);
+  return success();
 }
 
 static void addGPUBufferizePasses(OpPassManager &funcPassManager) {
@@ -394,11 +463,8 @@ static void addGPUBufferizePasses(OpPassManager &funcPassManager) {
   funcPassManager.addPass(createGPUAllocPrivateMemoryForDPSOpsPass());
   BufferizationOptions::AllocationFn allocationFn =
       gpuRequireMemSpaceAllocationFn;
-  BufferizationOptions::MemCpyFn memcpyFn = [](OpBuilder &builder, Location loc,
-                                               Value from, Value to) {
-    memref::CopyOp::create(builder, loc, from, to);
-    return success();
-  };
+  BufferizationOptions::MemCpyFn memcpyFn =
+      gpuComprehensiveBufferizeMemCpyFn;
   funcPassManager.addPass(
       createIREEComprehensiveBufferizePass(allocationFn, memcpyFn));
 
@@ -1347,6 +1413,20 @@ void registerCodegenROCDLPasses() {
       "iree-codegen-llvmgpu-bufferization-pipeline",
       "Runs pass pipeline to bufferize for llvmgpu backends",
       [](OpPassManager &passManager) { addBufferizePasses(passManager); });
+
+  // Test-only pipeline for lit coverage of gpuRequireMemSpaceAllocationFn.
+  static PassPipelineRegistration<> LLVMGPUTestRequireMemSpaceBufferizePipeline(
+      "iree-codegen-llvmgpu-test-require-memspace-bufferization-pipeline",
+      "Runs an LLVMGPU lit regression test pipeline that bufferizes with "
+      "required GPU memory spaces",
+      [](OpPassManager &passManager) {
+        BufferizationOptions::AllocationFn allocationFn =
+            gpuRequireMemSpaceAllocationFn;
+        BufferizationOptions::MemCpyFn memcpyFn =
+            gpuComprehensiveBufferizeMemCpyFn;
+        passManager.addPass(
+            createIREEComprehensiveBufferizePass(allocationFn, memcpyFn));
+      });
 
   static PassPipelineRegistration<ROCDLPipelineOptions>
       LowerToROCMLLVMGPUPasses(
