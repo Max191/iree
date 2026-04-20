@@ -15,6 +15,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
+#include "iree/compiler/Codegen/Dialect/PCF/IR/PCFOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Passes.h"
 #include "iree/compiler/Codegen/Dialect/PCF/Transforms/Passes.h"
 #include "iree/compiler/Codegen/LLVMGPU/LLVMGPUConstraintGenerator.h"
@@ -152,13 +153,39 @@ static FailureOr<Value> gpuAllocationFn(OpBuilder &builder, Location loc,
                                         MemRefType memRefType,
                                         ValueRange dynamicSizes,
                                         unsigned alignment) {
-  Block *insertionBlock = builder.getInsertionBlock();
-  Operation *parent = insertionBlock->getParentOp();
-  scf::ForallOp enclosingForall = dyn_cast<scf::ForallOp>(parent);
-  if (!enclosingForall) {
-    enclosingForall = parent->getParentOfType<scf::ForallOp>();
-  }
-  if (enclosingForall && hasThreadMapping(enclosingForall)) {
+  auto getEnclosingAddressSpace = [&]() -> std::optional<gpu::AddressSpace> {
+    for (Operation *parent = builder.getInsertionBlock()->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (auto genericOp = dyn_cast<IREE::PCF::GenericOp>(parent)) {
+        if (isa<IREE::GPU::LaneScopeAttr>(genericOp.getScope())) {
+          return gpu::AddressSpace::Private;
+        }
+        if (isa<IREE::GPU::SubgroupScopeAttr>(genericOp.getScope())) {
+          return gpu::AddressSpace::Workgroup;
+        }
+        continue;
+      }
+      if (auto loopOp = dyn_cast<IREE::PCF::LoopOp>(parent)) {
+        if (isa<IREE::GPU::LaneScopeAttr>(loopOp.getScope())) {
+          return gpu::AddressSpace::Private;
+        }
+        if (isa<IREE::GPU::SubgroupScopeAttr>(loopOp.getScope())) {
+          return gpu::AddressSpace::Workgroup;
+        }
+        continue;
+      }
+      if (auto forallOp = dyn_cast<scf::ForallOp>(parent);
+          forallOp && hasThreadMapping(forallOp)) {
+        return gpu::AddressSpace::Private;
+      }
+    }
+    return std::nullopt;
+  };
+
+  std::optional<gpu::AddressSpace> contextualAddressSpace =
+      getEnclosingAddressSpace();
+  if (contextualAddressSpace &&
+      *contextualAddressSpace == gpu::AddressSpace::Private) {
     auto addressSpace = gpu::AddressSpaceAttr::get(
         builder.getContext(), gpu::GPUDialect::getPrivateAddressSpace());
     auto allocType =
@@ -167,7 +194,6 @@ static FailureOr<Value> gpuAllocationFn(OpBuilder &builder, Location loc,
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
-
   auto addressSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
   auto allocType =
@@ -367,12 +393,49 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
                                                        MemRefType memRefType,
                                                        ValueRange dynamicSizes,
                                                        unsigned alignment) {
+  auto getEnclosingAddressSpace = [&]() -> std::optional<gpu::AddressSpace> {
+    for (Operation *parent = builder.getInsertionBlock()->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (auto genericOp = dyn_cast<IREE::PCF::GenericOp>(parent)) {
+        if (isa<IREE::GPU::LaneScopeAttr>(genericOp.getScope())) {
+          return gpu::AddressSpace::Private;
+        }
+        if (isa<IREE::GPU::SubgroupScopeAttr>(genericOp.getScope())) {
+          return gpu::AddressSpace::Workgroup;
+        }
+        continue;
+      }
+      if (auto loopOp = dyn_cast<IREE::PCF::LoopOp>(parent)) {
+        if (isa<IREE::GPU::LaneScopeAttr>(loopOp.getScope())) {
+          return gpu::AddressSpace::Private;
+        }
+        if (isa<IREE::GPU::SubgroupScopeAttr>(loopOp.getScope())) {
+          return gpu::AddressSpace::Workgroup;
+        }
+        continue;
+      }
+      if (auto forallOp = dyn_cast<scf::ForallOp>(parent);
+          forallOp && hasThreadMapping(forallOp)) {
+        return gpu::AddressSpace::Private;
+      }
+    }
+    return std::nullopt;
+  };
+
   Attribute memorySpace = memRefType.getMemorySpace();
+  std::optional<gpu::AddressSpace> contextualAddressSpace =
+      getEnclosingAddressSpace();
   // Bail out if the memref type specifies a nonnull memory space that is not
-  // #gpu.address_space.
+  // #gpu.address_space, except descriptor-space tensors that need a local copy
+  // during bufferization.
   if (memorySpace &&
       !isa<gpu::AddressSpaceAttr, amdgpu::AddressSpaceAttr>(memorySpace)) {
-    return failure();
+    if (!isa<IREE::HAL::DescriptorTypeAttr>(memorySpace) ||
+        !contextualAddressSpace) {
+      return failure();
+    }
+    memorySpace = gpu::AddressSpaceAttr::get(builder.getContext(),
+                                             *contextualAddressSpace);
   }
 
   MemRefType allocType = memRefType;
@@ -381,10 +444,18 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
   auto workgroupSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
   if (!memorySpace) {
+    gpu::AddressSpace inferredAddressSpace =
+        contextualAddressSpace.value_or(gpu::AddressSpace::Private);
     allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
-                        AffineMap(), privateSpace);
-    memorySpace = privateSpace;
+                        AffineMap(),
+                        gpu::AddressSpaceAttr::get(builder.getContext(),
+                                                   inferredAddressSpace));
+    memorySpace = allocType.getMemorySpace();
+  } else if (memorySpace == privateSpace || memorySpace == workgroupSpace) {
+    allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), memorySpace);
   }
 
   if (memorySpace == privateSpace) {
