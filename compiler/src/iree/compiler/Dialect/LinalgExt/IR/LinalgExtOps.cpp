@@ -2791,18 +2791,20 @@ LogicalResult Im2colOp::verify() {
   }
 
   // Verify inner sizes for each output dim type (Batch, M, K) separately.
-  // Output dims in canonical order are: [Batch..., M..., K...].
+  // Output dims in canonical order are: [Batch..., M..., K...], corresponding
+  // to GEMM batch / M / K roles.
   //
-  // Batch output dims: each produces 1 coordinate (batch index).
+  // Batch output dims (GEMM batch): each produces 1 coordinate.
   //   -> total inner sizes across all batch dims = batchPos.size()
   //
-  // M output dims: collectively produce mPos.size() coordinates
-  //   (spatial output positions, one per spatial dimension).
+  // M output dims (GEMM M): collectively produce mPos.size() coordinates
+  //   (one per M input dim, whether windowed-spatial or passthrough).
   //   -> total inner sizes across all M dims = mPos.size()
   //
-  // K output dims: collectively produce (mPos.size() + kPos.size())
-  //   coordinates (kernel window offsets + channel positions,
-  //   indexed by input_k_perm).
+  // K output dims (GEMM K): collectively produce (mPos.size() + kPos.size())
+  //   coordinates (one window offset per M input dim + one channel coordinate
+  //   per K input dim, indexed by input_k_perm). Passthrough M dims contribute
+  //   a size-1 window-offset slot.
   //   -> total inner sizes across all K dims = mPos.size() + kPos.size()
   int64_t numBatchOutputDims = batchPos.size();
   int64_t expectedBatchInner = batchPos.size();

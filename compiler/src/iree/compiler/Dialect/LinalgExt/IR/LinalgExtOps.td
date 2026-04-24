@@ -1411,16 +1411,22 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
 
     #### Attributes
 
-    **Convolution metadata** — derived from the original convolution:
-    - `strides`: spatial stride per m_pos dimension.
-    - `dilations`: dilation factor per m_pos dimension.
-    - `kernel_size`: filter kernel extent per m_pos dimension.
+    **Convolution metadata** — one entry per `m_pos` dimension:
+    - `strides`: spatial stride per m_pos dimension (1 for passthrough M dims).
+    - `dilations`: dilation factor per m_pos dimension (1 for passthrough M dims).
+    - `kernel_size`: filter kernel extent per m_pos dimension (1 for passthrough
+      M dims).
 
-    **Dimension mapping** — describes which input dimensions are batch, spatial
-    (M), or reduction (K):
-    - `batch_pos`: input dimensions that are batch (pass-through to output).
-    - `m_pos`: input dimensions that are spatial (indexed by stride/dilation).
-    - `k_pos`: input dimensions that are channels (direct index).
+    **Dimension mapping** — classifies each input dimension by its role in the
+    subsequent GEMM:
+    - `batch_pos`: input dimensions that are GEMM batch dimensions (present in
+      both the image-side and filter-side of the IGEMM, e.g. conv groups/depth).
+    - `m_pos`: input dimensions that become GEMM M dimensions. This includes
+      convolution spatial dims (windowed with stride/dilation/kernel_size) and
+      convolution batch dims (passthrough with trivial stride=1, dilation=1,
+      kernel_size=1 — present in the image-side and output but absent from the
+      filter).
+    - `k_pos`: input channel dimensions that become part of GEMM K.
 
     **Indexing**:
     - `offsets`: one offset per output dimension in canonical
@@ -1461,57 +1467,62 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     #### Semantics
 
     For each output position `(b, m, k)`, the op computes input coordinates,
-    where `i` indexes over `m_pos` dimensions (spatial) and `j` indexes over
-    `k_pos` dimensions (channel):
+    where `i` indexes over `m_pos` dimensions (GEMM M) and `j` indexes over
+    `k_pos` dimensions (GEMM K channel):
     ```
       spatial_coord[i] = m_coord[i] * stride[i] + window_offset[i] * dilation[i]
       channel_coord[j] = k_coord[j]
     ```
     where `m_coord` and `window_offset`/`k_coord` come from delinearizing the
-    M and K output indices using `output_sizes`.
+    M and K output indices using `output_sizes`. For passthrough M dimensions
+    (those originating from convolution batch dims) `stride=dilation=1` and
+    the corresponding `window_offset` is drawn from a size-1 coordinate, so the
+    formula reduces to `spatial_coord[i] = m_coord[i]`.
 
     #### Examples
 
-    Basic im2col (NHWC conv, 3x3 kernel):
+    Basic im2col (NHWC conv, 3x3 kernel). The conv batch dim (N) is a
+    passthrough M dim with `stride=dilation=kernel_size=1`, so its K window
+    offset is a size-1 coordinate:
     ```mlir
       %im2col = iree_linalg_ext.im2col
-          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-          offsets = [0, 0, 0]
-          output_sizes = [[2], [32, 32], [3, 3, 640]]
-          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
-          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [1, 3, 3]
+          offsets = [0, 0, 0, 0]
+          output_sizes = [[2], [32], [32], [1, 3, 3, 640]]
+          batch_pos = [] m_pos = [0, 1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2, 3] output_perm = [0, 1, 2, 3]
           ins(%in : tensor<2x34x34x640xf32>)
-          outs(%out : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+          outs(%out : tensor<2x32x32x5760xf32>) -> tensor<2x32x32x5760xf32>
     ```
 
     With input padding (same padding absorbed from tensor.pad):
     ```mlir
       %im2col = iree_linalg_ext.im2col
-          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-          offsets = [0, 0, 0]
-          output_sizes = [[2], [34, 34], [3, 3, 640]]
-          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
-          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+          strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [1, 3, 3]
+          offsets = [0, 0, 0, 0]
+          output_sizes = [[2], [34], [34], [1, 3, 3, 640]]
+          batch_pos = [] m_pos = [0, 1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2, 3] output_perm = [0, 1, 2, 3]
           input_pad_low = [0, 1, 1, 0] input_pad_high = [0, 1, 1, 0]
           pad_value(%cst : f32)
           ins(%in : tensor<2x34x34x640xf32>)
-          outs(%out : tensor<2x1156x5760xf32>) -> tensor<2x1156x5760xf32>
+          outs(%out : tensor<2x34x34x5760xf32>) -> tensor<2x34x34x5760xf32>
     ```
 
     With output-only padding (GEMM alignment, no input padding):
     ```mlir
-      // M valid = 32*32 = 1024; output has 1040 (16 extra M positions filled
-      // with pad_value for GEMM alignment). K valid = 3*3*640 = 5760.
+      // M valid = 2*32*32 = 2048; one output M dim has 16 extra positions
+      // filled with pad_value for GEMM alignment. K valid = 1*3*3*640 = 5760.
       %im2col = iree_linalg_ext.im2col
-          strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-          offsets = [0, 0, 0]
-          output_sizes = [[2], [32, 32], [3, 3, 640]]
-          batch_pos = [0] m_pos = [1, 2] k_pos = [3]
-          input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
-          output_pad_low = [0, 0, 0] output_pad_high = [0, 16, 0]
+          strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [1, 3, 3]
+          offsets = [0, 0, 0, 0]
+          output_sizes = [[2], [32], [32], [1, 3, 3, 640]]
+          batch_pos = [] m_pos = [0, 1, 2] k_pos = [3]
+          input_k_perm = [0, 1, 2, 3] output_perm = [0, 1, 2, 3]
+          output_pad_low = [0, 0, 0, 0] output_pad_high = [0, 0, 16, 0]
           pad_value(%cst : f32)
           ins(%in : tensor<2x34x34x640xf32>)
-          outs(%out : tensor<2x1040x5760xf32>) -> tensor<2x1040x5760xf32>
+          outs(%out : tensor<2x32x48x5760xf32>) -> tensor<2x32x48x5760xf32>
     ```
   }];
 

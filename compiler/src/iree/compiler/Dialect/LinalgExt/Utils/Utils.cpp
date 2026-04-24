@@ -426,10 +426,14 @@ bool isGatherlikeOp(Operation *op) {
 // IGEMM details for generic convolutions
 //===---------------------------------------------------------------------===//
 
-/// Classification of IGEMM dims from the image/im2col perspective.
-/// Batch includes both batch and depth (group) dims. M is output spatial
-/// dims. InputChannel and FilterLoop are the two subcategories of reduction
-/// dims. The canonical im2col output order is:
+/// Classification of IGEMM dims from the image/im2col perspective, matching
+/// GEMM roles. Batch is the GEMM batch — conv depth/group dims, which appear
+/// in both the image-side and filter-side of the IGEMM. M is the GEMM M — conv
+/// output-image (spatial) dims plus conv batch dims; both kinds of M appear on
+/// the image side but not the filter side, with spatial dims windowed and
+/// conv-batch dims passthrough. InputChannel and FilterLoop are the two
+/// subcategories of reduction dims (GEMM K). The canonical im2col output order
+/// is:
 ///   [Batch, M, InputChannel, FilterLoop].
 enum class Im2colDimKind {
   Batch,
@@ -462,13 +466,19 @@ static SmallVector<int64_t> computeIm2colOutputPermutation(
 
   auto classifyIgemmDim = [&](int64_t igemmDim) -> Im2colDimKind {
     ArrayRef<int64_t> convDimGroup = igemmDimToConvDims[igemmDim];
+    // GEMM batch = conv depth/group dims (present on both LHS and RHS of the
+    // IGEMM).
     if (llvm::all_of(convDimGroup, [&](int64_t convDim) {
-          return batchDimSet.contains(convDim) || depthDimSet.contains(convDim);
+          return depthDimSet.contains(convDim);
         })) {
       return Im2colDimKind::Batch;
     }
+    // GEMM M = conv output-image (windowed spatial) dims and conv batch dims
+    // (passthrough). Both kinds are present on the image side of the IGEMM but
+    // absent from the filter side.
     if (llvm::all_of(convDimGroup, [&](int64_t convDim) {
-          return outputImageDimSet.contains(convDim);
+          return outputImageDimSet.contains(convDim) ||
+                 batchDimSet.contains(convDim);
         })) {
       return Im2colDimKind::M;
     }
