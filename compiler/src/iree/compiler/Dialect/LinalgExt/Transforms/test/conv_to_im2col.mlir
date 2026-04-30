@@ -1,5 +1,8 @@
 // RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(util.func(iree-linalg-ext-convert-conv-to-im2col-op))" %s | FileCheck %s
 
+// Conv batch dims are GEMM M, not im2col batch_pos. They are passthrough M
+// entries with size-1 K window offsets; only conv depth/group dims that appear
+// in both image and filter become batch_pos.
 util.func public @conv_2d_nhwc_hwcf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<3x3x4x16xf32>, %arg2: tensor<1x14x14x16xf32>) -> tensor<1x14x14x16xf32> {
   %0 = linalg.conv_2d_nhwc_hwcf
     {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64> }
@@ -623,6 +626,8 @@ util.func public @conv_2d_ngchw_fgchw_gnfhw(%arg0: tensor<2x7x4x10x10xf32>, %arg
 // CHECK-SAME:   %[[OUT:.+]]: [[OUT_T:tensor<7x2x16x8x8xf32>]]
 // CHECK:      %[[EMPTY:.+]] = tensor.empty() : [[RHS_T:tensor<2x7x36x8x8xf32>]]
 // CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
+// CHECK-SAME:   strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [1, 3, 3]
+// CHECK-SAME:   offsets = [0, 0, 0, 0, 0] output_sizes = {{\[}}[7], [2], [8], [8], [1, 4, 3, 3]]
 // CHECK-SAME:   batch_pos = [1] m_pos = [0, 3, 4] k_pos = [2]
 // CHECK-SAME:   input_k_perm = [0, 1, 2, 3] output_perm = [1, 0, 4, 2, 3]
 // CHECK-SAME:   ins(%[[IMG]] : [[IMG_T]])
@@ -635,3 +640,28 @@ util.func public @conv_2d_ngchw_fgchw_gnfhw(%arg0: tensor<2x7x4x10x10xf32>, %arg
 // CHECK-SAME:   outs(%[[OUT]] : [[OUT_T]]) {
 // CHECK:      }
 // CHECK:      util.return %[[MATMUL]]
+
+// -----
+
+// Unsupported conv-like maps must fail the pattern cleanly instead of forcing
+// im2col metadata. Here the filter uses reduction dim d7 where the input uses
+// d4, so the filter/input reduction pairing is not a valid convolution.
+#map = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7) -> (d0, d1 + d5, d2 + d6, d4)>
+#map1 = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7) -> (d5, d6, d7, d3)>
+#map2 = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7) -> (d0, d1, d2, d3)>
+util.func public @unsupported_filter_reduction_not_in_input(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<3x3x4x16xf32>, %arg2: tensor<1x14x14x16xf32>) -> tensor<1x14x14x16xf32> {
+  %0 = linalg.generic {
+    indexing_maps = [#map, #map1, #map2],
+    iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction", "reduction", "reduction"]
+  } ins(%arg0, %arg1 : tensor<1x16x16x4xf32>, tensor<3x3x4x16xf32>) outs(%arg2 : tensor<1x14x14x16xf32>) {
+  ^bb0(%in: f32, %in_0: f32, %out: f32):
+    %1 = arith.mulf %in, %in_0 : f32
+    %2 = arith.addf %out, %1 : f32
+    linalg.yield %2 : f32
+  } -> tensor<1x14x14x16xf32>
+  util.return %0 : tensor<1x14x14x16xf32>
+}
+// CHECK-LABEL: util.func public @unsupported_filter_reduction_not_in_input(
+// CHECK:      linalg.generic
+// CHECK-NOT:  iree_linalg_ext.im2col
+// CHECK:      util.return

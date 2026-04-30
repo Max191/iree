@@ -1467,17 +1467,17 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     #### Semantics
 
     For each output position `(b, m, k)`, the op computes input coordinates,
-    where `i` indexes over `m_pos` dimensions (GEMM M) and `j` indexes over
-    `k_pos` dimensions (GEMM K channel):
+    where `i` indexes over `m_pos` dimensions (GEMM M: spatial or
+    passthrough) and `j` indexes over `k_pos` dimensions (GEMM K channel):
     ```
-      spatial_coord[i] = m_coord[i] * stride[i] + window_offset[i] * dilation[i]
+      m_input_coord[i] = m_coord[i] * stride[i] + window_offset[i] * dilation[i]
       channel_coord[j] = k_coord[j]
     ```
     where `m_coord` and `window_offset`/`k_coord` come from delinearizing the
     M and K output indices using `output_sizes`. For passthrough M dimensions
     (those originating from convolution batch dims) `stride=dilation=1` and
     the corresponding `window_offset` is drawn from a size-1 coordinate, so the
-    formula reduces to `spatial_coord[i] = m_coord[i]`.
+    formula reduces to `m_input_coord[i] = m_coord[i]`.
 
     #### Examples
 
