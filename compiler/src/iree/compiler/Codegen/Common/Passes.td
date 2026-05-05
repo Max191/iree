@@ -647,7 +647,9 @@ def GenericVectorizationPass :
             /*default=*/"2147483647",
            "Max vector size allowed to avoid creating large vectors.">,
     Option<"vectorizeMapStore", "vectorize-map-store", "bool", /*default=*/"false",
-      "Enable vectorization of iree_linalg_ext.map_store operations via VectorizableOpInterface.">
+      "Enable vectorization of iree_linalg_ext.map_store operations via VectorizableOpInterface. "
+      "Production pipelines enabling this should run "
+      "iree-codegen-annotate-map-store-contiguous-dim-hints immediately before this pass.">
   ];
   let dependentDialects = [
     "::mlir::arith::ArithDialect"
@@ -875,6 +877,23 @@ def MaterializeVectorTileSizesPass :
   let description = [{
     Propagate vector tile sizes from to_layout anchors and materialize them as
     discardable attributes on compute ops.
+  }];
+}
+
+def AnnotateMapStoreContiguousDimHintsPass :
+    InterfacePass<"iree-codegen-annotate-map-store-contiguous-dim-hints",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Annotate exact contiguous dimensions on map_store ops";
+  let description = [{
+    Annotates `iree_linalg_ext.map_store` ops with `contiguous_dim_hints` for
+    yielded output indices that are exactly an input block argument plus a
+    constant, expressed either directly or through one single-result
+    `affine.apply` with add-only constant folding. Ambiguous projections and
+    other equivalent arithmetic forms are intentionally left unhinted. Ops with
+    existing `contiguous_dim_hints` are treated as already annotated and are not
+    completed by this pass. Each hint is an internal metadata pair `(inputDim,
+    outputDim)` stating that `inputDim` can be represented as a contiguous
+    base-map dimension in `outputDim`.
   }];
 }
 

@@ -75,6 +75,7 @@ iree_compiler_cc_library(
     srcs = [
         "AbsorbSwizzleHintToAlloc.cpp",
         "AddFastMathFlags.cpp",
+        "AnnotateMapStoreContiguousDimHints.cpp",
         "BlockDynamicDimensions.cpp",
         "BubbleUpOrdinalOps.cpp",
         "BufferizationAnalysis.cpp",

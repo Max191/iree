@@ -17,6 +17,7 @@ iree_lit_test_suite(
     "absorb_swizzle_hint_to_alloc.mlir"
     "add_fmfs.mlir"
     "affinemin_canonicalization.mlir"
+    "annotate_map_store_contiguous_dim_hints.mlir"
     "batch_matmuls.mlir"
     "block_dynamic_dims.mlir"
     "bubble_up_ordinal_ops.mlir"

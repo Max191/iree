@@ -17,6 +17,7 @@ package(
 iree_compiler_cc_library(
     name = "Utils",
     srcs = [
+        "AffineExprUtils.cpp",
         "CPUUtils.cpp",
         "CodegenPipelineOptions.cpp",
         "EncodingUtils.cpp",
@@ -28,6 +29,7 @@ iree_compiler_cc_library(
         "Utils.cpp",
     ],
     hdrs = [
+        "AffineExprUtils.h",
         "CPUUtils.h",
         "CodegenPipelineOptions.h",
         "EncodingUtils.h",

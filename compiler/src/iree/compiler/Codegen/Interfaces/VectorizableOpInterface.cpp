@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
+#include "iree/compiler/Codegen/Utils/AffineExprUtils.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/Im2colUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
@@ -34,7 +35,6 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/ScopeExit.h"
-#include "llvm/Support/CheckedArithmetic.h"
 
 // clang-format off
 #include "iree/compiler/Codegen/Interfaces/VectorizableOpInterface.cpp.inc"
@@ -463,7 +463,7 @@ struct MapStoreOutputDimPlan {
   SmallVector<int64_t> contiguousInputDims;
 };
 
-/// The helpers below support two contiguity modes:
+/// Map store vectorization supports two contiguity modes:
 ///   1. The legacy automatic innermost-dim path, which only recognizes
 ///      `inputIndex` and affine.apply expressions equivalent to
 ///      `inputIndex + constant`.
@@ -472,78 +472,6 @@ struct MapStoreOutputDimPlan {
 ///      are unit-coefficient contributors to exactly one output dim.
 /// Both modes are restricted to cases transfer_scatter can represent as a
 /// contiguous vector dimension plus an optional scalar/vector base component.
-static std::optional<int64_t> getConstantAffineExprValue(AffineExpr expr) {
-  if (auto constantExpr = dyn_cast<AffineConstantExpr>(expr)) {
-    return constantExpr.getValue();
-  }
-  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
-  if (!binaryExpr || binaryExpr.getKind() != AffineExprKind::Add) {
-    return std::nullopt;
-  }
-  std::optional<int64_t> lhs = getConstantAffineExprValue(binaryExpr.getLHS());
-  std::optional<int64_t> rhs = getConstantAffineExprValue(binaryExpr.getRHS());
-  if (!lhs || !rhs) {
-    return std::nullopt;
-  }
-  return llvm::checkedAdd(*lhs, *rhs);
-}
-
-static std::optional<int64_t>
-getUnitDimPlusConstantOffset(AffineExpr expr, unsigned dimPosition) {
-  if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
-    if (dimExpr.getPosition() == dimPosition) {
-      return 0;
-    }
-    return std::nullopt;
-  }
-  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
-  if (!binaryExpr || binaryExpr.getKind() != AffineExprKind::Add) {
-    return std::nullopt;
-  }
-  if (std::optional<int64_t> lhsOffset =
-          getUnitDimPlusConstantOffset(binaryExpr.getLHS(), dimPosition)) {
-    if (std::optional<int64_t> rhsConstant =
-            getConstantAffineExprValue(binaryExpr.getRHS())) {
-      return llvm::checkedAdd(*lhsOffset, *rhsConstant);
-    }
-  }
-  if (std::optional<int64_t> rhsOffset =
-          getUnitDimPlusConstantOffset(binaryExpr.getRHS(), dimPosition)) {
-    if (std::optional<int64_t> lhsConstant =
-            getConstantAffineExprValue(binaryExpr.getLHS())) {
-      return llvm::checkedAdd(*rhsOffset, *lhsConstant);
-    }
-  }
-  return std::nullopt;
-}
-
-static std::optional<int64_t> getConstantUnitOffset(Value outputIndex,
-                                                    Value inputIndex) {
-  if (outputIndex == inputIndex) {
-    return 0;
-  }
-  auto applyOp = outputIndex.getDefiningOp<affine::AffineApplyOp>();
-  if (!applyOp || applyOp.getAffineMap().getNumResults() != 1) {
-    return std::nullopt;
-  }
-
-  std::optional<unsigned> inputOperandPosition;
-  for (auto [position, operand] : llvm::enumerate(applyOp.getMapOperands())) {
-    if (operand != inputIndex) {
-      continue;
-    }
-    if (inputOperandPosition) {
-      return std::nullopt;
-    }
-    inputOperandPosition = position;
-  }
-  if (!inputOperandPosition) {
-    return std::nullopt;
-  }
-  return getUnitDimPlusConstantOffset(applyOp.getAffineMap().getResult(0),
-                                      *inputOperandPosition);
-}
-
 static FailureOr<AffineExpr> getMapStoreAffineIndexExpr(
     Value value, IREE::LinalgExt::MapStoreOp mapStoreOp,
     DenseMap<Value, AffineExpr> &exprMemo, DenseSet<Value> &inFlight) {
@@ -1011,7 +939,8 @@ struct MapStoreOpVectorizationModel
       // the inner input index plus a constant offset.
       Value innermostOutputIdx =
           mapStoreOp.getOutputIndex(mapStoreOp.getOutputRank() - 1);
-      if (!getConstantUnitOffset(innermostOutputIdx, innermostInputIdx)) {
+      if (!getConstantUnitOffset(innermostOutputIdx, innermostInputIdx)
+               .has_value()) {
         return false;
       }
     }
@@ -1042,7 +971,7 @@ struct MapStoreOpVectorizationModel
     std::optional<int64_t> innermostOffset =
         getConstantUnitOffset(innermostOutputIdx, innermostInputIdx);
     const bool preserveInnermostContiguousDim =
-        !maskDependsOnInnermostInput && innermostOffset;
+        !maskDependsOnInnermostInput && innermostOffset.has_value();
 
     FailureOr<SmallVector<MapStoreOutputDimPlan>> maybeOutputPlans =
         getMapStoreOutputDimPlans(mapStoreOp, rewriter);
