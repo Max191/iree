@@ -18,6 +18,7 @@
 #include "iree/compiler/Utils/Indexing.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Transforms/Transforms.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
@@ -449,6 +450,224 @@ struct ToLayoutOpVectorizationModel
   }
 };
 
+struct MapStoreIndexVectorizationResult {
+  SmallVector<Value> outputIndexVectors;
+  Value maskVector;
+};
+
+/// The helpers below intentionally recognize only `inputIndex` and affine.apply
+/// expressions equivalent to `inputIndex + constant`, because transfer_scatter
+/// can represent the contiguous dimension plus a scalar base offset, but not a
+/// per-lane offset vector added to a contiguous dimension.
+static std::optional<int64_t> getConstantAffineExprValue(AffineExpr expr) {
+  if (auto constantExpr = dyn_cast<AffineConstantExpr>(expr)) {
+    return constantExpr.getValue();
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binaryExpr || binaryExpr.getKind() != AffineExprKind::Add) {
+    return std::nullopt;
+  }
+  std::optional<int64_t> lhs = getConstantAffineExprValue(binaryExpr.getLHS());
+  std::optional<int64_t> rhs = getConstantAffineExprValue(binaryExpr.getRHS());
+  if (!lhs || !rhs) {
+    return std::nullopt;
+  }
+  return *lhs + *rhs;
+}
+
+static std::optional<int64_t>
+getUnitDimPlusConstantOffset(AffineExpr expr, unsigned dimPosition) {
+  if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+    if (dimExpr.getPosition() == dimPosition) {
+      return 0;
+    }
+    return std::nullopt;
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binaryExpr || binaryExpr.getKind() != AffineExprKind::Add) {
+    return std::nullopt;
+  }
+  if (std::optional<int64_t> lhsOffset =
+          getUnitDimPlusConstantOffset(binaryExpr.getLHS(), dimPosition)) {
+    if (std::optional<int64_t> rhsConstant =
+            getConstantAffineExprValue(binaryExpr.getRHS())) {
+      return *lhsOffset + *rhsConstant;
+    }
+  }
+  if (std::optional<int64_t> rhsOffset =
+          getUnitDimPlusConstantOffset(binaryExpr.getRHS(), dimPosition)) {
+    if (std::optional<int64_t> lhsConstant =
+            getConstantAffineExprValue(binaryExpr.getLHS())) {
+      return *rhsOffset + *lhsConstant;
+    }
+  }
+  return std::nullopt;
+}
+
+static std::optional<int64_t> getConstantUnitOffset(Value outputIndex,
+                                                    Value inputIndex) {
+  if (outputIndex == inputIndex) {
+    return 0;
+  }
+  auto applyOp = outputIndex.getDefiningOp<affine::AffineApplyOp>();
+  if (!applyOp || applyOp.getAffineMap().getNumResults() != 1) {
+    return std::nullopt;
+  }
+
+  std::optional<unsigned> inputOperandPosition;
+  for (auto [position, operand] : llvm::enumerate(applyOp.getMapOperands())) {
+    if (operand != inputIndex) {
+      continue;
+    }
+    if (inputOperandPosition) {
+      return std::nullopt;
+    }
+    inputOperandPosition = position;
+  }
+  if (!inputOperandPosition) {
+    return std::nullopt;
+  }
+  return getUnitDimPlusConstantOffset(applyOp.getAffineMap().getResult(0),
+                                      *inputOperandPosition);
+}
+
+static FailureOr<MapStoreIndexVectorizationResult>
+vectorizeMapStoreIndicesAndMask(
+    IREE::LinalgExt::MapStoreOp mapStoreOp, RewriterBase &rewriter,
+    ArrayRef<int64_t> iterationShape) {
+  Location loc = mapStoreOp.getLoc();
+  RewriterBase::InsertionGuard insertionGuard(rewriter);
+  rewriter.setInsertionPoint(mapStoreOp);
+
+  auto bodyBuilder = [&](OpBuilder &builder, Location nestedLoc,
+                         ValueRange args) {
+    auto inlineBodyBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
+                                 ArrayRef<Value> yieldedValues) {
+      SmallVector<Value> results;
+      llvm::append_range(results, yieldedValues.drop_back(/*N=*/1));
+      results.push_back(yieldedValues.back());
+      linalg::YieldOp::create(inlineBuilder, inlineLoc, results);
+    };
+    SmallVector<Value> indices = llvm::map_to_vector(
+        llvm::seq<int64_t>(mapStoreOp.getInputRank()),
+        [&](int64_t dim) -> Value {
+          return linalg::IndexOp::create(builder, nestedLoc,
+                                         builder.getIndexType(), dim);
+        });
+    mapStoreOp.inlineMapStoreBody(builder, nestedLoc, indices,
+                                  inlineBodyBuilder);
+  };
+
+  SmallVector<Value> outputTensors;
+  for (int64_t i = 0, e = mapStoreOp.getOutputRank(); i < e; ++i) {
+    outputTensors.push_back(tensor::EmptyOp::create(
+        rewriter, loc, iterationShape, rewriter.getIndexType()));
+  }
+  outputTensors.push_back(tensor::EmptyOp::create(
+      rewriter, loc, iterationShape, rewriter.getIntegerType(1)));
+
+  SmallVector<AffineMap> maps(
+      outputTensors.size(),
+      rewriter.getMultiDimIdentityMap(mapStoreOp.getInputRank()));
+  SmallVector<utils::IteratorType> iterTypes(mapStoreOp.getInputRank(),
+                                             utils::IteratorType::parallel);
+  auto genericOp = linalg::GenericOp::create(
+      rewriter, loc, TypeRange(outputTensors), ValueRange(), outputTensors,
+      maps, iterTypes, bodyBuilder);
+  auto eraseUnusedOutputTensors = [&]() {
+    for (Value outputTensor : outputTensors) {
+      Operation *definingOp = outputTensor.getDefiningOp();
+      if (definingOp && definingOp->use_empty()) {
+        rewriter.eraseOp(definingOp);
+      }
+    }
+  };
+  auto eraseGenericAndUnusedTensors = [&]() {
+    if (genericOp->use_empty()) {
+      rewriter.eraseOp(genericOp);
+    }
+    eraseUnusedOutputTensors();
+  };
+
+  SmallVector<affine::AffineLinearizeIndexOp> linearizeOps(
+      genericOp.getBody()->getOps<affine::AffineLinearizeIndexOp>());
+  for (auto linearizeOp : linearizeOps) {
+    rewriter.setInsertionPoint(linearizeOp);
+    if (failed(affine::lowerAffineLinearizeIndexOp(rewriter, linearizeOp))) {
+      eraseGenericAndUnusedTensors();
+      return rewriter.notifyMatchFailure(
+          mapStoreOp, "failed to lower affine.linearize_index op");
+    }
+  }
+  SmallVector<affine::AffineDelinearizeIndexOp> delinearizeOps(
+      genericOp.getBody()->getOps<affine::AffineDelinearizeIndexOp>());
+  for (auto delinearizeOp : delinearizeOps) {
+    rewriter.setInsertionPoint(delinearizeOp);
+    if (failed(
+            affine::lowerAffineDelinearizeIndexOp(rewriter, delinearizeOp))) {
+      eraseGenericAndUnusedTensors();
+      return rewriter.notifyMatchFailure(
+          mapStoreOp, "failed to lower affine.delinearize_index op");
+    }
+  }
+
+  // linalg::vectorize is expected to replace each auxiliary tensor result with
+  // a vector.transfer_write carrying the computed index or mask vector. The
+  // replacement order follows the output tensor order above: one index tensor
+  // for each map_store output dimension, followed by the mask tensor.
+  FailureOr<linalg::VectorizationResult> vectorizationResult =
+      linalg::vectorize(rewriter, genericOp);
+  if (failed(vectorizationResult)) {
+    eraseGenericAndUnusedTensors();
+    return rewriter.notifyMatchFailure(mapStoreOp,
+                                       "failed to vectorize index computation");
+  }
+  auto eraseVectorizationResultsAndGeneric = [&]() {
+    for (Value replacement : vectorizationResult->replacements) {
+      Operation *definingOp = replacement.getDefiningOp();
+      if (definingOp && definingOp->use_empty()) {
+        rewriter.eraseOp(definingOp);
+      }
+    }
+    eraseGenericAndUnusedTensors();
+  };
+
+  SmallVector<Value> outputIndexVectors;
+  outputIndexVectors.reserve(mapStoreOp.getOutputRank());
+  SmallVector<vector::TransferWriteOp> outputIndexWriteOps;
+  outputIndexWriteOps.reserve(mapStoreOp.getOutputRank());
+  for (Value replacement :
+       ArrayRef(vectorizationResult->replacements)
+           .take_front(mapStoreOp.getOutputRank())) {
+    auto writeOp = replacement.getDefiningOp<vector::TransferWriteOp>();
+    if (!writeOp) {
+      eraseVectorizationResultsAndGeneric();
+      return rewriter.notifyMatchFailure(mapStoreOp,
+                                         "expected vector.transfer_write");
+    }
+    outputIndexVectors.push_back(writeOp.getVector());
+    outputIndexWriteOps.push_back(writeOp);
+  }
+
+  auto maskWriteOp = vectorizationResult->replacements.back()
+                         .getDefiningOp<vector::TransferWriteOp>();
+  if (!maskWriteOp) {
+    eraseVectorizationResultsAndGeneric();
+    return rewriter.notifyMatchFailure(mapStoreOp,
+                                       "expected mask vector.transfer_write");
+  }
+  Value maskVector = maskWriteOp.getVector();
+  for (vector::TransferWriteOp writeOp : outputIndexWriteOps) {
+    rewriter.eraseOp(writeOp);
+  }
+  rewriter.eraseOp(maskWriteOp);
+  rewriter.eraseOp(genericOp);
+  eraseUnusedOutputTensors();
+
+  return MapStoreIndexVectorizationResult{std::move(outputIndexVectors),
+                                          maskVector};
+}
+
 struct MapStoreOpVectorizationModel
     : VectorizableOpInterface::ExternalModel<MapStoreOpVectorizationModel,
                                              IREE::LinalgExt::MapStoreOp> {
@@ -483,10 +702,10 @@ struct MapStoreOpVectorizationModel
         return false;
       }
       // Next check that the inner index of the yield is a unit function of
-      // the inner input index.
+      // the inner input index plus a constant offset.
       Value innermostOutputIdx =
           mapStoreOp.getOutputIndex(mapStoreOp.getOutputRank() - 1);
-      if (!isUnitFunctionOf(innermostOutputIdx, innermostInputIdx)) {
+      if (!getConstantUnitOffset(innermostOutputIdx, innermostInputIdx)) {
         return false;
       }
     }
@@ -499,20 +718,101 @@ struct MapStoreOpVectorizationModel
                                           DictionaryAttr options) const {
     auto mapStoreOp = cast<IREE::LinalgExt::MapStoreOp>(op);
     Location loc = mapStoreOp.getLoc();
+    RewriterBase::InsertionGuard insertionGuard(rewriter);
     rewriter.setInsertionPoint(mapStoreOp);
     ShapedType inputType = mapStoreOp.getInputType();
+    ShapedType outputType = mapStoreOp.getOutputType();
     Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    SmallVector<Value> zeros(inputType.getRank(), zero);
+
+    const int64_t inputRank = inputType.getRank();
+    const int64_t outputRank = outputType.getRank();
+    Value innermostInputIdx = mapStoreOp.getInputIndex(inputRank - 1);
+    Value innermostOutputIdx = mapStoreOp.getOutputIndex(outputRank - 1);
+    Operation *maskOp = mapStoreOp.getMask().getDefiningOp();
+    SetVector<Operation *> innermostInputSlice;
+    getForwardSlice(innermostInputIdx, &innermostInputSlice);
+    const bool maskDependsOnInnermostInput =
+        maskOp && innermostInputSlice.contains(maskOp);
+    std::optional<int64_t> innermostOffset =
+        getConstantUnitOffset(innermostOutputIdx, innermostInputIdx);
+    const bool preserveInnermostContiguousDim =
+        !maskDependsOnInnermostInput && innermostOffset;
+
+    SmallVector<int64_t> indexVectorShape(inputType.getShape());
+    FailureOr<MapStoreIndexVectorizationResult> indexVectorizationResult =
+        vectorizeMapStoreIndicesAndMask(mapStoreOp, rewriter,
+                                        indexVectorShape);
+    if (failed(indexVectorizationResult)) {
+      return failure();
+    }
+
+    SmallVector<Value> outputIndexVectors =
+        indexVectorizationResult->outputIndexVectors;
+    SmallVector<Value> scatterIndexVectors;
+    scatterIndexVectors.reserve(outputRank);
+    for (auto [outputDim, indexVector] : llvm::enumerate(outputIndexVectors)) {
+      if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
+        continue;
+      }
+      scatterIndexVectors.push_back(indexVector);
+    }
+
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<AffineExpr> baseMapExprs;
+    baseMapExprs.reserve(outputRank);
+    int64_t nextSymbol = 0;
+    for (int64_t outputDim = 0; outputDim < outputRank; ++outputDim) {
+      if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
+        baseMapExprs.push_back(getAffineDimExpr(inputRank - 1, ctx));
+      } else {
+        baseMapExprs.push_back(getAffineSymbolExpr(nextSymbol++, ctx));
+      }
+    }
+
+    int64_t numSymbols = scatterIndexVectors.size();
+    SmallVector<AffineMap> indexingMaps;
+    indexingMaps.push_back(
+        AffineMap::get(inputRank, numSymbols, baseMapExprs, ctx));
+    SmallVector<AffineExpr> fullInputDimExprs;
+    for (int64_t dim = 0; dim < inputRank; ++dim) {
+      fullInputDimExprs.push_back(getAffineDimExpr(dim, ctx));
+    }
+    for (Value indexVector : scatterIndexVectors) {
+      bool isScalarIndex = isa<IndexType>(indexVector.getType());
+      ArrayRef<AffineExpr> indexMapExprs(fullInputDimExprs);
+      if (isScalarIndex) {
+        indexMapExprs = {};
+      }
+      indexingMaps.push_back(
+          AffineMap::get(inputRank, numSymbols, indexMapExprs, ctx));
+    }
+    indexingMaps.push_back(
+        AffineMap::get(inputRank, numSymbols, fullInputDimExprs, ctx));
+
+    SmallVector<Value> offsets(outputRank, zero);
+    if (preserveInnermostContiguousDim && *innermostOffset != 0) {
+      offsets.back() =
+          arith::ConstantIndexOp::create(rewriter, loc, *innermostOffset);
+    }
+
+    SmallVector<Value> zeros(inputRank, zero);
     auto inputVectorType =
         VectorType::get(inputType.getShape(), inputType.getElementType());
     Value inputVector = vector::TransferReadOp::create(
         rewriter, loc, inputVectorType, mapStoreOp.getInput(),
         /*indices=*/zeros,
         /*padding=*/std::nullopt);
-    auto vectorizedMapStoreOp =
-        clone(rewriter, mapStoreOp, mapStoreOp.getResultTypes(),
-              {inputVector, mapStoreOp.getOutput()});
-    return SmallVector<Value>(vectorizedMapStoreOp->getResults());
+
+    SmallVector<Type> resultTypes;
+    if (mapStoreOp.hasPureTensorSemantics()) {
+      llvm::append_range(resultTypes, mapStoreOp.getResultTypes());
+    }
+    auto transferScatterOp = IREE::VectorExt::TransferScatterOp::create(
+        rewriter, loc, resultTypes, mapStoreOp.getOutput(), inputVector,
+        offsets, scatterIndexVectors,
+        rewriter.getAffineMapArrayAttr(indexingMaps),
+        indexVectorizationResult->maskVector);
+    return SmallVector<Value>(transferScatterOp->getResults());
   }
 };
 

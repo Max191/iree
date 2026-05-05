@@ -265,6 +265,67 @@ func.func @transfer_scatter_unroll_embedding_write(
 
 // -----
 
+// Test lowering of a rank-1 non-contiguous transfer_scatter to vector.scatter.
+
+func.func @transfer_scatter_rank1_to_vector_scatter(
+  %dest: memref<16xf32>,
+  %vector: vector<4xf32>,
+  %indices: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0]
+  [%indices : vector<4xindex>] {
+    indexing_maps = [affine_map<(d0)[s0] -> (s0)>,
+                     affine_map<(d0)[s0] -> (d0)>]
+  } : vector<4xf32>, memref<16xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_rank1_to_vector_scatter
+// CHECK: vector.scatter {{.*}} : memref<16xf32>, vector<4xindex>, vector<4xi1>, vector<4xf32>
+// CHECK-NOT: transfer_scatter
+
+// -----
+
+func.func @transfer_scatter_rank1_sub_byte_not_vector_scatter(
+  %dest: memref<16xf4E2M1FN>,
+  %vector: vector<4xf4E2M1FN>,
+  %indices: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0]
+  [%indices : vector<4xindex>] {
+    indexing_maps = [affine_map<(d0)[s0] -> (s0)>,
+                     affine_map<(d0)[s0] -> (d0)>]
+  } : vector<4xf4E2M1FN>, memref<16xf4E2M1FN>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_rank1_sub_byte_not_vector_scatter
+// CHECK: iree_vector_ext.transfer_scatter
+// CHECK-NOT: vector.scatter
+
+// -----
+
+func.func @transfer_scatter_rank1_rank2_base_to_vector_scatter(
+  %dest: memref<4x4xf32>,
+  %vector: vector<4xf32>,
+  %indices: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0]
+  [%indices : vector<4xindex>] {
+    indexing_maps = [affine_map<(d0)[s0] -> (s0, d0)>,
+                     affine_map<(d0)[s0] -> (d0)>]
+  } : vector<4xf32>, memref<4x4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_rank1_rank2_base_to_vector_scatter
+// CHECK: memref.collapse_shape {{.*}} memref<4x4xf32> into memref<16xf32>
+// CHECK: arith.muli
+// CHECK: vector.scatter {{.*}} : memref<16xf32>, vector<4xindex>, vector<4xi1>, vector<4xf32>
+// CHECK-NOT: transfer_scatter
+
+// -----
+
 // Test unrolling of a masked 2D transfer_scatter.
 
 func.func @transfer_scatter_unroll_masked(
