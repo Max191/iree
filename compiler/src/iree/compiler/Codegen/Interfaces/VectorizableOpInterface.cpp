@@ -15,6 +15,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/Utils/AffineExprUtils.h"
 #include "iree/compiler/Utils/Indexing.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -31,6 +32,9 @@
 #include "mlir/Dialect/Vector/Utils/VectorUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 // clang-format off
 #include "iree/compiler/Codegen/Interfaces/VectorizableOpInterface.cpp.inc"
@@ -455,10 +459,19 @@ struct MapStoreIndexVectorizationResult {
   Value maskVector;
 };
 
-/// The helpers below intentionally recognize only `inputIndex` and affine.apply
-/// expressions equivalent to `inputIndex + constant`, because transfer_scatter
-/// can represent the contiguous dimension plus a scalar base offset, but not a
-/// per-lane offset vector added to a contiguous dimension.
+struct MapStoreOutputDimPlan {
+  SmallVector<int64_t> contiguousInputDims;
+};
+
+/// The helpers below support two contiguity modes:
+///   1. The legacy automatic innermost-dim path, which only recognizes
+///      `inputIndex` and affine.apply expressions equivalent to
+///      `inputIndex + constant`.
+///   2. Explicit contiguous-dim hints, which are validated by reconstructing
+///      affine output-index expressions and checking that hinted source dims
+///      are unit-coefficient contributors to exactly one output dim.
+/// Both modes are restricted to cases transfer_scatter can represent as a
+/// contiguous vector dimension plus an optional scalar/vector base component.
 static std::optional<int64_t> getConstantAffineExprValue(AffineExpr expr) {
   if (auto constantExpr = dyn_cast<AffineConstantExpr>(expr)) {
     return constantExpr.getValue();
@@ -472,7 +485,7 @@ static std::optional<int64_t> getConstantAffineExprValue(AffineExpr expr) {
   if (!lhs || !rhs) {
     return std::nullopt;
   }
-  return *lhs + *rhs;
+  return llvm::checkedAdd(*lhs, *rhs);
 }
 
 static std::optional<int64_t>
@@ -491,14 +504,14 @@ getUnitDimPlusConstantOffset(AffineExpr expr, unsigned dimPosition) {
           getUnitDimPlusConstantOffset(binaryExpr.getLHS(), dimPosition)) {
     if (std::optional<int64_t> rhsConstant =
             getConstantAffineExprValue(binaryExpr.getRHS())) {
-      return *lhsOffset + *rhsConstant;
+      return llvm::checkedAdd(*lhsOffset, *rhsConstant);
     }
   }
   if (std::optional<int64_t> rhsOffset =
           getUnitDimPlusConstantOffset(binaryExpr.getRHS(), dimPosition)) {
     if (std::optional<int64_t> lhsConstant =
             getConstantAffineExprValue(binaryExpr.getLHS())) {
-      return *rhsOffset + *lhsConstant;
+      return llvm::checkedAdd(*rhsOffset, *lhsConstant);
     }
   }
   return std::nullopt;
@@ -531,31 +544,324 @@ static std::optional<int64_t> getConstantUnitOffset(Value outputIndex,
                                       *inputOperandPosition);
 }
 
+static FailureOr<AffineExpr> getMapStoreAffineIndexExpr(
+    Value value, IREE::LinalgExt::MapStoreOp mapStoreOp,
+    DenseMap<Value, AffineExpr> &exprMemo, DenseSet<Value> &inFlight) {
+  // Reconstruct only the affine fragment that this vectorizer can lower into
+  // transfer_scatter base maps: map_store block args, index constants, and
+  // affine.apply chains over those values. Other region semantics are rejected
+  // as unsupported hints instead of being approximated.
+  if (auto it = exprMemo.find(value); it != exprMemo.end()) {
+    return it->second;
+  }
+
+  MLIRContext *ctx = mapStoreOp.getContext();
+  for (int64_t dim = 0, e = mapStoreOp.getInputRank(); dim < e; ++dim) {
+    if (value == mapStoreOp.getInputIndex(dim)) {
+      AffineExpr expr = getAffineDimExpr(dim, ctx);
+      exprMemo.try_emplace(value, expr);
+      return expr;
+    }
+  }
+
+  if (auto constantOp = value.getDefiningOp<arith::ConstantIndexOp>()) {
+    AffineExpr expr = getAffineConstantExpr(constantOp.value(), ctx);
+    exprMemo.try_emplace(value, expr);
+    return expr;
+  }
+  if (auto constantOp = value.getDefiningOp<arith::ConstantOp>()) {
+    auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue());
+    if (intAttr && isa<IndexType>(value.getType())) {
+      std::optional<int64_t> intValue = intAttr.getValue().trySExtValue();
+      if (!intValue) {
+        return failure();
+      }
+      AffineExpr expr = getAffineConstantExpr(*intValue, ctx);
+      exprMemo.try_emplace(value, expr);
+      return expr;
+    }
+  }
+
+  auto applyOp = value.getDefiningOp<affine::AffineApplyOp>();
+  if (!applyOp || applyOp.getAffineMap().getNumResults() != 1) {
+    return failure();
+  }
+  if (!inFlight.insert(value).second) {
+    return failure();
+  }
+  llvm::scope_exit eraseInFlight([&]() { inFlight.erase(value); });
+
+  AffineMap affineMap = applyOp.getAffineMap();
+  OperandRange operands = applyOp.getMapOperands();
+  SmallVector<AffineExpr> dimReplacements;
+  SmallVector<AffineExpr> symbolReplacements;
+  dimReplacements.reserve(affineMap.getNumDims());
+  symbolReplacements.reserve(affineMap.getNumSymbols());
+  for (int64_t i = 0, e = affineMap.getNumDims(); i < e; ++i) {
+    FailureOr<AffineExpr> operandExpr =
+        getMapStoreAffineIndexExpr(operands[i], mapStoreOp, exprMemo,
+                                   inFlight);
+    if (failed(operandExpr)) {
+      return failure();
+    }
+    dimReplacements.push_back(*operandExpr);
+  }
+  for (int64_t i = 0, e = affineMap.getNumSymbols(); i < e; ++i) {
+    FailureOr<AffineExpr> operandExpr = getMapStoreAffineIndexExpr(
+        operands[affineMap.getNumDims() + i], mapStoreOp, exprMemo, inFlight);
+    if (failed(operandExpr)) {
+      return failure();
+    }
+    symbolReplacements.push_back(*operandExpr);
+  }
+
+  AffineExpr expr =
+      affineMap
+          .replaceDimsAndSymbols(dimReplacements, symbolReplacements,
+                                 mapStoreOp.getInputRank(), /*numResultSyms=*/0)
+          .getResult(0);
+  exprMemo.try_emplace(value, expr);
+  return expr;
+}
+
+static LogicalResult validateMapStoreOutputDimPlans(
+    IREE::LinalgExt::MapStoreOp mapStoreOp,
+    ArrayRef<MapStoreOutputDimPlan> outputPlans, RewriterBase &rewriter) {
+  if (llvm::all_of(outputPlans, [](const MapStoreOutputDimPlan &plan) {
+        return plan.contiguousInputDims.empty();
+      })) {
+    return success();
+  }
+
+  DenseMap<Value, AffineExpr> exprMemo;
+  DenseSet<Value> inFlight;
+  SmallVector<AffineExpr> outputExprs;
+  outputExprs.reserve(mapStoreOp.getOutputRank());
+  for (int64_t outputDim = 0, e = mapStoreOp.getOutputRank(); outputDim < e;
+       ++outputDim) {
+    FailureOr<AffineExpr> expr = getMapStoreAffineIndexExpr(
+        mapStoreOp.getOutputIndex(outputDim), mapStoreOp, exprMemo, inFlight);
+    if (failed(expr)) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp,
+          "contiguous dim hints require affine output index expressions");
+    }
+    outputExprs.push_back(*expr);
+  }
+
+  for (auto [hintedOutputDim, plan] : llvm::enumerate(outputPlans)) {
+    for (int64_t hintedInputDim : plan.contiguousInputDims) {
+      for (auto [outputDim, expr] : llvm::enumerate(outputExprs)) {
+        std::optional<int64_t> coefficient =
+            getAffineDimCoefficient(expr, hintedInputDim);
+        if (!coefficient) {
+          return rewriter.notifyMatchFailure(
+              mapStoreOp,
+              "contiguous dim hints require linear affine output indices");
+        }
+        if (outputDim == hintedOutputDim) {
+          if (*coefficient != 1) {
+            return rewriter.notifyMatchFailure(
+                mapStoreOp,
+                "hinted contiguous input dim must have unit coefficient");
+          }
+          continue;
+        }
+        if (*coefficient != 0) {
+          return rewriter.notifyMatchFailure(
+              mapStoreOp,
+              "hinted contiguous input dim must affect only one output dim");
+        }
+      }
+    }
+  }
+  return success();
+}
+
+static FailureOr<SmallVector<MapStoreOutputDimPlan>>
+getMapStoreOutputDimPlans(IREE::LinalgExt::MapStoreOp mapStoreOp,
+                          RewriterBase &rewriter) {
+  SmallVector<MapStoreOutputDimPlan> outputPlans(mapStoreOp.getOutputRank());
+  DenseI64ArrayAttr hintsAttr = mapStoreOp.getContiguousDimHintsAttr();
+  if (!hintsAttr) {
+    return outputPlans;
+  }
+  ArrayRef<int64_t> hints = hintsAttr.asArrayRef();
+  if (hints.size() % 2 != 0) {
+    return rewriter.notifyMatchFailure(
+        mapStoreOp, "expected contiguous dim hints in pairs");
+  }
+
+  for (int64_t i = 0, e = hints.size(); i < e; i += 2) {
+    int64_t inputDim = hints[i];
+    int64_t outputDim = hints[i + 1];
+    if (inputDim < 0 || inputDim >= mapStoreOp.getInputRank()) {
+      return rewriter.notifyMatchFailure(mapStoreOp,
+                                         "invalid hinted input dimension");
+    }
+    if (outputDim < 0 || outputDim >= mapStoreOp.getOutputRank()) {
+      return rewriter.notifyMatchFailure(mapStoreOp,
+                                         "invalid hinted output dimension");
+    }
+    outputPlans[outputDim].contiguousInputDims.push_back(inputDim);
+  }
+
+  for (MapStoreOutputDimPlan &plan : outputPlans) {
+    llvm::sort(plan.contiguousInputDims);
+    auto uniqueEnd = llvm::unique(plan.contiguousInputDims);
+    plan.contiguousInputDims.erase(uniqueEnd, plan.contiguousInputDims.end());
+  }
+  if (failed(
+          validateMapStoreOutputDimPlans(mapStoreOp, outputPlans, rewriter))) {
+    return failure();
+  }
+  return outputPlans;
+}
+
+static bool hasContiguousDimHints(
+    ArrayRef<MapStoreOutputDimPlan> outputPlans) {
+  return llvm::any_of(outputPlans, [](const MapStoreOutputDimPlan &plan) {
+    return !plan.contiguousInputDims.empty();
+  });
+}
+
+static Value dropContiguousDimsFromIndexVector(
+    RewriterBase &rewriter, Location loc, Value indexVector,
+    ArrayRef<int64_t> contiguousInputDims) {
+  if (contiguousInputDims.empty()) {
+    return indexVector;
+  }
+
+  SmallVector<int64_t> dims = llvm::to_vector(contiguousInputDims);
+  llvm::sort(dims, std::greater<int64_t>());
+  for (int64_t dim : dims) {
+    auto vectorType = dyn_cast<VectorType>(indexVector.getType());
+    if (!vectorType) {
+      return indexVector;
+    }
+    if (vectorType.getRank() == 1) {
+      indexVector =
+          vector::ExtractOp::create(rewriter, loc, indexVector, int64_t{0});
+      continue;
+    }
+    SmallVector<int64_t> offsets(vectorType.getRank(), 0);
+    SmallVector<int64_t> sizes(vectorType.getShape());
+    SmallVector<int64_t> strides(vectorType.getRank(), 1);
+    sizes[dim] = 1;
+    Value slice = vector::ExtractStridedSliceOp::create(
+        rewriter, loc, indexVector, offsets, sizes, strides);
+
+    SmallVector<int64_t> newShape;
+    for (int64_t i = 0, e = vectorType.getRank(); i < e; ++i) {
+      if (i != dim) {
+        newShape.push_back(vectorType.getDimSize(i));
+      }
+    }
+    auto newType =
+        VectorType::get(newShape, vectorType.getElementType());
+    indexVector =
+        vector::ShapeCastOp::create(rewriter, loc, newType, slice);
+  }
+  return indexVector;
+}
+
+static bool isZeroIndexValue(Value value) {
+  if (matchPattern(value, m_Zero())) {
+    return true;
+  }
+  auto constantOp = value.getDefiningOp<arith::ConstantOp>();
+  if (!constantOp) {
+    return false;
+  }
+  Attribute constantAttr = constantOp.getValue();
+  if (auto integerAttr = dyn_cast<IntegerAttr>(constantAttr)) {
+    return integerAttr.getValue().isZero();
+  }
+  if (auto denseIntAttr = dyn_cast<DenseIntElementsAttr>(constantAttr)) {
+    return denseIntAttr.isSplat() &&
+           denseIntAttr.getSplatValue<APInt>().isZero();
+  }
+  auto splatAttr = dyn_cast<SplatElementsAttr>(constantAttr);
+  if (!splatAttr) {
+    return false;
+  }
+  auto integerAttr =
+      dyn_cast<IntegerAttr>(splatAttr.getSplatValue<Attribute>());
+  return integerAttr && integerAttr.getValue().isZero();
+}
+
+static SmallVector<AffineExpr>
+getIndexVectorMapExprs(ArrayRef<int64_t> contiguousInputDims,
+                       int64_t inputRank, MLIRContext *ctx) {
+  llvm::SmallDenseSet<int64_t> contiguousDims(contiguousInputDims.begin(),
+                                             contiguousInputDims.end());
+  SmallVector<AffineExpr> exprs;
+  for (int64_t dim = 0; dim < inputRank; ++dim) {
+    if (!contiguousDims.contains(dim)) {
+      exprs.push_back(getAffineDimExpr(dim, ctx));
+    }
+  }
+  return exprs;
+}
+
 static FailureOr<MapStoreIndexVectorizationResult>
 vectorizeMapStoreIndicesAndMask(
     IREE::LinalgExt::MapStoreOp mapStoreOp, RewriterBase &rewriter,
-    ArrayRef<int64_t> iterationShape) {
+    ArrayRef<int64_t> iterationShape,
+    ArrayRef<SmallVector<int64_t>> zeroedInputDimsPerOutput = {}) {
   Location loc = mapStoreOp.getLoc();
   RewriterBase::InsertionGuard insertionGuard(rewriter);
   rewriter.setInsertionPoint(mapStoreOp);
 
   auto bodyBuilder = [&](OpBuilder &builder, Location nestedLoc,
                          ValueRange args) {
-    auto inlineBodyBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
-                                 ArrayRef<Value> yieldedValues) {
-      SmallVector<Value> results;
-      llvm::append_range(results, yieldedValues.drop_back(/*N=*/1));
-      results.push_back(yieldedValues.back());
-      linalg::YieldOp::create(inlineBuilder, inlineLoc, results);
+    auto buildInputIndices = [&](ArrayRef<int64_t> zeroedDims) {
+      SmallVector<Value> indices = llvm::map_to_vector(
+          llvm::seq<int64_t>(mapStoreOp.getInputRank()),
+          [&](int64_t dim) -> Value {
+            return linalg::IndexOp::create(builder, nestedLoc,
+                                           builder.getIndexType(), dim);
+          });
+      for (int64_t dim : zeroedDims) {
+        indices[dim] = arith::ConstantIndexOp::create(builder, nestedLoc, 0);
+      }
+      return indices;
     };
-    SmallVector<Value> indices = llvm::map_to_vector(
-        llvm::seq<int64_t>(mapStoreOp.getInputRank()),
-        [&](int64_t dim) -> Value {
-          return linalg::IndexOp::create(builder, nestedLoc,
-                                         builder.getIndexType(), dim);
-        });
+
+    SmallVector<Value> results;
+    if (zeroedInputDimsPerOutput.empty()) {
+      auto inlineBodyBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
+                                   ArrayRef<Value> yieldedValues) {
+        llvm::append_range(results, yieldedValues.drop_back(/*N=*/1));
+        results.push_back(yieldedValues.back());
+      };
+      SmallVector<Value> indices = buildInputIndices({});
+      mapStoreOp.inlineMapStoreBody(builder, nestedLoc, indices,
+                                    inlineBodyBuilder);
+      linalg::YieldOp::create(builder, nestedLoc, results);
+      return;
+    }
+
+    for (int64_t outputDim = 0, e = mapStoreOp.getOutputRank(); outputDim < e;
+         ++outputDim) {
+      auto inlineBodyBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
+                                   ArrayRef<Value> yieldedValues) {
+        results.push_back(yieldedValues[outputDim]);
+      };
+      SmallVector<Value> indices =
+          buildInputIndices(zeroedInputDimsPerOutput[outputDim]);
+      mapStoreOp.inlineMapStoreBody(builder, nestedLoc, indices,
+                                    inlineBodyBuilder);
+    }
+
+    auto inlineMaskBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
+                                 ArrayRef<Value> yieldedValues) {
+      results.push_back(yieldedValues.back());
+    };
+    SmallVector<Value> indices = buildInputIndices({});
     mapStoreOp.inlineMapStoreBody(builder, nestedLoc, indices,
-                                  inlineBodyBuilder);
+                                  inlineMaskBuilder);
+    linalg::YieldOp::create(builder, nestedLoc, results);
   };
 
   SmallVector<Value> outputTensors;
@@ -738,10 +1044,41 @@ struct MapStoreOpVectorizationModel
     const bool preserveInnermostContiguousDim =
         !maskDependsOnInnermostInput && innermostOffset;
 
+    FailureOr<SmallVector<MapStoreOutputDimPlan>> maybeOutputPlans =
+        getMapStoreOutputDimPlans(mapStoreOp, rewriter);
+    if (failed(maybeOutputPlans)) {
+      return failure();
+    }
+    SmallVector<MapStoreOutputDimPlan> outputPlans =
+        std::move(*maybeOutputPlans);
+    const bool hasExplicitContiguousDimHints =
+        hasContiguousDimHints(outputPlans);
+    if (hasExplicitContiguousDimHints && preserveInnermostContiguousDim) {
+      // Explicit hints describe additional contiguous dimensions. Keep the
+      // legacy automatic innermost-dim preservation as an augmentation so
+      // adding a hint for another dimension does not regress the pre-existing
+      // innermost transfer_scatter map. The mixed explicit/legacy lit test
+      // guards this choke point.
+      SmallVectorImpl<int64_t> &innerOutputContiguousDims =
+          outputPlans[outputRank - 1].contiguousInputDims;
+      if (!llvm::is_contained(innerOutputContiguousDims, inputRank - 1)) {
+        innerOutputContiguousDims.push_back(inputRank - 1);
+        llvm::sort(innerOutputContiguousDims);
+      }
+    }
+
     SmallVector<int64_t> indexVectorShape(inputType.getShape());
+    SmallVector<SmallVector<int64_t>> zeroedInputDimsPerOutput;
+    if (hasExplicitContiguousDimHints) {
+      zeroedInputDimsPerOutput.reserve(outputRank);
+      for (const MapStoreOutputDimPlan &plan : outputPlans) {
+        zeroedInputDimsPerOutput.push_back(plan.contiguousInputDims);
+      }
+    }
     FailureOr<MapStoreIndexVectorizationResult> indexVectorizationResult =
         vectorizeMapStoreIndicesAndMask(mapStoreOp, rewriter,
-                                        indexVectorShape);
+                                        indexVectorShape,
+                                        zeroedInputDimsPerOutput);
     if (failed(indexVectorizationResult)) {
       return failure();
     }
@@ -750,50 +1087,76 @@ struct MapStoreOpVectorizationModel
         indexVectorizationResult->outputIndexVectors;
     SmallVector<Value> scatterIndexVectors;
     scatterIndexVectors.reserve(outputRank);
-    for (auto [outputDim, indexVector] : llvm::enumerate(outputIndexVectors)) {
-      if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
-        continue;
-      }
-      scatterIndexVectors.push_back(indexVector);
-    }
 
     MLIRContext *ctx = rewriter.getContext();
     SmallVector<AffineExpr> baseMapExprs;
     baseMapExprs.reserve(outputRank);
-    int64_t nextSymbol = 0;
+    SmallVector<SmallVector<AffineExpr>> indexVectorMapExprs;
+    SmallVector<AffineExpr> fullInputDimExprs;
+    for (int64_t dim = 0; dim < inputRank; ++dim) {
+      fullInputDimExprs.push_back(getAffineDimExpr(dim, ctx));
+    }
+    SmallVector<Value> offsets(outputRank, zero);
+
     for (int64_t outputDim = 0; outputDim < outputRank; ++outputDim) {
-      if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
-        baseMapExprs.push_back(getAffineDimExpr(inputRank - 1, ctx));
-      } else {
-        baseMapExprs.push_back(getAffineSymbolExpr(nextSymbol++, ctx));
+      if (!hasExplicitContiguousDimHints) {
+        if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
+          baseMapExprs.push_back(getAffineDimExpr(inputRank - 1, ctx));
+          continue;
+        }
+        baseMapExprs.push_back(
+            getAffineSymbolExpr(scatterIndexVectors.size(), ctx));
+        scatterIndexVectors.push_back(outputIndexVectors[outputDim]);
+        indexVectorMapExprs.push_back(fullInputDimExprs);
+        continue;
       }
+
+      const MapStoreOutputDimPlan &plan = outputPlans[outputDim];
+      Value indexVector = dropContiguousDimsFromIndexVector(
+          rewriter, loc, outputIndexVectors[outputDim],
+          plan.contiguousInputDims);
+      AffineExpr baseExpr = getAffineConstantExpr(0, ctx);
+      // dropContiguousDimsFromIndexVector materializes dropped dimensions by
+      // extracting the lane-0 value from vector constants. A remaining all-zero
+      // scalar or vector means there is no gathered base component for this
+      // output dim.
+      if (!isZeroIndexValue(indexVector)) {
+        if (isa<IndexType>(indexVector.getType())) {
+          offsets[outputDim] = indexVector;
+        } else {
+          baseExpr = baseExpr +
+                     getAffineSymbolExpr(scatterIndexVectors.size(), ctx);
+          scatterIndexVectors.push_back(indexVector);
+          indexVectorMapExprs.push_back(getIndexVectorMapExprs(
+              plan.contiguousInputDims, inputRank, ctx));
+        }
+      }
+      for (int64_t inputDim : plan.contiguousInputDims) {
+        baseExpr = baseExpr + getAffineDimExpr(inputDim, ctx);
+      }
+      baseMapExprs.push_back(baseExpr);
+    }
+
+    if (!hasExplicitContiguousDimHints && preserveInnermostContiguousDim &&
+        *innermostOffset != 0) {
+      offsets.back() =
+          arith::ConstantIndexOp::create(rewriter, loc, *innermostOffset);
     }
 
     int64_t numSymbols = scatterIndexVectors.size();
     SmallVector<AffineMap> indexingMaps;
     indexingMaps.push_back(
         AffineMap::get(inputRank, numSymbols, baseMapExprs, ctx));
-    SmallVector<AffineExpr> fullInputDimExprs;
-    for (int64_t dim = 0; dim < inputRank; ++dim) {
-      fullInputDimExprs.push_back(getAffineDimExpr(dim, ctx));
-    }
-    for (Value indexVector : scatterIndexVectors) {
-      bool isScalarIndex = isa<IndexType>(indexVector.getType());
-      ArrayRef<AffineExpr> indexMapExprs(fullInputDimExprs);
-      if (isScalarIndex) {
-        indexMapExprs = {};
+    for (auto [indexVector, mapExprs] :
+         llvm::zip_equal(scatterIndexVectors, indexVectorMapExprs)) {
+      ArrayRef<AffineExpr> exprs(mapExprs);
+      if (isa<IndexType>(indexVector.getType())) {
+        exprs = {};
       }
-      indexingMaps.push_back(
-          AffineMap::get(inputRank, numSymbols, indexMapExprs, ctx));
+      indexingMaps.push_back(AffineMap::get(inputRank, numSymbols, exprs, ctx));
     }
     indexingMaps.push_back(
         AffineMap::get(inputRank, numSymbols, fullInputDimExprs, ctx));
-
-    SmallVector<Value> offsets(outputRank, zero);
-    if (preserveInnermostContiguousDim && *innermostOffset != 0) {
-      offsets.back() =
-          arith::ConstantIndexOp::create(rewriter, loc, *innermostOffset);
-    }
 
     SmallVector<Value> zeros(inputRank, zero);
     auto inputVectorType =

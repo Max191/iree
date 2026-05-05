@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/Transforms/Transforms.h"
+#include "iree/compiler/Utils/AffineExprUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -28,21 +29,17 @@ namespace {
 /// 3. Reducing numDims by 1
 static AffineMap removeDim0FromMap(AffineMap map) {
   MLIRContext *ctx = map.getContext();
-  SmallVector<AffineExpr> newResults;
-  for (AffineExpr expr : map.getResults()) {
-    if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
-      unsigned pos = dimExpr.getPosition();
-      if (pos == 0) {
-        newResults.push_back(getAffineConstantExpr(0, ctx));
-      } else {
-        newResults.push_back(getAffineDimExpr(pos - 1, ctx));
-      }
+  SmallVector<AffineExpr> dimReplacements;
+  for (unsigned i = 0, e = map.getNumDims(); i < e; ++i) {
+    if (i == 0) {
+      dimReplacements.push_back(getAffineConstantExpr(0, ctx));
     } else {
-      newResults.push_back(expr);
+      dimReplacements.push_back(getAffineDimExpr(i - 1, ctx));
     }
   }
-  return AffineMap::get(map.getNumDims() - 1, map.getNumSymbols(), newResults,
-                        ctx);
+  return map.replaceDimsAndSymbols(dimReplacements, /*symReplacements=*/{},
+                                   map.getNumDims() - 1,
+                                   map.getNumSymbols());
 }
 
 /// Remove dim 0 references from an index vec map. Returns the new map with
@@ -103,16 +100,24 @@ static Value extractVecSlice(OpBuilder &b, Location loc, Value vec,
 // Shared unroll helpers
 //===----------------------------------------------------------------------===//
 
+struct BaseDim0Coefficient {
+  int64_t baseResultIndex;
+  int64_t dim0Coefficient;
+};
+
 /// Compute dim-0-removed indexing maps for unrolling. Populates the new base
-/// map, per-index-vec maps and axes, mask map and axes, base dims using dim 0,
-/// and the combined new indexing maps array.
-static void
+/// map, per-index-vec maps and axes, mask map and axes, linear dim-0
+/// coefficients for base-map results, and the combined new indexing maps array.
+/// Fails if any base-map result has a non-linear or otherwise unsupported dim-0
+/// contribution.
+static LogicalResult
 computeUnrollDim0Maps(ArrayRef<AffineMap> indexingMaps, int64_t numIndexVecs,
                       bool hasMask, AffineMap baseMap,
                       SmallVectorImpl<AffineMap> &newAllMaps,
                       SmallVectorImpl<SmallVector<int64_t>> &indexVecAxes,
                       SmallVectorImpl<int64_t> &maskAxes,
-                      SmallVectorImpl<int64_t> &baseDimsUsingDim0) {
+                      SmallVectorImpl<BaseDim0Coefficient>
+                          &baseDim0Coefficients) {
   AffineMap newBaseMap = removeDim0FromMap(baseMap);
   newAllMaps.push_back(newBaseMap);
 
@@ -130,12 +135,17 @@ computeUnrollDim0Maps(ArrayRef<AffineMap> indexingMaps, int64_t numIndexVecs,
   }
 
   for (auto [j, expr] : llvm::enumerate(baseMap.getResults())) {
-    if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
-      if (dimExpr.getPosition() == 0) {
-        baseDimsUsingDim0.push_back(j);
-      }
+    std::optional<int64_t> coefficient =
+        mlir::iree_compiler::getAffineDimCoefficient(expr, 0);
+    if (!coefficient) {
+      return failure();
+    }
+    if (*coefficient != 0) {
+      baseDim0Coefficients.push_back({static_cast<int64_t>(j),
+                                      *coefficient});
     }
   }
+  return success();
 }
 
 /// Extract sliced index vecs and mask for iteration `i` of dim-0 unrolling.
@@ -167,14 +177,22 @@ extractSlicesForIteration(OpBuilder &rewriter, Location loc, int64_t i,
 }
 
 /// Update base offsets for dim-0 iteration `i`.
-static SmallVector<Value>
+static FailureOr<SmallVector<Value>>
 computeNewOffsets(OpBuilder &rewriter, Location loc, ValueRange offsets,
-                  int64_t i, ArrayRef<int64_t> baseDimsUsingDim0) {
+                  int64_t i,
+                  ArrayRef<BaseDim0Coefficient> baseDim0Coefficients) {
   SmallVector<Value> newOffsets(offsets);
-  for (int64_t baseDim : baseDimsUsingDim0) {
-    Value offset = newOffsets[baseDim];
-    Value iVal = arith::ConstantIndexOp::create(rewriter, loc, i);
-    newOffsets[baseDim] = arith::AddIOp::create(rewriter, loc, offset, iVal);
+  for (BaseDim0Coefficient coefficient : baseDim0Coefficients) {
+    Value offset = newOffsets[coefficient.baseResultIndex];
+    std::optional<int64_t> scaledDim0Offset =
+        llvm::checkedMul(i, coefficient.dim0Coefficient);
+    if (!scaledDim0Offset) {
+      return failure();
+    }
+    Value iVal =
+        arith::ConstantIndexOp::create(rewriter, loc, *scaledDim0Offset);
+    newOffsets[coefficient.baseResultIndex] =
+        arith::AddIOp::create(rewriter, loc, offset, iVal);
   }
   return newOffsets;
 }
@@ -272,29 +290,9 @@ static Value broadcastIndexValue(OpBuilder &builder, Location loc, Value value,
   return vector::BroadcastOp::create(builder, loc, vectorType, value);
 }
 
-static Value materializeRank1IndexVector(PatternRewriter &rewriter,
-                                         Location loc, TransferScatterOp op,
-                                         AffineExpr expr,
+static Value materializeRank1IndexSymbol(PatternRewriter &rewriter,
+                                         Location loc, Value indexValue,
                                          VectorType indexVectorType) {
-  if (auto constantExpr = dyn_cast<AffineConstantExpr>(expr)) {
-    if (constantExpr.getValue() != 0) {
-      return nullptr;
-    }
-    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    return broadcastIndexValue(rewriter, loc, zero, indexVectorType);
-  }
-  if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
-    if (dimExpr.getPosition() != 0) {
-      return nullptr;
-    }
-    return vector::StepOp::create(rewriter, loc, indexVectorType);
-  }
-  auto symbolExpr = dyn_cast<AffineSymbolExpr>(expr);
-  if (!symbolExpr) {
-    return nullptr;
-  }
-
-  Value indexValue = op.getIndexVecs()[symbolExpr.getPosition()];
   if (isa<IndexType>(indexValue.getType())) {
     return broadcastIndexValue(rewriter, loc, indexValue, indexVectorType);
   }
@@ -308,6 +306,78 @@ static Value materializeRank1IndexVector(PatternRewriter &rewriter,
   Value scalarIndex = vector::ExtractOp::create(
       rewriter, loc, indexValue, SmallVector<int64_t>(vectorType.getRank(), 0));
   return broadcastIndexValue(rewriter, loc, scalarIndex, indexVectorType);
+}
+
+static Value materializeRank1IndexExpr(PatternRewriter &rewriter, Location loc,
+                                       TransferScatterOp op, AffineExpr expr,
+                                       VectorType indexVectorType) {
+  if (auto constantExpr = dyn_cast<AffineConstantExpr>(expr)) {
+    Value constant =
+        arith::ConstantIndexOp::create(rewriter, loc, constantExpr.getValue());
+    return broadcastIndexValue(rewriter, loc, constant, indexVectorType);
+  }
+  if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+    if (dimExpr.getPosition() != 0) {
+      return nullptr;
+    }
+    return vector::StepOp::create(rewriter, loc, indexVectorType);
+  }
+  if (auto symbolExpr = dyn_cast<AffineSymbolExpr>(expr)) {
+    return materializeRank1IndexSymbol(
+        rewriter, loc, op.getIndexVecs()[symbolExpr.getPosition()],
+        indexVectorType);
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binaryExpr) {
+    return nullptr;
+  }
+
+  switch (binaryExpr.getKind()) {
+  case AffineExprKind::Add: {
+    Value lhs = materializeRank1IndexExpr(rewriter, loc, op,
+                                          binaryExpr.getLHS(), indexVectorType);
+    Value rhs = materializeRank1IndexExpr(rewriter, loc, op,
+                                          binaryExpr.getRHS(), indexVectorType);
+    if (!lhs || !rhs) {
+      return nullptr;
+    }
+    return arith::AddIOp::create(rewriter, loc, lhs, rhs);
+  }
+  case AffineExprKind::Mul: {
+    auto lhsConstant = dyn_cast<AffineConstantExpr>(binaryExpr.getLHS());
+    auto rhsConstant = dyn_cast<AffineConstantExpr>(binaryExpr.getRHS());
+    AffineExpr valueExpr;
+    int64_t coefficient;
+    if (lhsConstant) {
+      coefficient = lhsConstant.getValue();
+      valueExpr = binaryExpr.getRHS();
+    } else if (rhsConstant) {
+      coefficient = rhsConstant.getValue();
+      valueExpr = binaryExpr.getLHS();
+    } else {
+      return nullptr;
+    }
+    Value value =
+        materializeRank1IndexExpr(rewriter, loc, op, valueExpr, indexVectorType);
+    if (!value) {
+      return nullptr;
+    }
+    Value constant =
+        arith::ConstantIndexOp::create(rewriter, loc, coefficient);
+    Value constantVector =
+        broadcastIndexValue(rewriter, loc, constant, indexVectorType);
+    return arith::MulIOp::create(rewriter, loc, value, constantVector);
+  }
+  default:
+    return nullptr;
+  }
+}
+
+static Value materializeRank1IndexVector(PatternRewriter &rewriter,
+                                         Location loc, TransferScatterOp op,
+                                         AffineExpr expr,
+                                         VectorType indexVectorType) {
+  return materializeRank1IndexExpr(rewriter, loc, op, expr, indexVectorType);
 }
 
 static Value materializeRank1MaskVector(PatternRewriter &rewriter,
@@ -460,10 +530,13 @@ struct UnrollTransferGatherDim final : OpRewritePattern<TransferGatherOp> {
 
     SmallVector<AffineMap> newAllMaps;
     SmallVector<SmallVector<int64_t>> indexVecAxes;
-    SmallVector<int64_t> maskAxes, baseDimsUsingDim0;
-    computeUnrollDim0Maps(indexingMaps, numIndexVecs, !!mask, indexingMaps[0],
-                          newAllMaps, indexVecAxes, maskAxes,
-                          baseDimsUsingDim0);
+    SmallVector<int64_t> maskAxes;
+    SmallVector<BaseDim0Coefficient> baseDim0Coefficients;
+    if (failed(computeUnrollDim0Maps(indexingMaps, numIndexVecs, !!mask,
+                                     indexingMaps[0], newAllMaps, indexVecAxes,
+                                     maskAxes, baseDim0Coefficients))) {
+      return rewriter.notifyMatchFailure(op, "unsupported base indexing map");
+    }
 
     SmallVector<int64_t> newShape(vectorType.getShape().drop_front());
     auto newVectorType = VectorType::get(newShape, vectorType.getElementType());
@@ -471,8 +544,11 @@ struct UnrollTransferGatherDim final : OpRewritePattern<TransferGatherOp> {
     Value acc = ub::PoisonOp::create(rewriter, loc, vectorType);
 
     for (int64_t i = 0; i < dim0Size; ++i) {
-      SmallVector<Value> newOffsets = computeNewOffsets(
-          rewriter, loc, op.getOffsets(), i, baseDimsUsingDim0);
+      FailureOr<SmallVector<Value>> newOffsets = computeNewOffsets(
+          rewriter, loc, op.getOffsets(), i, baseDim0Coefficients);
+      if (failed(newOffsets)) {
+        return rewriter.notifyMatchFailure(op, "offset overflow while unrolling");
+      }
 
       SmallVector<Value> newIndexVecs;
       Value newMask =
@@ -480,7 +556,7 @@ struct UnrollTransferGatherDim final : OpRewritePattern<TransferGatherOp> {
                                     indexVecAxes, mask, maskAxes, newIndexVecs);
 
       auto subGather = TransferGatherOp::create(
-          rewriter, loc, newVectorType, op.getBase(), newOffsets, newIndexVecs,
+          rewriter, loc, newVectorType, op.getBase(), *newOffsets, newIndexVecs,
           rewriter.getAffineMapArrayAttr(newAllMaps), op.getPadding(), newMask);
 
       SmallVector<int64_t> offsets(rank, 0);
@@ -519,16 +595,22 @@ struct UnrollTransferScatterDim final : OpRewritePattern<TransferScatterOp> {
 
     SmallVector<AffineMap> newAllMaps;
     SmallVector<SmallVector<int64_t>> indexVecAxes;
-    SmallVector<int64_t> maskAxes, baseDimsUsingDim0;
-    computeUnrollDim0Maps(indexingMaps, numIndexVecs, !!mask, indexingMaps[0],
-                          newAllMaps, indexVecAxes, maskAxes,
-                          baseDimsUsingDim0);
+    SmallVector<int64_t> maskAxes;
+    SmallVector<BaseDim0Coefficient> baseDim0Coefficients;
+    if (failed(computeUnrollDim0Maps(indexingMaps, numIndexVecs, !!mask,
+                                     indexingMaps[0], newAllMaps, indexVecAxes,
+                                     maskAxes, baseDim0Coefficients))) {
+      return rewriter.notifyMatchFailure(op, "unsupported base indexing map");
+    }
 
     Value dest = op.getBase();
 
     for (int64_t i = 0; i < dim0Size; ++i) {
-      SmallVector<Value> newOffsets = computeNewOffsets(
-          rewriter, loc, op.getOffsets(), i, baseDimsUsingDim0);
+      FailureOr<SmallVector<Value>> newOffsets = computeNewOffsets(
+          rewriter, loc, op.getOffsets(), i, baseDim0Coefficients);
+      if (failed(newOffsets)) {
+        return rewriter.notifyMatchFailure(op, "offset overflow while unrolling");
+      }
 
       SmallVector<Value> newIndexVecs;
       Value newMask =
@@ -540,13 +622,13 @@ struct UnrollTransferScatterDim final : OpRewritePattern<TransferScatterOp> {
 
       if (op.hasTensorSemantics()) {
         auto subScatter = TransferScatterOp::create(
-            rewriter, loc, dest.getType(), dest, vecSlice, newOffsets,
+            rewriter, loc, dest.getType(), dest, vecSlice, *newOffsets,
             newIndexVecs, rewriter.getAffineMapArrayAttr(newAllMaps), newMask);
         dest = subScatter.getResult();
         continue;
       }
       TransferScatterOp::create(rewriter, loc, /*resultTypes=*/TypeRange{},
-                                dest, vecSlice, newOffsets, newIndexVecs,
+                                dest, vecSlice, *newOffsets, newIndexVecs,
                                 rewriter.getAffineMapArrayAttr(newAllMaps),
                                 newMask);
     }

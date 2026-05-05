@@ -19,6 +19,14 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
+#include "llvm/ADT/StringRef.h"
+
+namespace mlir::iree_compiler::IREE::LinalgExt {
+
+inline constexpr llvm::StringLiteral kMapStoreContiguousDimHintsAttr =
+    "contiguous_dim_hints";
+
+} // namespace mlir::iree_compiler::IREE::LinalgExt
 
 // clang-format off
 

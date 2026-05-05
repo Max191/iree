@@ -18,6 +18,29 @@ using namespace mlir::iree_compiler::IREE::VectorExt;
 
 using VectorValue = TypedValue<VectorType>;
 
+static bool isSupportedBaseIndexingExpr(AffineExpr expr) {
+  if (isa<AffineDimExpr, AffineSymbolExpr, AffineConstantExpr>(expr)) {
+    return true;
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binaryExpr) {
+    return false;
+  }
+
+  switch (binaryExpr.getKind()) {
+  case AffineExprKind::Add:
+    return isSupportedBaseIndexingExpr(binaryExpr.getLHS()) &&
+           isSupportedBaseIndexingExpr(binaryExpr.getRHS());
+  case AffineExprKind::Mul:
+    return (isa<AffineConstantExpr>(binaryExpr.getLHS()) &&
+            isSupportedBaseIndexingExpr(binaryExpr.getRHS())) ||
+           (isa<AffineConstantExpr>(binaryExpr.getRHS()) &&
+            isSupportedBaseIndexingExpr(binaryExpr.getLHS()));
+  default:
+    return false;
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // LayoutConflictResolutionOp
 //===----------------------------------------------------------------------===//
@@ -89,7 +112,7 @@ mlir::iree_compiler::IREE::VectorExt::detail::verifyIndexedVectorOpInterface(
 
   int64_t vectorRank = vectorType.getRank();
   int64_t indexSyms = indexVecs.size();
-  for (AffineMap map : indexingMaps) {
+  for (auto [mapIndex, map] : llvm::enumerate(indexingMaps)) {
     if (map.getNumDims() != vectorRank) {
       return op->emitOpError(
                  "expected all indexing maps to have number of dims "
@@ -102,6 +125,19 @@ mlir::iree_compiler::IREE::VectorExt::detail::verifyIndexedVectorOpInterface(
                  "equal to number of index vecs. expected: ")
              << indexSyms << ", got: " << map.getNumSymbols() << " syms";
     }
+    if (mapIndex == 0) {
+      for (AffineExpr expr : map.getResults()) {
+        if (isSupportedBaseIndexingExpr(expr)) {
+          continue;
+        }
+        return op->emitOpError(
+            "expected base indexing map results to use only dimensions, "
+            "symbols, constants, addition, and multiplication by constants");
+      }
+      continue;
+    }
+    // Non-base maps describe indexing into index vectors and masks, so keep
+    // those restricted to plain projected dimensions.
     for (AffineExpr expr : map.getResults()) {
       if (isa<AffineDimExpr, AffineSymbolExpr>(expr)) {
         continue;
@@ -387,19 +423,25 @@ static IndexingMapFoldResult foldFromStep(int64_t index, Value operand,
   return {Value(), AffineMap(), true};
 }
 
-/// Returns true when a base map cannot be treated as a contiguous transfer map.
-static bool hasDuplicateDimExprs(AffineMap map) {
+/// Returns true when a base map can be treated as a contiguous transfer map.
+static bool isContiguousBaseMap(AffineMap map) {
   llvm::SmallDenseSet<unsigned> seenDims;
   for (AffineExpr expr : map.getResults()) {
-    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
-    if (!dimExpr) {
+    if (auto constExpr = dyn_cast<AffineConstantExpr>(expr)) {
+      if (constExpr.getValue() != 0) {
+        return false;
+      }
       continue;
     }
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return false;
+    }
     if (!seenDims.insert(dimExpr.getPosition()).second) {
-      return true;
+      return false;
     }
   }
-  return false;
+  return true;
 }
 
 template <typename OpTy>
@@ -772,6 +814,9 @@ struct FoldContiguousGatherToTransferRead final
     if (!op.getIndexVecs().empty()) {
       return failure();
     }
+    if (!isContiguousBaseMap(op.getBaseIndexingMap())) {
+      return failure();
+    }
 
     AffineMap permutationMap = op.getBasePermutationMap();
     VectorType vectorType = op.getVectorType();
@@ -799,7 +844,7 @@ struct FoldContiguousScatterToTransferWrite final
     if (!op.getIndexVecs().empty()) {
       return failure();
     }
-    if (hasDuplicateDimExprs(op.getBaseIndexingMap())) {
+    if (!isContiguousBaseMap(op.getBaseIndexingMap())) {
       return failure();
     }
 

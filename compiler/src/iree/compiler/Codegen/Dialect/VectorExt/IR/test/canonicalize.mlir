@@ -197,6 +197,26 @@ func.func @transfer_gather_fold_contiguous_load(
 
 // -----
 
+func.func @transfer_gather_affine_base_is_not_contiguous_read(
+  %source: tensor<4096x64xf16>)
+  -> vector<64x1xf16> {
+
+  %cst0 = arith.constant 0.0 : f16
+  %c0 = arith.constant 0 : index
+
+  %out = iree_vector_ext.transfer_gather %source[%c0, %c0], %cst0 {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d0 + d1)>]
+  } : tensor<4096x64xf16>, vector<64x1xf16>
+
+  return %out : vector<64x1xf16>
+}
+
+// CHECK-LABEL: @transfer_gather_affine_base_is_not_contiguous_read
+// CHECK: iree_vector_ext.transfer_gather
+// CHECK-NOT: vector.transfer_read
+
+// -----
+
 func.func @transfer_gather_fold_all_true_mask(
   %source: tensor<4096x64xf16>, %indices: vector<64xindex>)
   -> vector<64x32xf16> {
@@ -388,6 +408,26 @@ func.func @transfer_scatter_duplicate_dim_is_not_contiguous_write(
 }
 
 // CHECK-LABEL: @transfer_scatter_duplicate_dim_is_not_contiguous_write
+// CHECK-NOT: vector.transfer_write
+// CHECK: iree_vector_ext.transfer_scatter
+
+// -----
+
+func.func @transfer_scatter_affine_base_is_not_contiguous_write(
+  %vector: vector<4x4xf16>,
+  %dest: tensor<4x8xf16>)
+  -> tensor<4x8xf16> {
+
+  %c0 = arith.constant 0 : index
+
+  %out = iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0] {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d0 + d1)>]
+  } : vector<4x4xf16>, tensor<4x8xf16> -> tensor<4x8xf16>
+
+  return %out : tensor<4x8xf16>
+}
+
+// CHECK-LABEL: @transfer_scatter_affine_base_is_not_contiguous_write
 // CHECK-NOT: vector.transfer_write
 // CHECK: iree_vector_ext.transfer_scatter
 

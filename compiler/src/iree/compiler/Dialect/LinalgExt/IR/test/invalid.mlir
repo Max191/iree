@@ -631,6 +631,48 @@ func.func @map_store_0D(
 
 // -----
 
+func.func @map_store_contiguous_dim_hints_wrong_pair_count(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected contiguous_dim_hints to contain pairs of input dim and output dim}}
+  iree_linalg_ext.map_store {contiguous_dim_hints = array<i64: 0>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_contiguous_dim_hints_input_dim_out_of_range(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected contiguous_dim_hints input dims to be in range [0, 1)}}
+  iree_linalg_ext.map_store {contiguous_dim_hints = array<i64: 1, 0>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_contiguous_dim_hints_output_dim_out_of_range(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected contiguous_dim_hints output dims to be in range [0, 1)}}
+  iree_linalg_ext.map_store {contiguous_dim_hints = array<i64: 0, 1>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
 func.func @arg_compare_invalid_dim(
     %input_val: tensor<2x10xf32>,
     %out_val: tensor<2xf32>,
