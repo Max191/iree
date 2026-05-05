@@ -189,6 +189,26 @@ func.func @transfer_gather_unroll_embedding_lookup(
 
 // -----
 
+func.func @transfer_gather_unroll_affine_base(
+  %source: memref<4096x64xf16>,
+  %indices: vector<4xindex>) -> vector<4x64xf16> {
+  %cst = arith.constant 0.0 : f16
+  %c0 = arith.constant 0 : index
+  %out = iree_vector_ext.transfer_gather %source[%c0, %c0]
+  [%indices : vector<4xindex>], %cst {
+    indexing_maps = [affine_map<(d0, d1)[s0] -> (s0 + d0, d1)>,
+                     affine_map<(d0, d1)[s0] -> (d0)>]
+  } : memref<4096x64xf16>, vector<4x64xf16>
+  return %out : vector<4x64xf16>
+}
+
+// CHECK-LABEL: func.func @transfer_gather_unroll_affine_base
+// CHECK-NOT: transfer_gather
+// CHECK-COUNT-4: vector.load
+// CHECK-NOT: transfer_gather
+
+// -----
+
 // Test unrolling of a masked 2D transfer_gather.
 // Same embedding lookup shape but with a mask on the result.
 
@@ -323,6 +343,65 @@ func.func @transfer_scatter_rank1_rank2_base_to_vector_scatter(
 // CHECK: arith.muli
 // CHECK: vector.scatter {{.*}} : memref<16xf32>, vector<4xindex>, vector<4xi1>, vector<4xf32>
 // CHECK-NOT: transfer_scatter
+
+// -----
+
+func.func @transfer_scatter_rank1_affine_base_to_vector_scatter(
+  %dest: memref<16xf32>,
+  %vector: vector<4xf32>,
+  %indices: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0]
+  [%indices : vector<4xindex>] {
+    indexing_maps = [affine_map<(d0)[s0] -> (s0 + d0)>,
+                     affine_map<(d0)[s0] -> (d0)>]
+  } : vector<4xf32>, memref<16xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_rank1_affine_base_to_vector_scatter
+// CHECK: arith.addi
+// CHECK: vector.scatter {{.*}} : memref<16xf32>, vector<4xindex>, vector<4xi1>, vector<4xf32>
+// CHECK-NOT: transfer_scatter
+
+// -----
+
+func.func @transfer_scatter_unroll_affine_base(
+  %dest: memref<4096x64xf16>,
+  %vector: vector<4x64xf16>,
+  %indices: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0]
+  [%indices : vector<4xindex>] {
+    indexing_maps = [affine_map<(d0, d1)[s0] -> (s0 + d0, d1)>,
+                     affine_map<(d0, d1)[s0] -> (d0)>]
+  } : vector<4x64xf16>, memref<4096x64xf16>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_unroll_affine_base
+// CHECK-COUNT-4: vector.store {{.+}} : memref<4096x64xf16>, vector<64xf16>
+
+// -----
+
+func.func @transfer_scatter_unroll_scaled_affine_base(
+  %dest: memref<4096x64xf16>,
+  %vector: vector<4x64xf16>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0] {
+    indexing_maps = [affine_map<(d0, d1) -> (d0 * 2, d1)>]
+  } : vector<4x64xf16>, memref<4096x64xf16>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_unroll_scaled_affine_base
+// CHECK-DAG: %[[C2:.+]] = arith.constant 2 : index
+// CHECK-DAG: %[[C4:.+]] = arith.constant 4 : index
+// CHECK-DAG: %[[C6:.+]] = arith.constant 6 : index
+// CHECK: vector.store {{.*}}[%{{.*}}, %{{.*}}]
+// CHECK: vector.store {{.*}}[%[[C2]], %{{.*}}]
+// CHECK: vector.store {{.*}}[%[[C4]], %{{.*}}]
+// CHECK: vector.store {{.*}}[%[[C6]], %{{.*}}]
 
 // -----
 

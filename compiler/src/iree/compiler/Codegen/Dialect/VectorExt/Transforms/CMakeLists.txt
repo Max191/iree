@@ -56,6 +56,7 @@ iree_cc_library(
     MLIRVectorDialect
     MLIRVectorUtils
     iree::compiler::Codegen::Dialect::VectorExt::IR::IREEVectorExtDialect
+    iree::compiler::Utils
   PUBLIC
 )
 

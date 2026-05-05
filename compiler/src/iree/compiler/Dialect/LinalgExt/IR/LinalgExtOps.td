@@ -399,10 +399,21 @@ def IREELinalgExt_MapStoreOp : IREELinalgExt_Op<"map_store",
     the `output`, and an additional `i1` Value, which represents a mask on
     whether or not to write to the `output` at the yielded set of indices. If
     the mask value is true, the input value will be written.
+
+    The optional `contiguous_dim_hints` attribute is an internal codegen hint
+    used during vectorization. It is encoded as a dense i64 array of pairs
+    `(inputDim, outputDim)` stating that `inputDim` has unit contiguity in
+    `outputDim`. The vectorizer validates that hinted output indices are
+    affine, that the hinted input dimension has unit coefficient in the hinted
+    output dimension, and that it does not affect another output dimension.
+    The op verifier only checks the attribute schema and dimension ranges;
+    semantic hint validation happens during vectorization, where invalid or
+    unsupported hints leave the op unvectorized.
   }];
   let arguments = (ins
       AnyShaped:$input,
-      AnyRankedTensorOrMemRef:$output
+      AnyRankedTensorOrMemRef:$output,
+      OptionalAttr<DenseI64ArrayAttr>:$contiguous_dim_hints
   );
   let results = (outs Variadic<AnyRankedTensor>:$results);
   let regions = (region AnyRegion:$transformation_region);

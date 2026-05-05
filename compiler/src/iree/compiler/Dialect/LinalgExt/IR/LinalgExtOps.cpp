@@ -841,7 +841,8 @@ MapStoreOp MapStoreOp::createIdentityMapStore(OpBuilder &builder, Location loc,
   if (isa<RankedTensorType>(output.getType())) {
     resultType.push_back(output.getType());
   }
-  auto mapStoreOp = MapStoreOp::create(builder, loc, resultType, input, output);
+  auto mapStoreOp = MapStoreOp::create(builder, loc, resultType, input, output,
+                                       DenseI64ArrayAttr{});
 
   // Add the transformation block with an identity transformation.
   Region &region = mapStoreOp.getTransformationRegion();
@@ -875,6 +876,30 @@ LogicalResult MapStoreOp::verify() {
   if (!llvm::all_of(transformBody.getArgumentTypes(),
                     llvm::IsaPred<IndexType>)) {
     return emitOpError("expected block arguments to be index types");
+  }
+  DenseI64ArrayAttr hintsAttr = getContiguousDimHintsAttr();
+  if (!hintsAttr) {
+    return success();
+  }
+  ArrayRef<int64_t> hintValues = hintsAttr.asArrayRef();
+  if (hintValues.size() % 2 != 0) {
+    return emitOpError("expected ")
+           << kMapStoreContiguousDimHintsAttr
+           << " to contain pairs of input dim and output dim";
+  }
+  for (int64_t i = 0, e = hintValues.size(); i < e; i += 2) {
+    int64_t inputDim = hintValues[i];
+    int64_t outputDim = hintValues[i + 1];
+    if (inputDim < 0 || inputDim >= getInputRank()) {
+      return emitOpError("expected ")
+             << kMapStoreContiguousDimHintsAttr
+             << " input dims to be in range [0, " << getInputRank() << ")";
+    }
+    if (outputDim < 0 || outputDim >= getOutputRank()) {
+      return emitOpError("expected ")
+             << kMapStoreContiguousDimHintsAttr
+             << " output dims to be in range [0, " << getOutputRank() << ")";
+    }
   }
   return success();
 }

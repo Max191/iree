@@ -85,6 +85,21 @@ func.func @index_vec_shape_mismatch(%indices: vector<128x64xindex>,
 
 // -----
 
+func.func @unsupported_gather_base_indexing_map(
+  %source: tensor<128x64xf16>) -> vector<128x64xf16> {
+  %cst0 = arith.constant 0.0 : f16
+  %c0 = arith.constant 0 : index
+
+  // expected-error @+1 {{'iree_vector_ext.transfer_gather' op expected base indexing map results to use only dimensions, symbols, constants, addition, and multiplication by constants}}
+  %out = iree_vector_ext.transfer_gather %source[%c0, %c0], %cst0 {
+    indexing_maps = [affine_map<(d0, d1) -> (d0 floordiv 2, d1)>]
+  } : tensor<128x64xf16>, vector<128x64xf16>
+
+  return %out : vector<128x64xf16>
+}
+
+// -----
+
 func.func @scatter_wrong_num_indexing_maps(%indices: vector<128xindex>,
   %vector: vector<128xf16>,
   %dest: tensor<128xf16>)
@@ -115,6 +130,22 @@ func.func @scatter_index_vec_shape_mismatch(%indices: vector<128x64xindex>,
   [%indices : vector<128x64xindex>] {
     indexing_maps = [affine_map<(d0, d1)[s0] -> (d0, s0)>,
                      affine_map<(d0, d1)[s0] -> (d1, d0)>]
+  } : vector<128x64xf16>, tensor<128x64xf16> -> tensor<128x64xf16>
+
+  return %out : tensor<128x64xf16>
+}
+
+// -----
+
+func.func @unsupported_scatter_base_indexing_map(
+  %vector: vector<128x64xf16>,
+  %dest: tensor<128x64xf16>)
+  -> tensor<128x64xf16> {
+  %c0 = arith.constant 0 : index
+
+  // expected-error @+1 {{'iree_vector_ext.transfer_scatter' op expected base indexing map results to use only dimensions, symbols, constants, addition, and multiplication by constants}}
+  %out = iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0] {
+    indexing_maps = [affine_map<(d0, d1) -> (d0 floordiv 2, d1)>]
   } : vector<128x64xf16>, tensor<128x64xf16> -> tensor<128x64xf16>
 
   return %out : tensor<128x64xf16>
