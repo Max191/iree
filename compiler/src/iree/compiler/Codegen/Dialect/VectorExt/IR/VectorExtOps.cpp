@@ -346,13 +346,38 @@ static IndexingMapFoldResult foldFromStep(int64_t index, Value operand,
     return {operand, map, false};
   }
   assert(map.getNumResults() == 1);
+  AffineExpr replacementExpr = map.getResult(0);
+  auto replacementDim = dyn_cast<AffineDimExpr>(replacementExpr);
+  if (!replacementDim) {
+    return {operand, map, false};
+  }
+  // Folding `s0` to `d1` is only valid when `s0` names one base dim and no
+  // other base dim already advances with `d1`.
+  bool foundSymbol = false;
+  for (AffineExpr expr : baseMap.getResults()) {
+    if (auto sym = dyn_cast<AffineSymbolExpr>(expr)) {
+      if (sym.getPosition() == index) {
+        if (foundSymbol) {
+          return {operand, map, false};
+        }
+        foundSymbol = true;
+      }
+      continue;
+    }
+    if (expr == replacementDim) {
+      return {operand, map, false};
+    }
+  }
+  if (!foundSymbol) {
+    return {operand, map, false};
+  }
   // Replace the symbol in the base map with the dim expression from the
   // index vec map, making this dimension contiguous.
   SmallVector<AffineExpr> newResults;
   for (AffineExpr expr : baseMap.getResults()) {
     if (auto sym = dyn_cast<AffineSymbolExpr>(expr)) {
       if (sym.getPosition() == index) {
-        expr = map.getResult(0);
+        expr = replacementDim;
       }
     }
     newResults.push_back(expr);
@@ -360,6 +385,21 @@ static IndexingMapFoldResult foldFromStep(int64_t index, Value operand,
   baseMap = AffineMap::get(baseMap.getNumDims(), baseMap.getNumSymbols(),
                            newResults, baseMap.getContext());
   return {Value(), AffineMap(), true};
+}
+
+/// Returns true when a base map cannot be treated as a contiguous transfer map.
+static bool hasDuplicateDimExprs(AffineMap map) {
+  llvm::SmallDenseSet<unsigned> seenDims;
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      continue;
+    }
+    if (!seenDims.insert(dimExpr.getPosition()).second) {
+      return true;
+    }
+  }
+  return false;
 }
 
 template <typename OpTy>
@@ -757,6 +797,9 @@ struct FoldContiguousScatterToTransferWrite final
   LogicalResult matchAndRewrite(TransferScatterOp op,
                                 PatternRewriter &rewriter) const override {
     if (!op.getIndexVecs().empty()) {
+      return failure();
+    }
+    if (hasDuplicateDimExprs(op.getBaseIndexingMap())) {
       return failure();
     }
 

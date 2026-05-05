@@ -173,6 +173,7 @@ iree_cc_library(
   DEPS
     ::VectorizableOpInterfaceGen
     MLIRAffineDialect
+    MLIRAffineTransforms
     MLIRAffineUtils
     MLIRAnalysis
     MLIRArithDialect
