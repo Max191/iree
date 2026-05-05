@@ -14,6 +14,7 @@ iree_cc_library(
   NAME
     Utils
   HDRS
+    "AffineExprUtils.h"
     "CPUUtils.h"
     "CodegenPipelineOptions.h"
     "EncodingUtils.h"
@@ -24,6 +25,7 @@ iree_cc_library(
     "SliceUtils.h"
     "Utils.h"
   SRCS
+    "AffineExprUtils.cpp"
     "CPUUtils.cpp"
     "CodegenPipelineOptions.cpp"
     "EncodingUtils.cpp"
