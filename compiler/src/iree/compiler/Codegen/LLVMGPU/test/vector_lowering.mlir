@@ -366,6 +366,28 @@ func.func @transfer_scatter_rank1_affine_base_to_vector_scatter(
 
 // -----
 
+func.func @transfer_scatter_unit_vector_constant_base(
+  %dest: memref<4x4xf32>,
+  %vector: vector<1xf32>,
+  %indices: vector<1xindex>,
+  %mask: vector<1xi1>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0]
+  [%indices : vector<1xindex>], %mask {
+    indexing_maps = [affine_map<(d0)[s0] -> (s0, 0)>,
+                     affine_map<(d0)[s0] -> (d0)>,
+                     affine_map<(d0)[s0] -> (d0)>]
+  } : vector<1xf32>, memref<4x4xf32>, vector<1xi1>
+  return
+}
+
+// CHECK-LABEL: func.func @transfer_scatter_unit_vector_constant_base
+// CHECK: %[[INDEX:.*]] = vector.extract %{{.*}}[0]
+// CHECK: vector.maskedstore %{{.*}}[%[[INDEX]], %c0], %{{.*}}, %{{.*}} : memref<4x4xf32>, vector<1xi1>, vector<1xf32>
+// CHECK-NOT: transfer_scatter
+
+// -----
+
 func.func @transfer_scatter_unroll_affine_base(
   %dest: memref<4096x64xf16>,
   %vector: vector<4x64xf16>,

@@ -21,6 +21,8 @@ func.func @map_store(
 
 // -----
 
+// Tiny non-contiguous tiles stay on the memref fallback path to avoid
+// workgroup-staged tensor transfer_scatter overhead.
 func.func @map_store_f32_not_unit_stride(
     %input: tensor<2x2xf32>, %output: tensor<2x4xf32>
 ) -> tensor<2x4xf32> {
@@ -33,14 +35,95 @@ func.func @map_store_f32_not_unit_stride(
   return %0 : tensor<2x4xf32>
 }
 // CHECK-LABEL: @map_store_f32_not_unit_stride
+//       CHECK:   iree_linalg_ext.map_store
+//   CHECK-NOT:   transfer_scatter
+
+// -----
+
+func.func @map_store_f32_noncontiguous_eight_element_tile(
+    %input: tensor<8xf32>, %output: tensor<16xf32>
+) -> tensor<16xf32> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> (d0 * 2)>(%idx0)
+      iree_linalg_ext.yield %1, %mask : index, i1
+  } : tensor<8xf32> into tensor<16xf32> -> tensor<16xf32>
+  return %0 : tensor<16xf32>
+}
+// CHECK-LABEL: @map_store_f32_noncontiguous_eight_element_tile
+//       CHECK:   iree_linalg_ext.map_store
+//   CHECK-NOT:   transfer_scatter
+
+// -----
+
+func.func @map_store_f32_noncontiguous_nine_element_tile(
+    %input: tensor<9xf32>, %output: tensor<18xf32>
+) -> tensor<18xf32> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> (d0 * 2)>(%idx0)
+      iree_linalg_ext.yield %1, %mask : index, i1
+  } : tensor<9xf32> into tensor<18xf32> -> tensor<18xf32>
+  return %0 : tensor<18xf32>
+}
+// CHECK-LABEL: @map_store_f32_noncontiguous_nine_element_tile
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
+//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
+//       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]]]
+//  CHECK-SAME:     vector<9xindex>
+//  CHECK-SAME:     : vector<9xf32>, tensor<18xf32> -> tensor<18xf32>
+//       CHECK:   return %[[SCATTER]] : tensor<18xf32>
+
+// -----
+
+func.func @map_store_f32_tiny_noncontiguous_explicit_hint(
+    %input: tensor<2x4xf32>, %output: tensor<2x8xf32>
+) -> tensor<2x8xf32> {
+  %0 = iree_linalg_ext.map_store {contiguous_dim_hints = array<i64: 0, 0>}
+      %input into %output {
+    ^bb0(%idx0: index, %idx1: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> (d0 * 2)>(%idx1)
+      iree_linalg_ext.yield %idx0, %1, %mask : index, index, i1
+  } : tensor<2x4xf32> into tensor<2x8xf32> -> tensor<2x8xf32>
+  return %0 : tensor<2x8xf32>
+}
+// CHECK-LABEL: @map_store_f32_tiny_noncontiguous_explicit_hint
 //  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
 //  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
 //       CHECK:   %[[C0:.+]] = arith.constant 0 : index
 //       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
 //       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]]
-//  CHECK-SAME:     vector<2xindex>
-//  CHECK-SAME:     : vector<2x2xf32>, tensor<2x4xf32> -> tensor<2x4xf32>
-//       CHECK:   return %[[SCATTER]] : tensor<2x4xf32>
+//  CHECK-SAME:     : vector<2x4xf32>, tensor<2x8xf32> -> tensor<2x8xf32>
+//       CHECK:   return %[[SCATTER]] : tensor<2x8xf32>
+
+// -----
+
+func.func @map_store_f32_not_unit_stride_large_tile(
+    %input: tensor<2x2x4xf32>, %output: tensor<2x2x8xf32>
+) -> tensor<2x2x8xf32> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index, %idx1: index, %idx2: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> (d0 * 2)>(%idx2)
+      iree_linalg_ext.yield %idx0, %idx1, %1, %mask
+          : index, index, index, i1
+  } : tensor<2x2x4xf32> into tensor<2x2x8xf32> -> tensor<2x2x8xf32>
+  return %0 : tensor<2x2x8xf32>
+}
+// CHECK-LABEL: @map_store_f32_not_unit_stride_large_tile
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
+//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
+//       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]]
+//  CHECK-SAME:     vector<4xindex>
+//  CHECK-SAME:     : vector<2x2x4xf32>, tensor<2x2x8xf32> -> tensor<2x2x8xf32>
+//       CHECK:   return %[[SCATTER]] : tensor<2x2x8xf32>
 
 // -----
 
@@ -81,14 +164,8 @@ func.func @map_store_f32_inner_offset_depends_on_outer_dim(
   return %0 : tensor<2x5xf32>
 }
 // CHECK-LABEL: @map_store_f32_inner_offset_depends_on_outer_dim
-//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
-//  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
-//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
-//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
-//       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]]
-//  CHECK-SAME:     vector<2x3xindex>
-//  CHECK-SAME:     : vector<2x3xf32>, tensor<2x5xf32> -> tensor<2x5xf32>
-//       CHECK:   return %[[SCATTER]] : tensor<2x5xf32>
+//       CHECK:   iree_linalg_ext.map_store
+//   CHECK-NOT:   transfer_scatter
 
 // -----
 
@@ -111,9 +188,9 @@ func.func @map_store_f32_explicit_hint_keeps_legacy_innermost(
 // CHECK-LABEL: @map_store_f32_explicit_hint_keeps_legacy_innermost
 //  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
 //  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
-//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
-//       CHECK:   %[[ZERO_INNER:.+]] = arith.constant dense<0> : vector<3xindex>
-//       CHECK:   %[[ZERO_OUTER:.+]] = arith.constant dense<0> : vector<2xindex>
+//   CHECK-DAG:   %[[ZERO_INNER:.+]] = arith.constant dense<0> : vector<3xindex>
+//   CHECK-DAG:   %[[ZERO_OUTER:.+]] = arith.constant dense<0> : vector<2xindex>
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
 //       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
 //       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]] [%[[ZERO_INNER]], %[[ZERO_OUTER]] : vector<3xindex>, vector<2xindex>]
 //  CHECK-SAME:     indexing_maps = [#[[$MIXED_HINT_BASE_MAP]], #[[$MIXED_HINT_INDEX_MAP_0]], #[[$MIXED_HINT_INDEX_MAP_1]]]
@@ -142,9 +219,9 @@ func.func @map_store_f32_explicit_hint_keeps_inner_constant_offset(
 // CHECK-LABEL: @map_store_f32_explicit_hint_keeps_inner_constant_offset
 //  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
 //  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
-//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
-//       CHECK:   %[[ZERO_OUTER:.+]] = arith.constant dense<0> : vector<3xindex>
-//       CHECK:   %[[ONE_INNER:.+]] = arith.constant dense<1> : vector<2xindex>
+//   CHECK-DAG:   %[[ZERO_OUTER:.+]] = arith.constant dense<0> : vector<3xindex>
+//   CHECK-DAG:   %[[ONE_INNER:.+]] = arith.constant dense<1> : vector<2xindex>
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
 //       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
 //       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]] [%[[ZERO_OUTER]], %[[ONE_INNER]] : vector<3xindex>, vector<2xindex>]
 //  CHECK-SAME:     indexing_maps = [#[[$MIXED_HINT_OFFSET_BASE_MAP]], #[[$MIXED_HINT_OFFSET_INDEX_MAP_0]], #[[$MIXED_HINT_OFFSET_INDEX_MAP_1]]]
@@ -201,8 +278,8 @@ func.func @map_store_f32_hinted_inner_contiguous_with_mask(
 // CHECK-LABEL: @map_store_f32_hinted_inner_contiguous_with_mask
 //  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
 //  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
-//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
-//       CHECK:   %[[MASK:.+]] = arith.cmpi uge
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//   CHECK-DAG:   %[[MASK:.+]] = arith.cmpi uge
 //       CHECK:   %[[INDEX:.+]] = vector.shape_cast
 //       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
 //       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]] [%[[INDEX]] : vector<2xindex>], %[[MASK]]
@@ -300,7 +377,8 @@ func.func @map_store_f32_reject_non_affine_hint(
 
 // -----
 
-// Full-byte map_store still vectorizes when the mask depends on the inner dim.
+// Full-byte map_store with a mask depending on the inner dim stays on the
+// post-bufferization decomposition path.
 func.func @map_store_f32_mask_depends_on_inner_index(
     %input: tensor<2x2xf32>, %output: tensor<2x2xf32>
 ) -> tensor<2x2xf32> {
@@ -313,14 +391,8 @@ func.func @map_store_f32_mask_depends_on_inner_index(
   return %0 : tensor<2x2xf32>
 }
 // CHECK-LABEL: @map_store_f32_mask_depends_on_inner_index
-//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
-//  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
-//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
-//       CHECK:   %[[MASK:.+]] = arith.cmpi uge
-//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
-//       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]], %[[MASK]]
-//  CHECK-SAME:     : vector<2x2xf32>, tensor<2x2xf32>, vector<2xi1> -> tensor<2x2xf32>
-//       CHECK:   return %[[SCATTER]] : tensor<2x2xf32>
+//       CHECK:   iree_linalg_ext.map_store
+//   CHECK-NOT:   transfer_scatter
 
 // -----
 

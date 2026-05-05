@@ -120,8 +120,8 @@ func.func @duplicate_apply_operand_is_not_hinted(
 // ANNOTATE: iree_linalg_ext.map_store
 // ANNOTATE-NOT: contiguous_dim_hints
 // VECTORIZE-LABEL: @duplicate_apply_operand_is_not_hinted
-// VECTORIZE: iree_vector_ext.transfer_scatter
-// VECTORIZE-SAME: tensor<3xf32> -> tensor<3xf32>
+// VECTORIZE: iree_linalg_ext.map_store
+// VECTORIZE-NOT: transfer_scatter
 
 // -----
 
@@ -140,8 +140,8 @@ func.func @symbol_operand_is_not_hinted(
 // ANNOTATE: iree_linalg_ext.map_store
 // ANNOTATE-NOT: contiguous_dim_hints
 // VECTORIZE-LABEL: @symbol_operand_is_not_hinted
-// VECTORIZE: iree_vector_ext.transfer_scatter
-// VECTORIZE-SAME: tensor<3xf32> -> tensor<3xf32>
+// VECTORIZE: iree_linalg_ext.map_store
+// VECTORIZE-NOT: transfer_scatter
 
 // -----
 
@@ -161,8 +161,8 @@ func.func @chained_apply_is_not_hinted(
 // ANNOTATE: iree_linalg_ext.map_store
 // ANNOTATE-NOT: contiguous_dim_hints
 // VECTORIZE-LABEL: @chained_apply_is_not_hinted
-// VECTORIZE: iree_vector_ext.transfer_scatter
-// VECTORIZE-SAME: vector<3xindex>
+// VECTORIZE: iree_linalg_ext.map_store
+// VECTORIZE-NOT: transfer_scatter
 
 // -----
 

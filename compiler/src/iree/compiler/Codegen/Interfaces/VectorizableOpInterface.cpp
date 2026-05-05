@@ -44,6 +44,8 @@ namespace mlir::iree_compiler {
 
 namespace {
 
+static constexpr int64_t kTinyNonContiguousMapStoreMaxElements = 8;
+
 /// Extracts a boolean option from a DictionaryAttr.
 static bool getBoolOption(DictionaryAttr options, StringRef name,
                           bool defaultValue = false) {
@@ -994,6 +996,18 @@ struct MapStoreOpVectorizationModel
         innerOutputContiguousDims.push_back(inputRank - 1);
         llvm::sort(innerOutputContiguousDims);
       }
+    }
+
+    // Tiny non-contiguous tensor transfer_scatter stores can be dominated by
+    // workgroup staging overhead. This avoids a BOO backward-data 1x1
+    // convolution regression where an 8-element tile grew from ~3us to ~64us.
+    // Keep them on the memref fallback path until transfer_scatter lowers
+    // directly to the final dispatch destination.
+    if (!hasExplicitContiguousDimHints && !preserveInnermostContiguousDim &&
+        inputType.getNumElements() <=
+            kTinyNonContiguousMapStoreMaxElements) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp, "tiny non-contiguous map_store uses memref fallback");
     }
 
     SmallVector<int64_t> indexVectorShape(inputType.getShape());

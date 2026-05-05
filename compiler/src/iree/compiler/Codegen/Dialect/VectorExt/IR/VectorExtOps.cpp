@@ -444,6 +444,12 @@ static bool isContiguousBaseMap(AffineMap map) {
   return true;
 }
 
+static bool permutationMapHasConstantResult(AffineMap map) {
+  return llvm::any_of(map.getResults(), [](AffineExpr expr) {
+    return isa<AffineConstantExpr>(expr);
+  });
+}
+
 template <typename OpTy>
 static Value foldTransferFromBroadcast(OpTy op) {
   return foldTransferIndexVecs(op, foldFromBroadcast);
@@ -849,6 +855,12 @@ struct FoldContiguousScatterToTransferWrite final
     }
 
     AffineMap permutationMap = op.getBasePermutationMap();
+    // vector.transfer_write cannot represent broadcast dimensions in its
+    // permutation map. vector.transfer_read can, so the gather fold above does
+    // not need this guard.
+    if (permutationMapHasConstantResult(permutationMap)) {
+      return failure();
+    }
     VectorType vectorType = op.getVectorType();
     Value mask = prepareMaskForContiguousFold(
         rewriter, op.getLoc(), op.getMask(), vectorType, permutationMap,
