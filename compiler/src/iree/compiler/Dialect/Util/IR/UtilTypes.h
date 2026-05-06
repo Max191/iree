@@ -7,6 +7,7 @@
 #ifndef IREE_COMPILER_DIALECT_UTIL_IR_UTILTYPES_H_
 #define IREE_COMPILER_DIALECT_UTIL_IR_UTILTYPES_H_
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Endian.h"
@@ -25,6 +26,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include <numeric>
+#include <optional>
 
 // clang-format off: must be included after all LLVM/MLIR headers.
 #include "iree/compiler/Dialect/Util/IR/UtilEnums.h.inc" // IWYU pragma: keep
@@ -256,6 +258,75 @@ inline raw_ostream &operator<<(raw_ostream &os,
 
 using SetIntDivisibilityFn =
     llvm::function_ref<void(Value, const ConstantIntDivisibility &)>;
+
+//===----------------------------------------------------------------------===//
+// Forward defines for InferAffineSeedDependencyOpInterface
+//===----------------------------------------------------------------------===//
+
+class AffineSeedDependency {
+public:
+  // Maps seed values to the coefficient in the affine expression represented
+  // by this value. Missing seeds have coefficient zero, present integer values
+  // are known coefficients, and present std::nullopt values are seed-specific
+  // unknown coefficients.
+  using CoefficientMap = llvm::DenseMap<Value, std::optional<int64_t>>;
+
+  enum class Kind {
+    Uninitialized,
+    Known,
+    Unknown,
+  };
+
+  AffineSeedDependency() = default;
+
+  static AffineSeedDependency getIndependent();
+  static AffineSeedDependency getSeed(Value seed);
+  static AffineSeedDependency getKnown(CoefficientMap coefficients);
+  static AffineSeedDependency getUnknown();
+
+  static AffineSeedDependency join(const AffineSeedDependency &lhs,
+                                   const AffineSeedDependency &rhs);
+  static AffineSeedDependency scale(const AffineSeedDependency &dependency,
+                                    int64_t scale);
+  static AffineSeedDependency add(const AffineSeedDependency &lhs,
+                                  const AffineSeedDependency &rhs,
+                                  int64_t lhsScale = 1,
+                                  int64_t rhsScale = 1);
+  static AffineSeedDependency getUnknownForDependentSeeds(
+      ArrayRef<AffineSeedDependency> dependencies);
+
+  bool isUninitialized() const { return kind == Kind::Uninitialized; }
+  bool isKnown() const { return kind == Kind::Known; }
+  bool isUnknown() const { return kind == Kind::Unknown; }
+  bool isIndependent() const;
+  Kind getKind() const { return kind; }
+
+  const CoefficientMap &getCoefficients() const {
+    assert(isKnown() && "expected known affine seed dependency");
+    return coefficients;
+  }
+  std::optional<int64_t> getCoefficient(Value seed) const;
+
+  bool operator==(const AffineSeedDependency &rhs) const;
+  void print(raw_ostream &os) const;
+
+private:
+  explicit AffineSeedDependency(Kind kind) : kind(kind) {}
+  explicit AffineSeedDependency(CoefficientMap coefficients)
+      : kind(Kind::Known), coefficients(std::move(coefficients)) {}
+
+  Kind kind = Kind::Uninitialized;
+  CoefficientMap coefficients;
+};
+
+inline raw_ostream &operator<<(raw_ostream &os,
+                               const AffineSeedDependency &dependency) {
+  dependency.print(os);
+  return os;
+}
+
+using SetAffineSeedDependencyFn =
+    llvm::function_ref<void(Value, const AffineSeedDependency &)>;
 
 //===----------------------------------------------------------------------===//
 // Shape-aware interface utilities
