@@ -16,16 +16,32 @@ The important blocker is not a missing interface model for a new operation
 name. It is the precision and context available for
 `affine.delinearize_index`: the current model correctly returns per-seed
 unknown coefficients for quotient/remainder results because those expressions
-are not globally affine in the source linear index. Real data-tiling cases need
-either a guarded no-wrap/range proof for map-store tiles or a later consumer
-that treats these delinearized tiled layouts as a structured non-affine case.
+are not globally affine in the source linear index. Before treating that as an
+analysis failure, re-run this inventory after the pre-vectorization
+linearize/delinearize cleanup. For the remaining unsimplified cases, useful
+proofs likely need no-wrap/range information from integer range analysis,
+alignment information from integer divisibility analysis, or a structured
+consumer for tiled-layout splits.
 
-`arith.index_cast` / `arith.index_castui` are a secondary coverage gap. In the
-representative map-store region bodies inspected below, including the BOO
-sample, these casts were not observed. They do appear in nearby data-tiling
-workload setup and larger ROCm pipeline tests. If a future pre-analysis dump
-has map-store indices or dynamic bases flowing through these casts, unsupported
-casts will become full `Unknown`.
+The map-store body operation inventory is only part of the coverage story.
+Real BOO cases also implicitly capture SSA values from enclosing control flow,
+including `scf.for` induction variables and `scf.forall` induction values.
+Those captures should be treated as seed-independent offsets for the
+map-store-region seed query unless their own producer state is unknown.
+
+`arith.index_cast` / `arith.index_castui` should be treated as pass-through for
+this work: the result gets the same affine seed-dependency state as the
+operand. They were not observed inside the representative map-store region
+bodies inspected below, including the BOO sample, but they do appear in nearby
+data-tiling workload setup and larger ROCm pipeline tests.
+
+Report hygiene note: the target "pre-analysis IR" point is after affine
+cleanup and before map-store contiguity analysis. In this work, the concrete
+cleanup pass is `iree-codegen-pre-vectorization-affine-index-cleanup`
+(`PreVectorizationAffineIndexCleanupPass`). Some inspected artifacts in this
+report were captured before that pass was fully positioned in the pipeline, so
+the inventory should be refreshed at the target point once pass placement is
+finalized.
 
 ## Glossary
 
@@ -35,7 +51,8 @@ casts will become full `Unknown`.
   `bd-va2`.
 - Pre-analysis IR: IR after pre-vectorization affine cleanup and before the
   map-store contiguity analysis or generic vectorization consumes the region
-  index expressions.
+  index expressions. This is the target pipeline state for refreshed
+  inventories; see the report hygiene note above for historical captures.
 
 ## Inputs Inspected
 
@@ -119,7 +136,8 @@ upstream/main.
 ## Map-Store Region Operation Inventory
 
 Counts below include only operations inside map-store regions, not surrounding
-buffer loads, linalg producers, or checks.
+buffer loads, linalg producers, checks, or implicit captures from enclosing
+regions.
 
 | Source | Relevant region ops |
 | --- | --- |
@@ -137,7 +155,97 @@ Current affine seed-dependency external models in
 `arith.select`, `affine.apply`, `affine.linearize_index`, and
 `affine.delinearize_index`. The only unsupported ops observed directly in
 map-store bodies are `arith.cmpi` and `arith.andi`, and both are used for masks
-rather than yielded index values in the inspected cases.
+rather than yielded index values in the inspected cases. This in-body
+inventory must be read together with the implicit-capture slice described in
+the next section.
+
+## Implicit Captures and External Producers
+
+The yielded indices are not always computed solely from map-store block
+arguments and operations nested textually inside the region. Region bodies can
+implicitly capture SSA values from enclosing loops and distributed control
+flow. A representative BOO map-store computes one output dimension with:
+
+```mlir
+%36 = affine.apply affine_map<(d0, d1, d2) -> (d0 * 2 + d1 + d2)>(
+  %arg3, %arg9, %arg7)
+```
+
+Here `%arg9` is a map-store region block argument, while `%arg3` and `%arg7`
+come from enclosing control flow; `%arg7` is an `scf.for` induction variable in
+the inspected dump. This example came from `source_index` 3 in
+`build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample_report.json`;
+regenerate the dump with the BOO command in this report to inspect the full
+dispatch. Other captures in the BOO sample include constants, dynamic tensor
+dimensions, affine values derived before the map store, and `scf.forall`
+induction values used to locate distributed slices.
+
+For affine seed-dependency, these captured values should normally be
+independent of the map-store region seeds. The implementation must still make
+that independence available to transfer functions for mixed expressions such
+as `affine.apply`, otherwise an uninitialized captured operand can prevent a
+known seed coefficient from propagating. This means the real coverage question
+is not only "which ops are inside the map-store body?", but also "which
+external producers feed captured operands?" The initial list to verify in real
+pipelines is:
+
+- `scf.for` induction variables captured as seed-independent affine offsets.
+- `scf.forall` induction values captured as seed-independent distributed tile
+  offsets.
+- `affine.apply` producers outside the map-store body that compute captured
+  tile bases.
+- `tensor.dim` / dynamic size values that feed masks or output bounds and
+  should be independent for yielded-index proofs.
+- Constants and dispatch/workgroup-derived indices that should be independent
+  unless a future query intentionally seeds them.
+
+The current BOO sample report records only region-body operation counts. A
+follow-up coverage pass should inventory the producer slice for all captured
+operands used by yielded indices, not only the operations nested in the
+map-store region. A deterministic inventory should walk backward from yielded
+index operands, stop at map-store region block arguments and captured values,
+and record each captured value's SSA name, defining op, dominance scope, and
+expected seed-dependency state (`Known({})`, coefficient map, or unknown).
+
+When the implementation lands, add a minimal lit test to
+`compiler/src/iree/compiler/Dialect/Util/Transforms/test/test_affine_seed_dependency_analysis.mlir`
+that mixes a map-store block argument with a captured `scf.for` induction
+variable in an `affine.apply`. The test should follow the existing
+`iree_unregistered.test_affine_seed_dependency` pattern. The `FUTURE-CHECK`
+lines below are the expected checks after implicit-capture handling is wired;
+before that implementation, this shape is expected to report a conservative
+full-unknown lattice result. These snippets are planning artifacts, not current
+regression guardrails; when the implementation lands, derive the exact
+`CHECK` strings from the `iree-opt --iree-util-test-affine-seed-dependency-analysis`
+output instead of hand-editing coefficient strings.
+
+```mlir
+// FUTURE-CHECK-LABEL: @map_store_capture_for_iv
+func.func @map_store_capture_for_iv(
+    %input: tensor<2x2xf32>, %output: tensor<2x4xf32>
+) -> tensor<2x4xf32> {
+  %c0 = arith.constant 0 : index
+  %c2 = arith.constant 2 : index
+  %c1 = arith.constant 1 : index
+  %mask = arith.constant true
+  %result = scf.for %iv = %c0 to %c2 step %c1
+      iter_args(%out = %output) -> (tensor<2x4xf32>) {
+    %next = iree_linalg_ext.map_store %input into %out {
+    ^bb0(%idx0: index, %idx1: index):
+      %mapped = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%idx1, %iv)
+      // FUTURE-CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 1"
+      "iree_unregistered.test_affine_seed_dependency"(%mapped, %idx0, %idx1)
+          : (index, index, index) -> ()
+      // FUTURE-CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 0"
+      "iree_unregistered.test_affine_seed_dependency"(%iv, %idx0, %idx1)
+          : (index, index, index) -> ()
+      iree_linalg_ext.yield %idx0, %mapped, %mask : index, index, i1
+    } : tensor<2x2xf32> into tensor<2x4xf32> -> tensor<2x4xf32>
+    scf.yield %next : tensor<2x4xf32>
+  }
+  return %result : tensor<2x4xf32>
+}
+```
 
 ## Observed Analysis Behavior
 
@@ -163,9 +271,9 @@ This is the expected conservative result: useful affine expressions are known,
 non-affine quotient/remainder expressions become per-seed unknown, and
 independence from unrelated map-store block arguments is preserved.
 
-## Coverage Gaps and Transfer Rules
+## Coverage Assessment and Transfer Rules
 
-### Gap A: `affine.delinearize_index`
+### Assessment A: `affine.delinearize_index`
 
 Priority: required for E2E expand-like map stores and all inspected
 data-tiling / GPU-packed real cases.
@@ -185,36 +293,40 @@ Design note / proposed transfer rule:
 
 1. If the linear index input is independent of all seeds, every delinearized
    result is independent.
-2. If the op is part of an exact `linearize_index` / `delinearize_index`
-   inverse with matching static bases and the linearization is disjoint,
-   propagate the original component dependencies to the matching results.
-   Prefer keeping this as canonicalization when possible so the analysis sees
-   the simpler values.
+2. First rely on the pre-vectorization affine cleanup pass to split exact
+   `linearize_index` / `delinearize_index` compositions and other simplifiable
+   cases. Re-evaluate real dumps after that cleanup before adding special-case
+   local transfer rules.
 3. If the linear index depends on a seed and no range/alignment/no-wrap fact is
    available, do not assign a numeric coefficient to quotient or remainder
    results. Mark each dependent seed coefficient as `?`, while preserving
    known `0` for unrelated seeds.
-4. If a future map-store-aware context proves that a vectorized seed varies
-   only within one static delinearization tile and cannot cross the relevant
-   basis boundary, the innermost varying result may get coefficient `1` for
-   that seed and outer results may get coefficient `0` for that seed. Without
-   such a proof, a blanket coefficient-`1` rule for remainders is unsound.
-5. Dynamic bases should remain per-seed `?` for dependent seeds unless they
+4. Use integer range analysis to prove no-wrap conditions such as "the
+   seed-dependent part varies only within one static delinearization tile" or
+   "the affine expression cannot cross the relevant basis boundary" for the
+   vectorized seed range.
+5. Use integer divisibility analysis to prove alignment of the seed-independent
+   base/offset. For example, if the non-seed component is divisible by a basis
+   product and range analysis proves no carry into the next quotient, an
+   innermost delinearized result may have coefficient `1` for the seed while
+   outer results have coefficient `0`.
+6. Dynamic bases should remain per-seed `?` for dependent seeds unless they
    are folded to constants or the analysis is extended to carry symbolic
    coefficients. If all operands and bases are seed-independent, the results
    are independent.
 
 This is partly an interface-precision gap and partly an analysis-context gap:
 the current op interface signature does not receive map-store iteration ranges,
-vector tile widths, or alignment facts. Adding only a local op model cannot
-soundly prove the common data-tiling no-wrap cases.
+vector tile widths, integer ranges, or alignment/divisibility facts. Adding
+only a local op model cannot soundly prove the common data-tiling no-wrap
+cases.
 
-### Gap B: `arith.index_cast` and `arith.index_castui`
+### Assessment B: casts (`arith.index_cast` and `arith.index_castui`)
 
-Priority: likely needed for broader generated pipelines, especially when
-dynamic workload constants or packed layout dimensions feed map-store index
-expressions. Not a blocker for the checked-in map-store region snippets
-inspected here.
+Priority: likely needed as missing external-model wiring for broader generated
+pipelines, especially when dynamic workload constants or packed layout
+dimensions feed map-store index expressions. The intended transfer semantics
+for the current map-store contiguity query are simple pass-through.
 
 Examples:
 
@@ -225,19 +337,61 @@ Examples:
 
 Design note / proposed transfer rule:
 
-1. If the cast operand is seed-independent, the result is seed-independent.
-2. If the cast is index-preserving for the relevant value range, forward the
-   operand coefficient map unchanged.
-3. If the cast may truncate, wrap, reinterpret signedness in a way that changes
-   the mathematical integer value, or otherwise lacks a no-overflow proof,
-   mark dependent seed coefficients as `?` rather than full `Unknown`.
-4. Preserve known `0` coefficients for unrelated seeds.
+1. Treat these casts as abstract-state pass-through for now: the result gets
+   exactly the same affine seed-dependency state as the operand.
+2. This is not a general claim that all integer casts preserve mathematical
+   value. It is an engineering shortcut for index-like plumbing in the current
+   map-store pipelines.
+3. "Exactly the same" means copying the whole lattice value, including full
+   unknown, per-seed unknown markers, independence, and known coefficient maps;
+   the transfer rule does not re-derive integer semantics from the cast.
+4. This rule is valid only while the queried map-store relationships do not
+   depend on bitwidth-sensitive, wrap-sensitive, or signedness-sensitive
+   integer facts.
+5. If a later pipeline exposes truncating, wrapping, or sign-changing casts in
+   yielded index expressions, revisit this with integer range analysis and add
+   negative tests that produce `?` / unknown as appropriate.
+   A concrete future negative shape is an index that narrows through
+   `i64 -> i32` before round-tripping to `index`, where truncation could change
+   the yielded index relationship.
 
-This rule is useful only for index-like casts that produce index values queried
-by map-store analysis. It should not try to make arbitrary integer arithmetic
-globally affine.
+Implementation acceptance should include focused lit cases in
+`compiler/src/iree/compiler/Dialect/Util/Transforms/test/test_affine_seed_dependency_analysis.mlir`
+showing a known coefficient map forwarded through `arith.index_cast` and
+`arith.index_castui`. If truncating or wrapping casts ever enter the yielded
+index slice, add a negative case that returns `?` / unknown rather than
+silently cloning operand state. This is a closure requirement for the
+implementation bead that wires these models, not a requirement for closing this
+report-only bead.
 
-### Gap C: `arith.cmpi` and `arith.andi`
+Minimal positive test shape, with expected checks after the cast models are
+implemented:
+
+```mlir
+// FUTURE-CHECK-LABEL: @index_cast_passthrough
+util.func @index_cast_passthrough(%idx: index) {
+  %i64 = arith.index_cast %idx : index to i64
+  %roundtrip = arith.index_cast %i64 : i64 to index
+  // FUTURE-CHECK: affine_seed_dependency = "seed0 = 1"
+  "iree_unregistered.test_affine_seed_dependency"(%roundtrip, %idx)
+      : (index, index) -> ()
+  util.return
+}
+
+// -----
+
+// FUTURE-CHECK-LABEL: @index_castui_passthrough
+util.func @index_castui_passthrough(%idx: index) {
+  %i64 = arith.index_castui %idx : index to i64
+  %roundtrip = arith.index_castui %i64 : i64 to index
+  // FUTURE-CHECK: affine_seed_dependency = "seed0 = 1"
+  "iree_unregistered.test_affine_seed_dependency"(%roundtrip, %idx)
+      : (index, index) -> ()
+  util.return
+}
+```
+
+### Mask-only ops: `arith.cmpi` and `arith.andi`
 
 Priority: not required for map-store index contiguity in the inspected cases.
 
@@ -248,8 +402,11 @@ Examples:
 - The BOO sampled convolution cases use `arith.cmpi` and `arith.andi` only to
   compute the yielded mask after `affine.delinearize_index`.
 
-Design note / proposed transfer rule if a future consumer queries mask
-dependence:
+No operation interface work is needed for the current yielded-index contiguity
+proof. These ops are mask-only in the inspected cases, and the map-store
+consumer can query only yielded index operands.
+
+If a future consumer queries mask dependence:
 
 1. Treat comparison results as non-index boolean facts, not affine index
    values.
@@ -257,10 +414,8 @@ dependence:
 3. If either operand depends on a seed, record only boolean dependence or use a
    separate mask-dependency analysis; do not assign affine coefficients.
 
-The current affine seed-dependency analysis can ignore this for yielded index
-proofs. Adding coefficient-style interfaces for comparison/logical mask ops
-would be misleading unless the query API grows explicit boolean dependence
-support.
+Adding coefficient-style interfaces for comparison/logical mask ops would be
+misleading unless the query API grows explicit boolean dependence support.
 
 ## Non-Gaps
 
@@ -297,10 +452,17 @@ Potential follow-ups:
 
 1. Run the full 550-command BOO source list with `--verify-numerics` and save
    any additional map-store shapes that exercise different index operations.
-2. Decide whether data-tiling no-wrap facts belong in the affine
-   seed-dependency analysis API, in the map-store contiguity query, or in a
-   separate structured tiled-layout recognizer.
-3. Add `arith.index_cast` / `arith.index_castui` models before analyzing
-   dynamic-basis or workload-derived index expressions.
-4. Keep `affine.delinearize_index` conservative unless the implementation can
-   prove an exact inverse or no-wrap tile condition.
+2. Inventory implicit captures for yielded-index operands, including
+   `scf.for` induction variables, `scf.forall` induction values, external
+   `affine.apply` producers, and dynamic dimension values; use the reduced lit
+   test shape described in `Implicit Captures and External Producers`.
+3. Re-evaluate `affine.delinearize_index` after the linearize/delinearize
+   cleanup pass, then keep remaining cases conservative unless the
+   implementation can prove an exact inverse or no-wrap tile condition using
+   cleanup, integer range analysis, and/or integer divisibility analysis.
+   Decide whether those no-wrap facts belong in the affine seed-dependency
+   analysis API, in the map-store contiguity query, or in a separate structured
+   tiled-layout recognizer.
+4. Implement `arith.index_cast` / `arith.index_castui` as abstract-state
+   pass-through, with focused tests for pass-through plumbing and any future
+   truncating/wrapping negative case.
