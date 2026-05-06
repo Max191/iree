@@ -4,6 +4,9 @@ This directory collects the focused test plan for reworking
 `iree_linalg_ext.map_store` vectorization to lower directly to
 `iree_vector_ext.transfer_scatter`.
 
+See `affine_seed_dependency_op_coverage_report.md` for the current
+map-store-region affine seed-dependency operation coverage report.
+
 The matrix is split by feedback speed:
 
 1. Fast lit transform tests.

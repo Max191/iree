@@ -118,3 +118,91 @@ util.func @unsupported_op_is_full_unknown(%arg0: index) {
   "iree_unregistered.test_affine_seed_dependency"(%0, %arg0) : (index, index) -> ()
   util.return
 }
+
+// -----
+
+// CHECK-LABEL: @map_store_affine_apply_constant_offset_on_seed1
+func.func @map_store_affine_apply_constant_offset_on_seed1(
+    %input: tensor<2x2xf32>, %output: tensor<2x4xf32>
+) -> tensor<2x4xf32> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index, %idx1: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> (d0 + 2)>(%idx1)
+      // CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 1"
+      "iree_unregistered.test_affine_seed_dependency"(%1, %idx0, %idx1)
+          : (index, index, index) -> ()
+      iree_linalg_ext.yield %idx0, %1, %mask : index, index, i1
+  } : tensor<2x2xf32> into tensor<2x4xf32> -> tensor<2x4xf32>
+  return %0 : tensor<2x4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @map_store_linearize_collapse
+func.func @map_store_linearize_collapse(
+    %input: tensor<4x4xi32>, %output: tensor<16xi32>
+) -> tensor<16xi32> {
+  %mask = arith.constant true
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%arg2: index, %arg3: index):
+      %2 = affine.linearize_index disjoint [%arg2, %arg3] by (4, 4) : index
+      // CHECK: affine_seed_dependency = "seed0 = 4, seed1 = 1"
+      "iree_unregistered.test_affine_seed_dependency"(%2, %arg2, %arg3)
+          : (index, index, index) -> ()
+      iree_linalg_ext.yield %2, %mask : index, i1
+  } : tensor<4x4xi32> into tensor<16xi32> -> tensor<16xi32>
+  return %0 : tensor<16xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @map_store_delinearize_expand
+func.func @map_store_delinearize_expand(
+    %input: tensor<16xf32>, %output: tensor<4x4xf32>
+) -> tensor<4x4xf32> {
+  %mask = arith.constant true
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%arg2: index):
+      %2:2 = affine.delinearize_index %arg2 into (4, 4) : index, index
+      "iree_unregistered.test_affine_seed_dependency"(%2#0, %arg2)
+          : (index, index) -> ()
+      "iree_unregistered.test_affine_seed_dependency"(%2#1, %arg2)
+          : (index, index) -> ()
+      iree_linalg_ext.yield %2#0, %2#1, %mask : index, index, i1
+  } : tensor<16xf32> into tensor<4x4xf32> -> tensor<4x4xf32>
+  return %0 : tensor<4x4xf32>
+}
+// CHECK-COUNT-2: affine_seed_dependency = "seed0 = ?"
+
+// -----
+
+// CHECK-LABEL: @map_store_nested_gpu_delinearize
+func.func @map_store_nested_gpu_delinearize(
+    %input: tensor<256x256xf32>,
+    %output: tensor<2x16x8x4x4x4x4xf32>
+) -> tensor<2x16x8x4x4x4x4xf32> {
+  %mask = arith.constant true
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%arg0: index, %arg1: index):
+      %13:2 = affine.delinearize_index %arg0 into (2, 128) : index, index
+      %14:2 = affine.delinearize_index %arg1 into (16, 16) : index, index
+      %15:3 = affine.delinearize_index %13#1
+          into (4, 8, 4) : index, index, index
+      %16:2 = affine.delinearize_index %14#1 into (4, 4) : index, index
+      "iree_unregistered.test_affine_seed_dependency"(%13#0, %arg0, %arg1)
+          : (index, index, index) -> ()
+      "iree_unregistered.test_affine_seed_dependency"(%13#1, %arg0, %arg1)
+          : (index, index, index) -> ()
+      "iree_unregistered.test_affine_seed_dependency"(%15#2, %arg0, %arg1)
+          : (index, index, index) -> ()
+      "iree_unregistered.test_affine_seed_dependency"(%16#1, %arg0, %arg1)
+          : (index, index, index) -> ()
+      iree_linalg_ext.yield %13#0, %14#0, %15#1, %16#1, %15#0, %15#2,
+          %16#0, %mask : index, index, index, index, index, index, index, i1
+  } : tensor<256x256xf32> into tensor<2x16x8x4x4x4x4xf32>
+      -> tensor<2x16x8x4x4x4x4xf32>
+  return %0 : tensor<2x16x8x4x4x4x4xf32>
+}
+// CHECK-COUNT-3: affine_seed_dependency = "seed0 = ?, seed1 = 0"
+// CHECK: affine_seed_dependency = "seed0 = 0, seed1 = ?"
