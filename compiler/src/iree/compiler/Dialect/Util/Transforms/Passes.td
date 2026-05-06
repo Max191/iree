@@ -350,6 +350,17 @@ def TestFloatRangeAnalysisPass : Pass<"iree-util-test-float-range-analysis", "">
   }];
 }
 
+def TestAffineSeedDependencyAnalysisPass :
+    Pass<"iree-util-test-affine-seed-dependency-analysis", ""> {
+  let summary = "Tests affine seed-dependency analysis.";
+  let description = [{
+    Tests affine seed-dependency analysis by evaluating any
+    'iree_unregistered.test_affine_seed_dependency' op and setting the result
+    on an attribute. Operand 0 is the value to query, and remaining operands are
+    the ordered seed values to report.
+  }];
+}
+
 def TestIntegerDivisibilityAnalysisPass :
     Pass<"iree-util-test-integer-divisibility-analysis", ""> {
   let summary = "Tests integer divisibility analysis.";

@@ -40,6 +40,7 @@ iree_cc_library(
     "SimplifyGlobalAccesses.cpp"
     "StripAndSplatConstants.cpp"
     "StripDebugOps.cpp"
+    "TestAffineSeedDependencyAnalysis.cpp"
     "TestConversion.cpp"
     "TestFloatRangeAnalysis.cpp"
     "TestIntegerDivisibilityAnalysis.cpp"
