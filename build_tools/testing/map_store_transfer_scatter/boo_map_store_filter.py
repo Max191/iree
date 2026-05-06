@@ -123,6 +123,23 @@ def with_debug_flags(command: list[str], dump_dir: Path) -> list[str]:
     return [filtered[0], *debug_flags, *filtered[1:]]
 
 
+def with_resolved_compile_tool(command: list[str], iree_build: Path) -> list[str]:
+    """Resolves BOO-captured `iree-compile` spellings against `iree_build`."""
+    if not command:
+        return command
+    command_tool = Path(command[0])
+    if command_tool.is_absolute():
+        return command
+    if command_tool.name != "iree-compile":
+        return command
+    build_relative_tool = iree_build / command_tool
+    tools_basename_tool = iree_build / "tools" / command_tool.name
+    for candidate_tool in (build_relative_tool, tools_basename_tool):
+        if candidate_tool.exists():
+            return [str(candidate_tool), *command[1:]]
+    return command
+
+
 def list_text_files(dump_path: Path) -> list[Path]:
     if dump_path.is_file():
         return [dump_path]
@@ -229,10 +246,12 @@ def run_boo_command(
 
 def run_debug_compile(
     compile_command_file: Path,
+    iree_build: Path,
     dump_dir: Path,
     timeout_seconds: int,
 ) -> Path:
     compile_command = read_compile_command(compile_command_file)
+    compile_command = with_resolved_compile_tool(compile_command, iree_build)
     debug_command = with_debug_flags(compile_command, dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)
     stderr_file = dump_dir / "compile.after_all.mlir"
@@ -275,6 +294,7 @@ def command_filter_convs(args: argparse.Namespace) -> int:
             dump_dir = case_dir / "debug_dumps"
             stderr_file = run_debug_compile(
                 compile_command_file,
+                args.iree_build,
                 dump_dir,
                 args.timeout_seconds,
             )

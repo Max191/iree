@@ -20,12 +20,12 @@ are not globally affine in the source linear index. Real data-tiling cases need
 either a guarded no-wrap/range proof for map-store tiles or a later consumer
 that treats these delinearized tiled layouts as a structured non-affine case.
 
-`arith.index_cast` / `arith.index_castui` are a secondary coverage gap. They
-were not observed inside the representative map-store region bodies inspected
-below, but they appear in nearby data-tiling workload setup and larger ROCm
-pipeline tests. If a future pre-analysis dump has map-store indices or dynamic
-bases flowing through these casts, unsupported casts will become full
-`Unknown`.
+`arith.index_cast` / `arith.index_castui` are a secondary coverage gap. In the
+representative map-store region bodies inspected below, including the BOO
+sample, these casts were not observed. They do appear in nearby data-tiling
+workload setup and larger ROCm pipeline tests. If a future pre-analysis dump
+has map-store indices or dynamic bases flowing through these casts, unsupported
+casts will become full `Unknown`.
 
 ## Glossary
 
@@ -47,6 +47,7 @@ All commands below are run from the IREE source root unless noted.
 | Focused E2E semantic snippets | `build_tools/testing/map_store_transfer_scatter/snippets/focused/e2e_linalg_ext_map_store_pre.mlir` | 4 | Copy, collapse, expand, and slice-like map stores from `tests/e2e/linalg_ext_ops/map_store.mlir`. |
 | ROCm matmul packed output | `build_tools/testing/map_store_transfer_scatter/snippets/gpu/rocdl_matmul_map_store_pre_vector_distribute.mlir` | 1 | Full dispatch with nested `affine.delinearize_index` before vector distribution. |
 | ROCm tile-and-fuse data tiling | `build_tools/testing/map_store_transfer_scatter/snippets/gpu/rocdl_tile_and_fuse_data_tiling_map_store_pre.mlir` | 1 | Data-tiling map store with two source dimensions split into four destination dimensions. |
+| BOO sampled convolution filter run | `build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample_report.json` | 9 | First 20 commands from `$FILTERED_CONVS` produced 9 pre-vectorization map-store regions. |
 | Data-tiling configuration test | `compiler/src/iree/compiler/Codegen/LLVMGPU/test/gpu_pipeline_data_tiling.mlir` | 1 generated | Reproducible with the command below; write to a scratch path outside the repo. |
 | Full generic map-store test source | `compiler/src/iree/compiler/Codegen/Common/test/generic_vectorization_map_store.mlir` | 24 | Broader source test for explicit hints, rejection cases, masks, and sub-byte cases. |
 | Analysis lit coverage | `compiler/src/iree/compiler/Dialect/Util/Transforms/test/test_affine_seed_dependency_analysis.mlir` | 4 map-store-shaped additions | Minimal map-store-motivated query cases with FileCheck expectations for the observed lattice states. |
@@ -71,23 +72,49 @@ The checked-in snippet regeneration commands are documented in
 
 ## BOO Status
 
-The repo-local BOO seed command list is:
+The repo-local BOO command lists are:
 
 - `build_tools/testing/map_store_transfer_scatter/boo_convs_small_seed.txt`
+- `build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample.txt`
 
-Additional filtered BOO command lists were available in neighboring local
-worktrees during this investigation, but those paths are not part of the IREE
-checkout and are intentionally not recorded as durable report inputs.
+The repo-local BOO report artifacts are:
 
-BOO IR coverage is not claimed in this revision. To claim it, the BOO
-environment must provide `iree-boo-driver`, importable IREE Python compiler
-bindings, and an IREE build with `iree-compile` plus Python bindings. The
-expected durable artifacts are filtered command lists such as
-`map_store_convs*.txt`, `boo_map_store_filter_report.json`, and checked-in
-pre-vectorization snippets under
-`build_tools/testing/map_store_transfer_scatter/snippets/boo/`. A follow-up BOO
-run should regenerate those artifacts with `boo_map_store_filter.py` before
-closing the report bead.
+- `build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample_report.json`
+
+Limited BOO IR coverage is claimed for the 20-command local sample recorded
+here. The run used a BOO-capable environment:
+
+- `FILTERED_CONVS=/path/to/filtered_convs.txt`
+- `IREE_BUILD=/path/to/iree-build`
+- `VENV=/path/to/.venv`
+- `WORKDIR=/tmp/bd-va2-boo-map-store-filter-20`
+
+The command was:
+
+```bash
+python3 build_tools/testing/map_store_transfer_scatter/boo_map_store_filter.py \
+  filter-convs \
+  --commands-file "$FILTERED_CONVS" \
+  --iree-build "$IREE_BUILD" \
+  --venv "$VENV" \
+  --work-dir "$WORKDIR/run" \
+  --matches-out "$WORKDIR/map_store_convs.txt" \
+  --nonmatches-out "$WORKDIR/non_map_store_convs.txt" \
+  --errors-out "$WORKDIR/errors.txt" \
+  --report-out "$WORKDIR/boo_map_store_filter_report.json" \
+  --stop-before-file-regex generic-vectorization \
+  --timeout-seconds 0 \
+  --limit 20 \
+  --keep-going
+```
+
+Result: 9 matched, 11 nonmatched, 0 errors. The summarized JSON report and
+operation counts are checked in as
+`build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample_report.json`.
+The sample was run for IR coverage only; it did not pass `--verify-numerics`
+and did not run the full 550-command source list. A follow-up validation bead
+should run the full BOO matrix with numerics enabled and compare performance to
+upstream/main.
 
 ## Map-Store Region Operation Inventory
 
@@ -100,6 +127,7 @@ buffer loads, linalg producers, or checks.
 | Focused E2E snippets | `affine.linearize_index` 1, `affine.delinearize_index` 1, `arith.constant` 1, `arith.cmpi` 1 |
 | ROCm matmul packed output snippet | `affine.delinearize_index` 4 |
 | ROCm tile-and-fuse data-tiling snippet | `affine.delinearize_index` 2 |
+| BOO sampled convolution filter run | `affine.apply` 38, `affine.linearize_index` 9, `affine.delinearize_index` 9, `arith.cmpi` 36, `arith.andi` 27, `iree_linalg_ext.yield` 9 |
 | Generated `gpu_pipeline_data_tiling` dump | `affine.delinearize_index` 4 |
 | Full generic map-store source test | `arith.constant` 24, `affine.apply` 14, `arith.cmpi` 3, `arith.addi` 1 |
 
@@ -107,9 +135,9 @@ Current affine seed-dependency external models in
 `compiler/src/iree/compiler/ExternalInterfaces/UtilExternalModels.cpp` cover
 `arith.constant`, `arith.addi`, `arith.subi`, `arith.muli`,
 `arith.select`, `affine.apply`, `affine.linearize_index`, and
-`affine.delinearize_index`. The only unsupported op observed directly in
-map-store bodies is `arith.cmpi`, and it is used for masks rather than yielded
-index values in the inspected cases.
+`affine.delinearize_index`. The only unsupported ops observed directly in
+map-store bodies are `arith.cmpi` and `arith.andi`, and both are used for masks
+rather than yielded index values in the inspected cases.
 
 ## Observed Analysis Behavior
 
@@ -209,7 +237,7 @@ This rule is useful only for index-like casts that produce index values queried
 by map-store analysis. It should not try to make arbitrary integer arithmetic
 globally affine.
 
-### Gap C: `arith.cmpi`
+### Gap C: `arith.cmpi` and `arith.andi`
 
 Priority: not required for map-store index contiguity in the inspected cases.
 
@@ -217,6 +245,8 @@ Examples:
 
 - Focused generic and E2E snippets use `arith.cmpi` only to compute the
   yielded mask.
+- The BOO sampled convolution cases use `arith.cmpi` and `arith.andi` only to
+  compute the yielded mask after `affine.delinearize_index`.
 
 Design note / proposed transfer rule if a future consumer queries mask
 dependence:
@@ -228,8 +258,9 @@ dependence:
    separate mask-dependency analysis; do not assign affine coefficients.
 
 The current affine seed-dependency analysis can ignore this for yielded index
-proofs. Adding a coefficient-style interface for `arith.cmpi` would be
-misleading unless the query API grows explicit boolean dependence support.
+proofs. Adding coefficient-style interfaces for comparison/logical mask ops
+would be misleading unless the query API grows explicit boolean dependence
+support.
 
 ## Non-Gaps
 
@@ -264,8 +295,8 @@ structured handling of tiled layout splits.
 
 Potential follow-ups:
 
-1. Add targeted BOO snippets once a BOO environment with IREE Python bindings
-   is available.
+1. Run the full 550-command BOO source list with `--verify-numerics` and save
+   any additional map-store shapes that exercise different index operations.
 2. Decide whether data-tiling no-wrap facts belong in the affine
    seed-dependency analysis API, in the map-store contiguity query, or in a
    separate structured tiled-layout recognizer.

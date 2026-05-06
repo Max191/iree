@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for BOO map_store dump filtering helpers."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -179,6 +180,100 @@ class HelperTest(unittest.TestCase):
             ],
         )
 
+    def test_with_resolved_compile_tool_resolves_bare_tool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            iree_build = Path(temp_dir) / "iree-build"
+            tools_dir = iree_build / "tools"
+            tools_dir.mkdir(parents=True)
+            (tools_dir / "iree-compile").write_text("")
+
+            resolved = filter_tool.with_resolved_compile_tool(
+                ["iree-compile", "input.mlir"],
+                iree_build,
+            )
+
+            self.assertEqual(
+                resolved,
+                [str(tools_dir / "iree-compile"), "input.mlir"],
+            )
+
+    def test_with_resolved_compile_tool_keeps_empty_command(self):
+        self.assertEqual(
+            filter_tool.with_resolved_compile_tool([], Path("/unused")),
+            [],
+        )
+
+    def test_with_resolved_compile_tool_resolves_build_relative_tool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            iree_build = Path(temp_dir) / "iree-build"
+            tools_dir = iree_build / "tools"
+            tools_dir.mkdir(parents=True)
+            (tools_dir / "iree-compile").write_text("")
+
+            resolved = filter_tool.with_resolved_compile_tool(
+                ["tools/iree-compile", "input.mlir"],
+                iree_build,
+            )
+
+            self.assertEqual(
+                resolved,
+                [str(tools_dir / "iree-compile"), "input.mlir"],
+            )
+
+    def test_with_resolved_compile_tool_resolves_relative_tool_by_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            iree_build = Path(temp_dir) / "iree-build"
+            tools_dir = iree_build / "tools"
+            tools_dir.mkdir(parents=True)
+            (tools_dir / "iree-compile").write_text("")
+
+            resolved = filter_tool.with_resolved_compile_tool(
+                ["./iree-compile", "input.mlir"],
+                iree_build,
+            )
+
+            self.assertEqual(
+                resolved,
+                [str(tools_dir / "iree-compile"), "input.mlir"],
+            )
+
+    def test_with_resolved_compile_tool_keeps_explicit_tool(self):
+        resolved = filter_tool.with_resolved_compile_tool(
+            ["/opt/iree/tools/iree-compile", "input.mlir"],
+            Path("/unused"),
+        )
+
+        self.assertEqual(
+            resolved,
+            ["/opt/iree/tools/iree-compile", "input.mlir"],
+        )
+
+    def test_with_resolved_compile_tool_keeps_missing_bare_tool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            iree_build = Path(temp_dir) / "iree-build"
+            (iree_build / "tools").mkdir(parents=True)
+
+            resolved = filter_tool.with_resolved_compile_tool(
+                ["iree-compile", "input.mlir"],
+                iree_build,
+            )
+
+            self.assertEqual(resolved, ["iree-compile", "input.mlir"])
+
+    def test_with_resolved_compile_tool_keeps_other_tool_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            iree_build = Path(temp_dir) / "iree-build"
+            tools_dir = iree_build / "tools"
+            tools_dir.mkdir(parents=True)
+            (tools_dir / "other-tool").write_text("")
+
+            resolved = filter_tool.with_resolved_compile_tool(
+                ["other-tool", "input.mlir"],
+                iree_build,
+            )
+
+            self.assertEqual(resolved, ["other-tool", "input.mlir"])
+
     def test_filename_stop_prevents_later_tree_matches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             dump_dir = Path(temp_dir)
@@ -216,6 +311,29 @@ class HelperTest(unittest.TestCase):
             )
 
             self.assertTrue(result["has_pre_vectorization_map_store"])
+
+
+class SampleArtifactTest(unittest.TestCase):
+    def test_boo_sample_commands_match_report(self):
+        sample_dir = Path(__file__).parent
+        commands_file = sample_dir / "boo_convs_map_store_sample.txt"
+        report_file = sample_dir / "boo_convs_map_store_sample_report.json"
+        commands = filter_tool.read_commands(commands_file)
+        report = json.loads(report_file.read_text())
+
+        self.assertEqual(
+            commands,
+            [case["command"] for case in report["matched_cases"]],
+        )
+        self.assertEqual(len(commands), report["matched"])
+        self.assertEqual(report["errors"], 0)
+
+        aggregate_counts = {}
+        for case in report["matched_cases"]:
+            for op_name, count in case["region_ops"].items():
+                aggregate_counts[op_name] = aggregate_counts.get(op_name, 0) + count
+
+        self.assertEqual(aggregate_counts, report["aggregate_region_ops"])
 
 
 if __name__ == "__main__":
