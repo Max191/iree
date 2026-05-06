@@ -886,12 +886,19 @@ def AnnotateMapStoreContiguousDimHintsPass :
   let summary = "Annotate exact contiguous dimensions on map_store ops";
   let description = [{
     Annotates `iree_linalg_ext.map_store` ops with `contiguous_dim_hints` for
-    yielded output indices that are exactly an input block argument plus a
-    constant, expressed either directly or through one single-result
-    `affine.apply` with add-only constant folding. Ambiguous projections and
-    other equivalent arithmetic forms are intentionally left unhinted. Ops with
-    existing `contiguous_dim_hints` are treated as already annotated and are not
-    completed by this pass. Each hint is an internal metadata pair `(inputDim,
+    yielded output indices whose affine seed-dependency state proves a unit
+    coefficient on exactly one map_store input index and zero coefficients on
+    the other input indices. The analysis is seeded with map_store input indices
+    and solved once per function containing unannotated map_store ops. This is
+    more expensive than local syntactic matching, but composes through supported
+    affine/index operations, so equivalent SSA forms are not limited to a single
+    syntactic `affine.apply`. The downstream vectorizer still validates that
+    hinted index expressions are representable as transfer_scatter maps.
+    Ambiguous, unsupported, or unknown projections are intentionally left
+    unhinted. Ops with existing `contiguous_dim_hints` are treated as already
+    annotated and are not completed by this pass. If analysis fails, the pass
+    leaves ops unhinted rather than failing compilation because the hints are
+    optional metadata. Each hint is an internal metadata pair `(inputDim,
     outputDim)` stating that `inputDim` can be represented as a contiguous
     base-map dimension in `outputDim`.
   }];
