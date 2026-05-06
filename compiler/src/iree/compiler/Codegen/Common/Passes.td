@@ -1018,6 +1018,41 @@ def MathTransformPass :
   ];
 }
 
+def PreVectorizationAffineIndexCleanupPass :
+    InterfacePass<"iree-codegen-pre-vectorization-affine-index-cleanup",
+                  "mlir::FunctionOpInterface"> {
+  let summary =
+      "Canonicalize and simplify affine index operations before vectorization";
+  let description = [{
+    Runs the full codegen config-tracking canonicalizer plus affine
+    linearize/delinearize simplification patterns that use value bounds. The
+    pass intentionally applies at function scope rather than only inside
+    map_store regions so composed affine index chains are simplified uniformly
+    before vectorization.
+
+    This cleanup prepares tensor index expressions for map_store contiguous
+    dimension hint annotation and generic vectorization. The config-tracking
+    listener preserves lowering configs through any operation replacements
+    introduced by the canonicalizer or affine cleanup patterns.
+    The affine cleanup patterns are the same family used by map_store-specific
+    decomposition cleanup; this pass makes that simplification available before
+    vectorization consumes map_store index expressions.
+
+    This is currently wired into the LLVMGPU vectorization pipeline, where the
+    map_store transfer_scatter lowering path is being developed. Other backends
+    can opt in at their pre-vectorization hint annotation point if they need the
+    same affine index cleanup.
+  }];
+  let dependentDialects = [
+    "::mlir::affine::AffineDialect",
+    "::mlir::arith::ArithDialect"
+  ];
+  let options = [
+    Option<"testConvergence", "test-convergence", "bool",
+           /*default=*/"false", "Fails if the patterns fail to converge">
+  ];
+}
+
 def PropagateConstantOffsetsPass :
     InterfacePass<"iree-codegen-propagate-constant-offsets", "mlir::FunctionOpInterface"> {
   let summary = "Pass to push constant offsets towards loads/stores";

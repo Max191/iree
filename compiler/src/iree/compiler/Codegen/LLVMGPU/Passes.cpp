@@ -274,7 +274,11 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
                                       bool foldIdentitySlices,
                                       bool decomposeMasks) {
   funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
-  funcPassManager.addPass(createCanonicalizerPass());
+  // Replace the prior single canonicalizer pass with a single config-tracking
+  // greedy rewrite pass so lowering configs survive replacements at this stage.
+  // This variant also adds affine simplify-with-bounds patterns so map_store
+  // hinting sees simplified index chains before vectorization.
+  funcPassManager.addPass(createPreVectorizationAffineIndexCleanupPass());
   funcPassManager.addPass(createCSEPass());
   if (enableMasking) {
     funcPassManager.addPass(createMaterializeVectorTileSizesPass());

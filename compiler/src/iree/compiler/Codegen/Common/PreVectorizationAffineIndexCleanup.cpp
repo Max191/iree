@@ -1,41 +1,37 @@
-// Copyright 2024 The IREE Authors
-//
-// Licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/PassUtils.h"
+#include "mlir/Dialect/Affine/Transforms/Transforms.h"
 
-#define DEBUG_TYPE "iree-codegen-config-tracking-canonicalizer"
+#define DEBUG_TYPE "iree-codegen-pre-vectorization-affine-index-cleanup"
 
 namespace mlir::iree_compiler {
 
-#define GEN_PASS_DEF_CONFIGTRACKINGCANONICALIZERPASS
+#define GEN_PASS_DEF_PREVECTORIZATIONAFFINEINDEXCLEANUPPASS
 #include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
-/// Codegen canonicalizer variant that tracks lowering configs through rewrites.
-struct ConfigTrackingCanonicalizerPass final
-    : impl::ConfigTrackingCanonicalizerPassBase<
-          ConfigTrackingCanonicalizerPass> {
+struct PreVectorizationAffineIndexCleanupPass final
+    : impl::PreVectorizationAffineIndexCleanupPassBase<
+          PreVectorizationAffineIndexCleanupPass> {
   using Base::Base;
 
   LogicalResult initialize(MLIRContext *context) override {
     configureCodegenGreedyRewrite(config);
+
     RewritePatternSet owningPatterns(context);
     populateCodegenCanonicalizationPatterns(context, owningPatterns);
+    affine::populateSimplifyAffineWithBoundsPatterns(owningPatterns);
+
     patterns =
         std::make_shared<FrozenRewritePatternSet>(std::move(owningPatterns));
     return success();
   }
 
   void runOnOperation() override {
-    // Canonicalization is best-effort unless explicitly checked by tests.
     if (failed(applyPatternsWithConfigTracking(
             getOperation(), *patterns, config, this->testConvergence,
-            "Canonicalizer failed to converge"))) {
+            "Pre-vectorization affine index cleanup failed to converge"))) {
       return signalPassFailure();
     }
   }

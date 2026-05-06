@@ -138,6 +138,7 @@ iree_cc_library(
     "OptimizeTensorInsertExtractSlices.cpp"
     "OptimizeVectorTransfer.cpp"
     "PadDynamicAlloc.cpp"
+    "PreVectorizationAffineIndexCleanup.cpp"
     "PassUtils.cpp"
     "Passes.cpp"
     "PatchFuncOps.cpp"

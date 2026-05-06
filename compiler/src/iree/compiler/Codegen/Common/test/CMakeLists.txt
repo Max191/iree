@@ -109,6 +109,7 @@ iree_lit_test_suite(
     "optimize_tensor_insert_extract_slices.mlir"
     "pad_dynamic_alloc.mlir"
     "patch_func_ops.mlir"
+    "pre_vectorization_affine_index_cleanup.mlir"
     "propagate_constant_offsets.mlir"
     "propagate_dispatch_config.mlir"
     "propagate_dispatch_size_bounds.mlir"
