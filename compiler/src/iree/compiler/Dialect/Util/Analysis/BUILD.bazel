@@ -15,12 +15,14 @@ package(
 iree_compiler_cc_library(
     name = "Analysis",
     srcs = [
+        "AffineSeedDependencyAnalysis.cpp",
         "Explorer.cpp",
         "GlobalTable.cpp",
         "IntegerDivisibilityAnalysis.cpp",
         "Position.cpp",
     ],
     hdrs = [
+        "AffineSeedDependencyAnalysis.h",
         "Explorer.h",
         "GlobalTable.h",
         "IntegerDivisibilityAnalysis.h",

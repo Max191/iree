@@ -23,6 +23,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -476,6 +477,273 @@ struct ArithDivUIInferIntDivisibilityOpInterface
             : 1;
 
     setResultDivs(divOp, IREE::Util::ConstantIntDivisibility(divUDiv, divSDiv));
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// InferAffineSeedDependencyOpInterface
+//===----------------------------------------------------------------------===//
+
+using AffineSeedDependency = IREE::Util::AffineSeedDependency;
+using SetAffineSeedDependencyFn = IREE::Util::SetAffineSeedDependencyFn;
+
+static std::optional<int64_t> matchConstantInt64(Value value) {
+  APInt intValue;
+  if (!matchPattern(value, m_ConstantInt(&intValue)) ||
+      !intValue.isSignedIntN(64)) {
+    return std::nullopt;
+  }
+  return intValue.getSExtValue();
+}
+
+class AffineExprSeedDependencyFinder
+    : public AffineExprVisitor<AffineExprSeedDependencyFinder,
+                               AffineSeedDependency> {
+public:
+  AffineExprSeedDependencyFinder(AffineMap map,
+                                 ArrayRef<AffineSeedDependency> argDeps)
+      : map(map), argDeps(argDeps) {
+    assert(argDeps.size() == map.getNumDims() + map.getNumSymbols() &&
+           "expected one dependency per affine map input");
+  }
+
+  AffineSeedDependency visitConstantExpr(AffineConstantExpr expr) {
+    return AffineSeedDependency::getIndependent();
+  }
+
+  AffineSeedDependency visitDimExpr(AffineDimExpr expr) {
+    if (expr.getPosition() >= map.getNumDims() ||
+        expr.getPosition() >= argDeps.size()) {
+      return AffineSeedDependency::getUnknown();
+    }
+    return argDeps[expr.getPosition()];
+  }
+
+  AffineSeedDependency visitSymbolExpr(AffineSymbolExpr expr) {
+    int64_t argIndex = static_cast<int64_t>(map.getNumDims()) +
+                       static_cast<int64_t>(expr.getPosition());
+    if (expr.getPosition() >= map.getNumSymbols() ||
+        argIndex >= static_cast<int64_t>(argDeps.size())) {
+      return AffineSeedDependency::getUnknown();
+    }
+    return argDeps[argIndex];
+  }
+
+  AffineSeedDependency visitAddExpr(AffineBinaryOpExpr expr) {
+    return AffineSeedDependency::add(visit(expr.getLHS()),
+                                     visit(expr.getRHS()));
+  }
+
+  AffineSeedDependency visitMulExpr(AffineBinaryOpExpr expr) {
+    AffineSeedDependency lhs = visit(expr.getLHS());
+    AffineSeedDependency rhs = visit(expr.getRHS());
+    if (auto rhsConstant = dyn_cast<AffineConstantExpr>(expr.getRHS())) {
+      return AffineSeedDependency::scale(lhs, rhsConstant.getValue());
+    }
+    if (auto lhsConstant = dyn_cast<AffineConstantExpr>(expr.getLHS())) {
+      return AffineSeedDependency::scale(rhs, lhsConstant.getValue());
+    }
+    if (lhs.isIndependent() && rhs.isIndependent()) {
+      return AffineSeedDependency::getIndependent();
+    }
+    return AffineSeedDependency::getUnknownForDependentSeeds({lhs, rhs});
+  }
+
+  AffineSeedDependency visitFloorDivExpr(AffineBinaryOpExpr expr) {
+    return visitNonLinearExpr(expr);
+  }
+
+  AffineSeedDependency visitCeilDivExpr(AffineBinaryOpExpr expr) {
+    return visitNonLinearExpr(expr);
+  }
+
+  AffineSeedDependency visitModExpr(AffineBinaryOpExpr expr) {
+    return visitNonLinearExpr(expr);
+  }
+
+private:
+  AffineSeedDependency visitInvalidExpr(AffineBinaryOpExpr expr) {
+    return AffineSeedDependency::getUnknown();
+  }
+
+  AffineSeedDependency visitNonLinearExpr(AffineBinaryOpExpr expr) {
+    AffineSeedDependency lhs = visit(expr.getLHS());
+    AffineSeedDependency rhs = visit(expr.getRHS());
+    if (lhs.isIndependent() && rhs.isIndependent()) {
+      return AffineSeedDependency::getIndependent();
+    }
+    return AffineSeedDependency::getUnknownForDependentSeeds({lhs, rhs});
+  }
+
+  AffineMap map;
+  ArrayRef<AffineSeedDependency> argDeps;
+};
+
+static SmallVector<AffineSeedDependency>
+getAffineMapSeedDependencies(AffineMap map,
+                             ArrayRef<AffineSeedDependency> argDeps) {
+  AffineExprSeedDependencyFinder finder(map, argDeps);
+  return llvm::map_to_vector(map.getResults(), [&](AffineExpr result) {
+    return finder.visit(result);
+  });
+}
+
+struct AffineApplyInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          AffineApplyInferAffineSeedDependencyOpInterface,
+          affine::AffineApplyOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto affineApplyOp = cast<affine::AffineApplyOp>(op);
+    SmallVector<AffineSeedDependency> resultDeps =
+        getAffineMapSeedDependencies(affineApplyOp.getMap(), argDeps);
+    assert(resultDeps.size() == 1 &&
+           "affine.apply maps must have exactly one result");
+    setResultDependencies(affineApplyOp.getResult(), resultDeps.front());
+  }
+};
+
+struct AffineDelinearizeIndexInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          AffineDelinearizeIndexInferAffineSeedDependencyOpInterface,
+          affine::AffineDelinearizeIndexOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto delinearizeOp = cast<affine::AffineDelinearizeIndexOp>(op);
+    AffineSeedDependency resultDep =
+        AffineSeedDependency::getUnknownForDependentSeeds(argDeps);
+    for (Value result : delinearizeOp.getResults()) {
+      setResultDependencies(result, resultDep);
+    }
+  }
+};
+
+struct AffineLinearizeIndexInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          AffineLinearizeIndexInferAffineSeedDependencyOpInterface,
+          affine::AffineLinearizeIndexOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto linearizeOp = cast<affine::AffineLinearizeIndexOp>(op);
+    ValueRange multiIndex = linearizeOp.getMultiIndex();
+
+    if (!linearizeOp.getDynamicBasis().empty()) {
+      setResultDependencies(linearizeOp.getResult(),
+                            AffineSeedDependency::getUnknownForDependentSeeds(
+                                argDeps));
+      return;
+    }
+
+    SmallVector<OpFoldResult> paddedBasis = linearizeOp.getPaddedBasis();
+    AffineSeedDependency resultDep = AffineSeedDependency::getIndependent();
+    for (auto [index, indexDep] : llvm::enumerate(argDeps.take_front(
+             multiIndex.size()))) {
+      int64_t stride = 1;
+      for (OpFoldResult basis : ArrayRef(paddedBasis).drop_front(index + 1)) {
+        std::optional<int64_t> constantBasis = getConstantIntValue(basis);
+        if (!constantBasis) {
+          setResultDependencies(
+              linearizeOp.getResult(),
+              AffineSeedDependency::getUnknownForDependentSeeds(argDeps));
+          return;
+        }
+        if (llvm::MulOverflow(stride, *constantBasis, stride)) {
+          setResultDependencies(
+              linearizeOp.getResult(),
+              AffineSeedDependency::getUnknownForDependentSeeds(argDeps));
+          return;
+        }
+      }
+      resultDep = AffineSeedDependency::add(
+          resultDep, AffineSeedDependency::scale(indexDep, stride));
+    }
+    setResultDependencies(linearizeOp.getResult(), resultDep);
+  }
+};
+
+template <typename OpTy>
+struct ArithAddInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithAddInferAffineSeedDependencyOpInterface<OpTy>, OpTy> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto addOp = cast<OpTy>(op);
+    setResultDependencies(addOp.getResult(),
+                          AffineSeedDependency::add(argDeps[0], argDeps[1]));
+  }
+};
+
+struct ArithSubIInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithSubIInferAffineSeedDependencyOpInterface, arith::SubIOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto subOp = cast<arith::SubIOp>(op);
+    setResultDependencies(
+        subOp.getResult(),
+        AffineSeedDependency::add(argDeps[0], argDeps[1], 1, -1));
+  }
+};
+
+struct ArithMulIInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithMulIInferAffineSeedDependencyOpInterface, arith::MulIOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto mulOp = cast<arith::MulIOp>(op);
+    if (std::optional<int64_t> rhsConstant =
+            matchConstantInt64(mulOp.getRhs())) {
+      setResultDependencies(mulOp.getResult(),
+                            AffineSeedDependency::scale(argDeps[0],
+                                                        *rhsConstant));
+      return;
+    }
+    if (std::optional<int64_t> lhsConstant =
+            matchConstantInt64(mulOp.getLhs())) {
+      setResultDependencies(mulOp.getResult(),
+                            AffineSeedDependency::scale(argDeps[1],
+                                                        *lhsConstant));
+      return;
+    }
+    if (argDeps[0].isIndependent() && argDeps[1].isIndependent()) {
+      setResultDependencies(mulOp.getResult(),
+                            AffineSeedDependency::getIndependent());
+      return;
+    }
+    setResultDependencies(mulOp.getResult(),
+                          AffineSeedDependency::getUnknownForDependentSeeds(
+                              argDeps));
+  }
+};
+
+struct ArithConstantInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithConstantInferAffineSeedDependencyOpInterface,
+          arith::ConstantOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto constantOp = cast<arith::ConstantOp>(op);
+    setResultDependencies(constantOp.getResult(),
+                          AffineSeedDependency::getIndependent());
+  }
+};
+
+struct ArithSelectInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithSelectInferAffineSeedDependencyOpInterface, arith::SelectOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto selectOp = cast<arith::SelectOp>(op);
+    setResultDependencies(selectOp.getResult(),
+                          AffineSeedDependency::join(argDeps[1], argDeps[2]));
   }
 };
 
@@ -1367,6 +1635,16 @@ void registerUtilExternalModels(DialectRegistry &registry) {
         *context);
     arith::SelectOp::attachInterface<
         ArithSelectInferIntDivisibilityOpInterface>(*context);
+    arith::ConstantOp::attachInterface<
+        ArithConstantInferAffineSeedDependencyOpInterface>(*context);
+    arith::AddIOp::attachInterface<
+        ArithAddInferAffineSeedDependencyOpInterface<arith::AddIOp>>(*context);
+    arith::SubIOp::attachInterface<
+        ArithSubIInferAffineSeedDependencyOpInterface>(*context);
+    arith::MulIOp::attachInterface<
+        ArithMulIInferAffineSeedDependencyOpInterface>(*context);
+    arith::SelectOp::attachInterface<
+        ArithSelectInferAffineSeedDependencyOpInterface>(*context);
   });
 
   registry.addExtension(
@@ -1379,6 +1657,13 @@ void registerUtilExternalModels(DialectRegistry &registry) {
             AffineMaxInferIntDivisibilityOpInterface>(*context);
         affine::AffineDelinearizeIndexOp::attachInterface<
             AffineDelinearizeIndexInferIntDivisibilityOpInterface>(*context);
+        affine::AffineApplyOp::attachInterface<
+            AffineApplyInferAffineSeedDependencyOpInterface>(*context);
+        affine::AffineDelinearizeIndexOp::attachInterface<
+            AffineDelinearizeIndexInferAffineSeedDependencyOpInterface>(
+            *context);
+        affine::AffineLinearizeIndexOp::attachInterface<
+            AffineLinearizeIndexInferAffineSeedDependencyOpInterface>(*context);
       });
 
   registry.addExtension(

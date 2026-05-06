@@ -8,6 +8,7 @@
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
@@ -29,6 +30,230 @@
 // clang-format on
 
 namespace mlir::iree_compiler::IREE::Util {
+
+//===----------------------------------------------------------------------===//
+// AffineSeedDependency
+//===----------------------------------------------------------------------===//
+
+AffineSeedDependency AffineSeedDependency::getIndependent() {
+  return AffineSeedDependency(CoefficientMap{});
+}
+
+AffineSeedDependency AffineSeedDependency::getSeed(Value seed) {
+  CoefficientMap coefficients;
+  coefficients[seed] = 1;
+  return AffineSeedDependency(std::move(coefficients));
+}
+
+AffineSeedDependency
+AffineSeedDependency::getKnown(CoefficientMap coefficients) {
+  for (auto it = coefficients.begin(); it != coefficients.end();) {
+    if (it->second && *it->second == 0) {
+      auto currentIt = it++;
+      coefficients.erase(currentIt);
+      continue;
+    }
+    ++it;
+  }
+  return AffineSeedDependency(std::move(coefficients));
+}
+
+AffineSeedDependency AffineSeedDependency::getUnknown() {
+  return AffineSeedDependency(Kind::Unknown);
+}
+
+static std::optional<int64_t>
+scaleCoefficient(std::optional<int64_t> coefficient, int64_t scale) {
+  if (!coefficient) {
+    return std::nullopt;
+  }
+  int64_t result;
+  if (llvm::MulOverflow(*coefficient, scale, result)) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+static std::optional<int64_t>
+addCoefficients(std::optional<int64_t> lhs, std::optional<int64_t> rhs) {
+  if (!lhs || !rhs) {
+    return std::nullopt;
+  }
+  int64_t result;
+  if (llvm::AddOverflow(*lhs, *rhs, result)) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+AffineSeedDependency
+AffineSeedDependency::join(const AffineSeedDependency &lhs,
+                           const AffineSeedDependency &rhs) {
+  if (lhs.isUninitialized()) {
+    return rhs;
+  }
+  if (rhs.isUninitialized()) {
+    return lhs;
+  }
+  if (lhs.isUnknown() || rhs.isUnknown()) {
+    return getUnknown();
+  }
+
+  CoefficientMap joined;
+  llvm::SmallDenseSet<Value> seeds;
+  for (auto [seed, coefficient] : lhs.coefficients) {
+    seeds.insert(seed);
+  }
+  for (auto [seed, coefficient] : rhs.coefficients) {
+    seeds.insert(seed);
+  }
+
+  for (Value seed : seeds) {
+    auto lhsIt = lhs.coefficients.find(seed);
+    auto rhsIt = rhs.coefficients.find(seed);
+    std::optional<int64_t> lhsCoeff =
+        lhsIt == lhs.coefficients.end() ? std::optional<int64_t>(0)
+                                        : lhsIt->second;
+    std::optional<int64_t> rhsCoeff =
+        rhsIt == rhs.coefficients.end() ? std::optional<int64_t>(0)
+                                        : rhsIt->second;
+    if (!lhsCoeff || !rhsCoeff || lhsCoeff != rhsCoeff) {
+      joined[seed] = std::nullopt;
+      continue;
+    }
+    if (*lhsCoeff != 0) {
+      joined[seed] = *lhsCoeff;
+    }
+  }
+  return getKnown(std::move(joined));
+}
+
+AffineSeedDependency
+AffineSeedDependency::scale(const AffineSeedDependency &dependency,
+                            int64_t scale) {
+  if (dependency.isUninitialized() || dependency.isUnknown()) {
+    return dependency;
+  }
+  if (scale == 0 || dependency.isIndependent()) {
+    return getIndependent();
+  }
+  CoefficientMap scaled;
+  for (auto [seed, coefficient] : dependency.coefficients) {
+    scaled[seed] = scaleCoefficient(coefficient, scale);
+  }
+  return getKnown(std::move(scaled));
+}
+
+AffineSeedDependency AffineSeedDependency::add(const AffineSeedDependency &lhs,
+                                               const AffineSeedDependency &rhs,
+                                               int64_t lhsScale,
+                                               int64_t rhsScale) {
+  if (lhs.isUninitialized() || rhs.isUninitialized()) {
+    return AffineSeedDependency();
+  }
+  if (lhs.isUnknown() || rhs.isUnknown()) {
+    return getUnknown();
+  }
+
+  AffineSeedDependency scaledLhs = scale(lhs, lhsScale);
+  AffineSeedDependency scaledRhs = scale(rhs, rhsScale);
+  CoefficientMap result;
+  llvm::SmallDenseSet<Value> seeds;
+  for (auto [seed, coefficient] : scaledLhs.coefficients) {
+    seeds.insert(seed);
+  }
+  for (auto [seed, coefficient] : scaledRhs.coefficients) {
+    seeds.insert(seed);
+  }
+
+  for (Value seed : seeds) {
+    auto lhsIt = scaledLhs.coefficients.find(seed);
+    auto rhsIt = scaledRhs.coefficients.find(seed);
+    std::optional<int64_t> lhsCoeff =
+        lhsIt == scaledLhs.coefficients.end() ? std::optional<int64_t>(0)
+                                              : lhsIt->second;
+    std::optional<int64_t> rhsCoeff =
+        rhsIt == scaledRhs.coefficients.end() ? std::optional<int64_t>(0)
+                                              : rhsIt->second;
+    std::optional<int64_t> coefficient = addCoefficients(lhsCoeff, rhsCoeff);
+    if (!coefficient || *coefficient != 0) {
+      result[seed] = coefficient;
+    }
+  }
+  return getKnown(std::move(result));
+}
+
+AffineSeedDependency AffineSeedDependency::getUnknownForDependentSeeds(
+    ArrayRef<AffineSeedDependency> dependencies) {
+  CoefficientMap result;
+  for (const AffineSeedDependency &dependency : dependencies) {
+    if (dependency.isUninitialized()) {
+      return AffineSeedDependency();
+    }
+    if (dependency.isUnknown()) {
+      return getUnknown();
+    }
+    for (auto [seed, coefficient] : dependency.coefficients) {
+      if (!coefficient || *coefficient != 0) {
+        result[seed] = std::nullopt;
+      }
+    }
+  }
+  return getKnown(std::move(result));
+}
+
+bool AffineSeedDependency::isIndependent() const {
+  return isKnown() && coefficients.empty();
+}
+
+std::optional<int64_t> AffineSeedDependency::getCoefficient(Value seed) const {
+  assert(isKnown() && "expected known affine seed dependency");
+  auto it = coefficients.find(seed);
+  if (it == coefficients.end()) {
+    return 0;
+  }
+  return it->second;
+}
+
+bool AffineSeedDependency::operator==(
+    const AffineSeedDependency &rhs) const {
+  if (kind != rhs.kind) {
+    return false;
+  }
+  if (!isKnown()) {
+    return true;
+  }
+  if (coefficients.size() != rhs.coefficients.size()) {
+    return false;
+  }
+  for (auto [seed, coefficient] : coefficients) {
+    auto rhsIt = rhs.coefficients.find(seed);
+    if (rhsIt == rhs.coefficients.end() || rhsIt->second != coefficient) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void AffineSeedDependency::print(raw_ostream &os) const {
+  if (isUninitialized()) {
+    os << "uninitialized";
+    return;
+  }
+  if (isUnknown()) {
+    os << "unknown";
+    return;
+  }
+  os << "known";
+  for (auto [seed, coefficient] : coefficients) {
+    os << " " << seed << "=";
+    if (coefficient) {
+      os << *coefficient;
+    } else {
+      os << "?";
+    }
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // !util.buffer
