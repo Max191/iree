@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/PCF/IR/PCFTypes.h"
 #include "iree/compiler/Codegen/Dialect/PCF/Transforms/ConversionDialectInterface.h"
 #include "iree/compiler/Codegen/Dialect/PCF/Transforms/Passes.h"
+#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -57,6 +58,7 @@ public:
 struct ResolveTokensPass final
     : impl::ResolveTokensPassBase<ResolveTokensPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<iree_compiler::IREE::VectorExt::IREEVectorExtDialect>();
     registry.addExtensions<LoadDependentDialectExtension>();
   }
   void runOnOperation() override;
@@ -207,6 +209,41 @@ struct ConvertWriteSliceOp final : OpConversionPattern<PCF::WriteSliceOp> {
   }
 };
 
+/// Resolve synced sref on `iree_vector_ext.transfer_scatter` base operand.
+struct ConvertTransferScatterOp final
+    : OpConversionPattern<IREE::VectorExt::TransferScatterOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(IREE::VectorExt::TransferScatterOp scatterOp,
+                  OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ValueRange splitBase = adaptor.getBase();
+    if (splitBase.empty()) {
+      return rewriter.notifyMatchFailure(scatterOp,
+                                         "expected converted base operands");
+    }
+
+    auto srefType =
+        dyn_cast<PCF::ShapedRefType>(scatterOp.getBase().getType());
+    if (!srefType) {
+      return rewriter.notifyMatchFailure(scatterOp, "expected sref base");
+    }
+
+    rewriter.startOpModification(scatterOp);
+    scatterOp.getBaseMutable().assign(splitBase.front());
+
+    auto syncScope =
+        cast_if_present<PCF::SyncScopeAttrInterface>(srefType.getSyncScope());
+    if (syncScope) {
+      rewriter.setInsertionPointAfter(scatterOp);
+      syncScope.enqueueWrite(rewriter, splitBase.drop_front(), scatterOp);
+    }
+    rewriter.finalizeOpModification(scatterOp);
+    return success();
+  }
+};
+
 /// Convert the destination block signature if necessary.
 struct ConvertBranchOp final : OpConversionPattern<cf::BranchOp> {
   using Base::Base;
@@ -286,7 +323,8 @@ void ResolveTokensPass::runOnOperation() {
 
   patterns
       .add<ConvertGenericOp, ConvertLoopOp, ConvertAllocOp, ConvertWriteSliceOp,
-           ConvertOptimizationBarrier, ConvertBranchOp>(typeConverter, context);
+           ConvertTransferScatterOp, ConvertOptimizationBarrier,
+           ConvertBranchOp>(typeConverter, context);
 
   // Verify that all operand, result, and region argument types have been
   // converted.

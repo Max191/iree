@@ -109,3 +109,19 @@ func.func @convert_alloc(%d0: index) -> !pcf.sref<?x5xi32, sync(#pcf.test_scope)
 //  CHECK-SAME:   %[[D0:[A-Za-z0-9]+]]: index
 //       CHECK:   %[[ALLOC:.+]] = pcf.alloc(%[[D0]]) : !pcf.sref<?x5xi32, #pcf.test_scope>
 //       CHECK:   return %[[ALLOC]] : !pcf.sref<?x5xi32, #pcf.test_scope>
+
+// -----
+
+func.func @convert_transfer_scatter(%ref: !pcf.sref<16x16xf32, sync(#pcf.test_scope)>) {
+  %c0 = arith.constant 0 : index
+  %vec = arith.constant dense<1.0> : vector<4x4xf32>
+  iree_vector_ext.transfer_scatter %vec into %ref[%c0, %c0] {
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>]
+  } : vector<4x4xf32>, !pcf.sref<16x16xf32, sync(#pcf.test_scope)>
+  return
+}
+
+// CHECK-LABEL: @convert_transfer_scatter
+//  CHECK-SAME:   %[[REF:[A-Za-z0-9]+]]: !pcf.sref<16x16xf32, #pcf.test_scope>
+//       CHECK:   iree_vector_ext.transfer_scatter %{{.*}} into %[[REF]][%c0, %c0]
+//  CHECK-SAME:    : vector<4x4xf32>, !pcf.sref<16x16xf32, #pcf.test_scope>

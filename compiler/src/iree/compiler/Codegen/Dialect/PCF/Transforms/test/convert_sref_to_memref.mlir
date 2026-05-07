@@ -470,3 +470,28 @@ func.func @convert_get_memref_dynamic_layout(%arg0: memref<?x?xi32, strided<[?, 
 //       CHECK:     %[[SV:.+]] = memref.subview %[[ARG0]][0, 0] [%{{.*}}, %{{.*}}] [1, 1] : memref<?x?xi32, strided<[?, ?], offset: ?>> to memref<?x?xi32, strided<[?, ?], offset: ?>>
 //       CHECK:     util.optimization_barrier %[[SV]]
 //       CHECK:     pcf.return
+
+// -----
+
+func.func @convert_transfer_scatter(%arg0: memref<16x16xf32>) {
+  pcf.generic scope(#pcf.test_scope)
+    execute(%ref = %arg0)[%id: index, %n: index]
+         : (!pcf.sref<16x16xf32, #pcf.test_scope>)
+        -> (memref<16x16xf32>) {
+    %c0 = arith.constant 0 : index
+    %vec = arith.constant dense<1.0> : vector<4x4xf32>
+    iree_vector_ext.transfer_scatter %vec into %ref[%c0, %c0] {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>]
+    } : vector<4x4xf32>, !pcf.sref<16x16xf32, #pcf.test_scope>
+    pcf.return
+  }
+  return
+}
+
+// CHECK-LABEL: @convert_transfer_scatter
+//  CHECK-SAME:     %[[ARG0:[A-Za-z0-9_]+]]: memref<16x16xf32>
+//       CHECK:   pcf.generic
+//  CHECK-NEXT:     execute[{{.*}}] {
+//       CHECK:     iree_vector_ext.transfer_scatter %{{.*}} into %[[ARG0]][%c0, %c0]
+//  CHECK-SAME:       : vector<4x4xf32>, memref<16x16xf32>
+//       CHECK:     pcf.return

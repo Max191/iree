@@ -423,3 +423,43 @@ func.func @transfer_scatter_fold_all_false_mask(
 // CHECK-SAME: %{{.*}}: vector<64x32xf16>, %[[DEST:.*]]: tensor<4096x64xf16>
 // CHECK: return %[[DEST]]
 // CHECK-NOT: transfer_scatter
+
+// -----
+
+// A `transfer_scatter` with a `pcf.sref` base and no SSA result writes through
+// the sref and has observable side effects. It must report Read+Write effects
+// on its base so that DCE (canonicalize/CSE) does not erase it just because
+// no SSA value consumes a result.
+func.func @transfer_scatter_sref_not_dce(
+    %vector: vector<64x32xf16>, %dest: !pcf.sref<4096x64xf16, #pcf.test_scope>,
+    %indices: vector<64xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %vector into %dest[%c0, %c0]
+  [%indices : vector<64xindex>] {
+    indexing_maps = [affine_map<(d0, d1)[s0] -> (s0, d1)>,
+                     affine_map<(d0, d1)[s0] -> (d0)>]
+  } : vector<64x32xf16>, !pcf.sref<4096x64xf16, #pcf.test_scope>
+  func.return
+}
+// CHECK-LABEL: @transfer_scatter_sref_not_dce
+//       CHECK:   iree_vector_ext.transfer_scatter
+
+// -----
+
+// A `transfer_gather` with a `pcf.sref` base reads through the sref and reports
+// a memory read effect on that base.
+func.func @transfer_gather_sref_read_effect(
+    %source: !pcf.sref<4096x64xf16, #pcf.test_scope>,
+    %indices: vector<64xindex>) {
+  %cst0 = arith.constant 0.0 : f16
+  %c0 = arith.constant 0 : index
+  %out = iree_vector_ext.transfer_gather %source[%c0, %c0]
+  [%indices : vector<64xindex>], %cst0 {
+    indexing_maps = [affine_map<(d0, d1)[s0] -> (s0, d1)>,
+                     affine_map<(d0, d1)[s0] -> (d0)>]
+  } : !pcf.sref<4096x64xf16, #pcf.test_scope>, vector<64x32xf16>
+  %barrier = util.optimization_barrier %out : vector<64x32xf16>
+  func.return
+}
+// CHECK-LABEL: @transfer_gather_sref_read_effect
+//       CHECK:   iree_vector_ext.transfer_gather

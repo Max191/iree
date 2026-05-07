@@ -59,10 +59,18 @@ Speculation::Speculatability TransferGatherOp::getSpeculatability() {
   return Speculation::NotSpeculatable;
 }
 
+// Returns true if `type` is a reference to mutable storage. Memrefs and
+// non-tensor, non-vector shaped reference types such as pcf.sref are mutable
+// storage; tensor and vector values are by-value.
+static bool isMutableStorageType(Type type) {
+  return isa<MemRefType>(type) ||
+         (isa<ShapedType>(type) && !isa<TensorType, VectorType>(type));
+}
+
 void TransferGatherOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
-  if (isa<MemRefType>(getBase().getType())) {
+  if (isMutableStorageType(getBase().getType())) {
     effects.emplace_back(MemoryEffects::Read::get(), &getBaseMutable(),
                          SideEffects::DefaultResource::get());
   }
@@ -807,7 +815,7 @@ Speculation::Speculatability TransferScatterOp::getSpeculatability() {
 void TransferScatterOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
-  if (isa<MemRefType>(getBase().getType())) {
+  if (isMutableStorageType(getBase().getType())) {
     effects.emplace_back(MemoryEffects::Read::get(), &getBaseMutable(),
                          SideEffects::DefaultResource::get());
     effects.emplace_back(MemoryEffects::Write::get(), &getBaseMutable(),
@@ -825,7 +833,7 @@ LogicalResult TransferScatterOp::verify() {
       return emitOpError("result type must match base type");
     }
   } else {
-    // Memref semantics: no result expected.
+    // Memref-like base, including sref: no result expected.
     if (getResult()) {
       return emitOpError("unexpected result for memref operand");
     }

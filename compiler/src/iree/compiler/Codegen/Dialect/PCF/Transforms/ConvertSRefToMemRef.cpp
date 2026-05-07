@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/PCF/IR/PCFTypes.h"
 #include "iree/compiler/Codegen/Dialect/PCF/Transforms/ConversionDialectInterface.h"
 #include "iree/compiler/Codegen/Dialect/PCF/Transforms/Passes.h"
+#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/Element.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/Solver.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/State.h"
@@ -69,6 +70,7 @@ struct ConvertSRefToMemRefPass final
     // Direct dialect deps.
     registry.insert<iree_compiler::IREE::Codegen::IREECodegenDialect,
                     iree_compiler::IREE::PCF::PCFDialect, arith::ArithDialect,
+                    iree_compiler::IREE::VectorExt::IREEVectorExtDialect,
                     memref::MemRefDialect, vector::VectorDialect>();
     registry.addExtensions<LoadDependentDialectExtension>();
   }
@@ -915,6 +917,26 @@ struct ConvertAllocOp final : OpConversionPattern<PCF::AllocOp> {
   }
 };
 
+/// Converts `iree_vector_ext.transfer_scatter` with sref base to use the
+/// converted memref base.
+struct ConvertTransferScatterOp final
+    : OpConversionPattern<IREE::VectorExt::TransferScatterOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(IREE::VectorExt::TransferScatterOp scatterOp,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<PCF::ShapedRefType>(scatterOp.getBase().getType())) {
+      return rewriter.notifyMatchFailure(scatterOp, "expected sref base");
+    }
+    rewriter.startOpModification(scatterOp);
+    scatterOp.getBaseMutable().assign(adaptor.getBase());
+    rewriter.finalizeOpModification(scatterOp);
+    return success();
+  }
+};
+
 struct ConvertOptimizationBarrier final
     : OpConversionPattern<Util::OptimizationBarrierOp> {
   using Base::Base;
@@ -1193,7 +1215,8 @@ void ConvertSRefToMemRefPass::runOnOperation() {
 
   patterns.add<ConvertGenericOp, ConvertLoopOp, ConvertWriteSliceOp,
                ConvertReadSliceOp, ConvertGetMemrefOp, ConvertAllocOp,
-               ConvertOptimizationBarrier>(typeConverter, context);
+               ConvertTransferScatterOp, ConvertOptimizationBarrier>(
+      typeConverter, context);
 
   // Function related conversion patterns need the analysis to lookup function
   // type conversions.
