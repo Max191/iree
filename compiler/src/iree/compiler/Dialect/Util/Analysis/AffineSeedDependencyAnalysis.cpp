@@ -9,6 +9,8 @@
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/DebugLog.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #define DEBUG_TYPE "iree-util-affine-seed-dependency-analysis"
 
@@ -129,7 +131,86 @@ void AffineSeedDependencyAnalysis::visitExternalCall(
 void AffineSeedDependencyAnalysis::visitNonControlFlowArguments(
     Operation *op, const RegionSuccessor &successor, ValueRange successorInputs,
     ArrayRef<AffineSeedDependencyLattice *> argLattices) {
-  // Region argument propagation is conservative in this first version. Seeds are
+  // Get the dependency state for an OpFoldResult. Static values are independent
+  // of all seeds; dynamic values are queried before the loop body and may
+  // require a later solver revisit if their producer has not been initialized.
+  auto getDependencyFromOfr =
+      [&](std::optional<OpFoldResult> ofr,
+          Block *block) -> std::optional<AffineSeedDependency> {
+    if (!ofr) {
+      return AffineSeedDependency::getIndependent();
+    }
+    if (getConstantIntValue(*ofr)) {
+      return AffineSeedDependency::getIndependent();
+    }
+    if (dyn_cast<Attribute>(*ofr)) {
+      return AffineSeedDependency::getIndependent();
+    }
+    Value value = cast<Value>(*ofr);
+    const AffineSeedDependencyLattice *lattice =
+        getLatticeElementFor(getProgramPointBefore(block), value);
+    if (!lattice || lattice->getValue().isUninitialized()) {
+      return std::nullopt;
+    }
+    return lattice->getValue();
+  };
+
+  // Infer LoopLike induction variables as `iv = lowerBound + i * step`.
+  // The iteration counter `i` is not a seed-derived value. Therefore an
+  // independent step contributes no seed coefficient, while a seed-dependent
+  // step makes exactly those dependent seed coefficients unknown.
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(op)) {
+    std::optional<SmallVector<Value>> ivs = loop.getLoopInductionVars();
+    std::optional<SmallVector<OpFoldResult>> lbs = loop.getLoopLowerBounds();
+    std::optional<SmallVector<OpFoldResult>> steps = loop.getLoopSteps();
+    if (!ivs || !lbs || !steps) {
+      return SparseForwardDataFlowAnalysis::visitNonControlFlowArguments(
+          op, successor, successorInputs, argLattices);
+    }
+
+    llvm::SmallDenseSet<Value> loopIvs;
+    for (auto [iv, lb, step] : llvm::zip_equal(*ivs, *lbs, *steps)) {
+      loopIvs.insert(iv);
+      AffineSeedDependencyLattice *ivLattice = getLatticeElement(iv);
+      if (isSeed(iv)) {
+        setLattice(ivLattice, AffineSeedDependency::getSeed(iv));
+        continue;
+      }
+
+      Block *block = iv.getParentBlock();
+      std::optional<AffineSeedDependency> lbDependency =
+          getDependencyFromOfr(lb, block);
+      std::optional<AffineSeedDependency> stepDependency =
+          getDependencyFromOfr(step, block);
+      if (!lbDependency || !stepDependency) {
+        // Do not pessimize this to unknown: joins are monotonic and unknown
+        // cannot refine back to a precise coefficient map. The lattice query
+        // above records a dependency and the solver will revisit this transfer
+        // once the bound state is initialized.
+        continue;
+      }
+
+      AffineSeedDependency ivDependency = *lbDependency;
+      if (!stepDependency->isIndependent()) {
+        ivDependency = AffineSeedDependency::add(
+            ivDependency, AffineSeedDependency::getUnknownForDependentSeeds(
+                              {*stepDependency}));
+      }
+      setLattice(ivLattice, ivDependency);
+    }
+
+    // Preserve conservative handling for any other non-control-flow region
+    // arguments not modeled as loop induction variables.
+    for (AffineSeedDependencyLattice *arg : argLattices) {
+      Value value = arg->getAnchor();
+      if (!loopIvs.contains(value)) {
+        setToSeedOrUnknown(arg);
+      }
+    }
+    return;
+  }
+
+  // Region argument propagation is conservative by default. Seeds are
   // initialized explicitly and all other non-control-flow arguments are unknown.
   for (AffineSeedDependencyLattice *arg : argLattices) {
     setToSeedOrUnknown(arg);

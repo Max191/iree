@@ -206,3 +206,87 @@ func.func @map_store_nested_gpu_delinearize(
 }
 // CHECK-COUNT-3: affine_seed_dependency = "seed0 = ?, seed1 = 0"
 // CHECK: affine_seed_dependency = "seed0 = 0, seed1 = ?"
+
+// -----
+
+// CHECK-LABEL: @map_store_capture_scf_for_iv
+func.func @map_store_capture_scf_for_iv(
+    %input: tensor<2x2xf32>, %output: tensor<2x4xf32>
+) -> tensor<2x4xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %result = scf.for %iv = %c0 to %c2 step %c1 iter_args(%iter = %output)
+      -> (tensor<2x4xf32>) {
+    %next = iree_linalg_ext.map_store %input into %iter {
+      ^bb0(%idx0: index, %idx1: index):
+        %mask = arith.constant true
+        %mapped = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%idx1, %iv)
+        // CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 0"
+        "iree_unregistered.test_affine_seed_dependency"(%iv, %idx0, %idx1)
+            : (index, index, index) -> ()
+        // CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 1"
+        "iree_unregistered.test_affine_seed_dependency"(%mapped, %idx0, %idx1)
+            : (index, index, index) -> ()
+        iree_linalg_ext.yield %idx0, %mapped, %mask : index, index, i1
+    } : tensor<2x2xf32> into tensor<2x4xf32> -> tensor<2x4xf32>
+    scf.yield %next : tensor<2x4xf32>
+  }
+  return %result : tensor<2x4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @map_store_capture_scf_forall_iv
+func.func @map_store_capture_scf_forall_iv(
+    %input: tensor<2x2xf32>, %output: tensor<2x4xf32>
+) -> tensor<2x4xf32> {
+  %result = scf.forall (%iv) in (2) shared_outs(%iter = %output)
+      -> tensor<2x4xf32> {
+    %next = iree_linalg_ext.map_store %input into %iter {
+      ^bb0(%idx0: index, %idx1: index):
+        %mask = arith.constant true
+        %mapped = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%idx1, %iv)
+        // CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 0"
+        "iree_unregistered.test_affine_seed_dependency"(%iv, %idx0, %idx1)
+            : (index, index, index) -> ()
+        // CHECK: affine_seed_dependency = "seed0 = 0, seed1 = 1"
+        "iree_unregistered.test_affine_seed_dependency"(%mapped, %idx0, %idx1)
+            : (index, index, index) -> ()
+        iree_linalg_ext.yield %idx0, %mapped, %mask : index, index, i1
+    } : tensor<2x2xf32> into tensor<2x4xf32> -> tensor<2x4xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %next into %iter[0, 0] [2, 4] [1, 1]
+          : tensor<2x4xf32> into tensor<2x4xf32>
+    }
+  }
+  return %result : tensor<2x4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @scf_for_iv_lower_bound_seed
+func.func @scf_for_iv_lower_bound_seed(%lb: index) {
+  %c1 = arith.constant 1 : index
+  %ub = affine.apply affine_map<(d0) -> (d0 + 4)>(%lb)
+  scf.for %iv = %lb to %ub step %c1 {
+    // CHECK: affine_seed_dependency = "seed0 = 1"
+    "iree_unregistered.test_affine_seed_dependency"(%iv, %lb)
+        : (index, index) -> ()
+  }
+  return
+}
+
+// -----
+
+// CHECK-LABEL: @scf_for_iv_seed_dependent_step
+func.func @scf_for_iv_seed_dependent_step(%step: index) {
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  scf.for %iv = %c0 to %c16 step %step {
+    // CHECK: affine_seed_dependency = "seed0 = ?"
+    "iree_unregistered.test_affine_seed_dependency"(%iv, %step)
+        : (index, index) -> ()
+  }
+  return
+}
