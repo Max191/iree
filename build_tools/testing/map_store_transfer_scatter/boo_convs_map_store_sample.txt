@@ -1,0 +1,15 @@
+# Nine BOO commands whose pre-vectorization dumps contained
+# iree_linalg_ext.map_store before generic vectorization, selected from a local
+# 20-command filter run.
+# Keep this file in sync with boo_convs_map_store_sample_report.json.
+# Regenerate with boo_map_store_filter.py using the command in
+# affine_seed_dependency_op_coverage_report.md.
+convbfp16 -n 16 -c 576 -H 8 -W 32 -k 576 -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 128 -c 384 -H 24 -W 48 -k 384 -y 1 -x 3 -p 0 -q 1 -u 1 -v 1 -l 1 -j 1 -g 3 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 128 -c 384 -H 24 -W 48 -k 384 -y 3 -x 1 -p 1 -q 0 -u 1 -v 1 -l 1 -j 1 -g 3 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 16 -c 64 -H 225 -W 225 -k 64 -y 3 -x 3 -p 1 -q 1 -u 1 -v 1 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 16 -c 64 -H 225 -W 225 -k 64 -y 3 -x 1 -p 1 -q 0 -u 1 -v 1 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 16 -c 64 -H 225 -W 225 -k 64 -y 1 -x 3 -p 0 -q 1 -u 1 -v 1 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 16 -c 64 -H 225 -W 225 -k 64 -y 3 -x 3 -p 1 -q 1 -u 3 -v 3 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 16 -c 576 -H 48 -W 32 -k 576 -y 3 -x 3 -p 1 -q 1 -u 1 -v 1 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1
+convbfp16 -n 16 -c 16 -H 225 -W 225 -k 64 -y 3 -x 3 -p 1 -q 1 -u 1 -v 1 -l 1 -j 1 -g 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC -t 1 -b 0 -F 1

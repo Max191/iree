@@ -4,6 +4,9 @@ This directory collects the focused test plan for reworking
 `iree_linalg_ext.map_store` vectorization to lower directly to
 `iree_vector_ext.transfer_scatter`.
 
+See `affine_seed_dependency_op_coverage_report.md` for the current
+map-store-region affine seed-dependency operation coverage report.
+
 The matrix is split by feedback speed:
 
 1. Fast lit transform tests.
@@ -164,10 +167,17 @@ The BOO driver is optional until BOO is configured on the machine. It expects a
 Python environment containing `iree-turbine`, PyTorch ROCm packages, and IREE
 Python bindings from a source build.
 
-Seed commands for quick iteration are in:
+Small BOO command files are in:
 
 ```text
 build_tools/testing/map_store_transfer_scatter/boo_convs_small_seed.txt
+build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample.txt
+```
+
+Sample BOO filter report artifacts are in:
+
+```text
+build_tools/testing/map_store_transfer_scatter/boo_convs_map_store_sample_report.json
 ```
 
 The larger source list can be any BOO commands file. If available in the
