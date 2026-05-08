@@ -29,10 +29,10 @@ class AffineSeedDependencyAnalysis
     : public dataflow::SparseForwardDataFlowAnalysis<
           AffineSeedDependencyLattice> {
 public:
-  using SeedPredicate = std::function<bool(Value)>;
+  using SeedPositionFn = std::function<std::optional<unsigned>(Value)>;
 
   explicit AffineSeedDependencyAnalysis(
-      DataFlowSolver &solver, SeedPredicate seedPredicate = {});
+      DataFlowSolver &solver, SeedPositionFn seedPositionFn = {});
 
   void setToEntryState(AffineSeedDependencyLattice *lattice) override;
 
@@ -52,16 +52,18 @@ public:
       ArrayRef<AffineSeedDependencyLattice *> argLattices) override;
 
 private:
+  std::optional<unsigned> getSeedPosition(Value value) const;
   bool isSeed(Value value) const;
+  AffineSeedDependency getSeedDependency(Value value) const;
   void setLattice(AffineSeedDependencyLattice *lattice,
                   const AffineSeedDependency &dependency);
   void setToUnknown(AffineSeedDependencyLattice *lattice);
   void setToSeedOrUnknown(AffineSeedDependencyLattice *lattice);
 
-  SeedPredicate seedPredicate;
+  SeedPositionFn seedPositionFn;
 };
 
-/// Infers seed coefficients from a single-result affine map expression.
+/// Infers seed expressions from a single-result affine map expression.
 AffineSeedDependency
 inferAffineMapSeedDependency(AffineMap map,
                              ArrayRef<AffineSeedDependency> argDeps);

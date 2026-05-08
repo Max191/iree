@@ -7,8 +7,11 @@
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+#include "iree/compiler/Utils/AffineExprUtils.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
@@ -36,54 +39,75 @@ namespace mlir::iree_compiler::IREE::Util {
 //===----------------------------------------------------------------------===//
 
 AffineSeedDependency AffineSeedDependency::getIndependent() {
-  return AffineSeedDependency(CoefficientMap{});
+  return AffineSeedDependency(/*expression=*/AffineExpr(),
+                              /*seedPositions=*/SeedPositionMap{},
+                              /*invalidatedSeeds=*/InvalidatedSeedSet{},
+                              /*hasIndependentOffset=*/true);
 }
 
-AffineSeedDependency AffineSeedDependency::getSeed(Value seed) {
-  CoefficientMap coefficients;
-  coefficients[seed] = 1;
-  return AffineSeedDependency(std::move(coefficients));
+AffineSeedDependency AffineSeedDependency::getSeed(Value seed,
+                                                   unsigned position) {
+  SeedPositionMap seedPositions;
+  seedPositions[seed] = position;
+  return AffineSeedDependency(getAffineDimExpr(position, seed.getContext()),
+                              std::move(seedPositions),
+                              /*invalidatedSeeds=*/InvalidatedSeedSet{},
+                              /*hasIndependentOffset=*/false);
 }
 
 AffineSeedDependency
-AffineSeedDependency::getKnown(CoefficientMap coefficients) {
-  for (auto it = coefficients.begin(); it != coefficients.end();) {
-    if (it->second && *it->second == 0) {
-      auto currentIt = it++;
-      coefficients.erase(currentIt);
-      continue;
-    }
-    ++it;
-  }
-  return AffineSeedDependency(std::move(coefficients));
+AffineSeedDependency::getKnown(AffineExpr expression,
+                               SeedPositionMap seedPositions,
+                               InvalidatedSeedSet invalidatedSeeds,
+                               bool hasIndependentOffset) {
+  return AffineSeedDependency(expression, std::move(seedPositions),
+                              std::move(invalidatedSeeds),
+                              hasIndependentOffset);
 }
 
 AffineSeedDependency AffineSeedDependency::getUnknown() {
   return AffineSeedDependency(Kind::Unknown);
 }
 
-static std::optional<int64_t>
-scaleCoefficient(std::optional<int64_t> coefficient, int64_t scale) {
-  if (!coefficient) {
-    return std::nullopt;
+static bool mergeSeedPositionMaps(
+    const AffineSeedDependency::SeedPositionMap &lhs,
+    const AffineSeedDependency::SeedPositionMap &rhs,
+    AffineSeedDependency::SeedPositionMap &merged) {
+  merged = lhs;
+  for (auto [seed, position] : rhs) {
+    auto [it, inserted] = merged.try_emplace(seed, position);
+    if (!inserted && it->second != position) {
+      return false;
+    }
   }
-  int64_t result;
-  if (llvm::MulOverflow(*coefficient, scale, result)) {
-    return std::nullopt;
-  }
-  return result;
+  return true;
 }
 
-static std::optional<int64_t>
-addCoefficients(std::optional<int64_t> lhs, std::optional<int64_t> rhs) {
-  if (!lhs || !rhs) {
-    return std::nullopt;
+static void addInvalidatedSeeds(
+    const AffineSeedDependency::InvalidatedSeedSet &from,
+    AffineSeedDependency::InvalidatedSeedSet &to) {
+  for (Value seed : from) {
+    to.insert(seed);
   }
-  int64_t result;
-  if (llvm::AddOverflow(*lhs, *rhs, result)) {
-    return std::nullopt;
+}
+
+static void addPotentiallyDependentSeeds(
+    const AffineSeedDependency &dependency,
+    AffineSeedDependency::InvalidatedSeedSet &invalidatedSeeds) {
+  addInvalidatedSeeds(dependency.getInvalidatedSeeds(), invalidatedSeeds);
+  for (auto [seed, position] : dependency.getSeedPositions()) {
+    invalidatedSeeds.insert(seed);
   }
-  return result;
+}
+
+static AffineExpr getZeroExpression(MLIRContext *context) {
+  return getAffineConstantExpr(0, context);
+}
+
+static AffineExpr getExpressionOrZero(const AffineSeedDependency &dependency,
+                                      MLIRContext *context) {
+  AffineExpr expression = dependency.getExpression(context);
+  return expression ? expression : getZeroExpression(context);
 }
 
 AffineSeedDependency
@@ -99,33 +123,36 @@ AffineSeedDependency::join(const AffineSeedDependency &lhs,
     return getUnknown();
   }
 
-  CoefficientMap joined;
-  llvm::SmallDenseSet<Value> seeds;
-  for (auto [seed, coefficient] : lhs.coefficients) {
-    seeds.insert(seed);
+  SeedPositionMap joinedSeedPositions;
+  if (!mergeSeedPositionMaps(lhs.seedPositions, rhs.seedPositions,
+                             joinedSeedPositions)) {
+    return getUnknown();
   }
-  for (auto [seed, coefficient] : rhs.coefficients) {
-    seeds.insert(seed);
-  }
+  InvalidatedSeedSet joinedInvalidatedSeeds;
+  addInvalidatedSeeds(lhs.invalidatedSeeds, joinedInvalidatedSeeds);
+  addInvalidatedSeeds(rhs.invalidatedSeeds, joinedInvalidatedSeeds);
 
-  for (Value seed : seeds) {
-    auto lhsIt = lhs.coefficients.find(seed);
-    auto rhsIt = rhs.coefficients.find(seed);
-    std::optional<int64_t> lhsCoeff =
-        lhsIt == lhs.coefficients.end() ? std::optional<int64_t>(0)
-                                        : lhsIt->second;
-    std::optional<int64_t> rhsCoeff =
-        rhsIt == rhs.coefficients.end() ? std::optional<int64_t>(0)
-                                        : rhsIt->second;
-    if (!lhsCoeff || !rhsCoeff || lhsCoeff != rhsCoeff) {
-      joined[seed] = std::nullopt;
-      continue;
-    }
-    if (*lhsCoeff != 0) {
-      joined[seed] = *lhsCoeff;
-    }
+  MLIRContext *context = nullptr;
+  if (lhs.expression) {
+    context = lhs.expression.getContext();
+  } else if (rhs.expression) {
+    context = rhs.expression.getContext();
   }
-  return getKnown(std::move(joined));
+  AffineExpr lhsExpression =
+      context ? getExpressionOrZero(lhs, context) : AffineExpr();
+  AffineExpr rhsExpression =
+      context ? getExpressionOrZero(rhs, context) : AffineExpr();
+  if (lhsExpression != rhsExpression) {
+    addPotentiallyDependentSeeds(lhs, joinedInvalidatedSeeds);
+    addPotentiallyDependentSeeds(rhs, joinedInvalidatedSeeds);
+    return getKnown(/*expression=*/AffineExpr(), std::move(joinedSeedPositions),
+                    std::move(joinedInvalidatedSeeds),
+                    lhs.independentOffset || rhs.independentOffset);
+  }
+  return getKnown(lhs.expression ? lhs.expression : rhs.expression,
+                  std::move(joinedSeedPositions),
+                  std::move(joinedInvalidatedSeeds),
+                  lhs.independentOffset || rhs.independentOffset);
 }
 
 AffineSeedDependency
@@ -134,14 +161,27 @@ AffineSeedDependency::scale(const AffineSeedDependency &dependency,
   if (dependency.isUninitialized() || dependency.isUnknown()) {
     return dependency;
   }
-  if (scale == 0 || dependency.isIndependent()) {
+  if (scale == 0) {
     return getIndependent();
   }
-  CoefficientMap scaled;
-  for (auto [seed, coefficient] : dependency.coefficients) {
-    scaled[seed] = scaleCoefficient(coefficient, scale);
+  if (dependency.isIndependent()) {
+    return dependency;
   }
-  return getKnown(std::move(scaled));
+
+  AffineExpr scaledExpression;
+  if (dependency.expression) {
+    for (auto [seed, position] : dependency.seedPositions) {
+      std::optional<int64_t> coefficient =
+          mlir::iree_compiler::getAffineDimCoefficient(dependency.expression,
+                                                       position);
+      if (coefficient && !llvm::checkedMul(*coefficient, scale)) {
+        return getUnknownForDependentSeeds({dependency});
+      }
+    }
+    scaledExpression = dependency.expression * scale;
+  }
+  return getKnown(scaledExpression, dependency.seedPositions,
+                  dependency.invalidatedSeeds, dependency.independentOffset);
 }
 
 AffineSeedDependency AffineSeedDependency::add(const AffineSeedDependency &lhs,
@@ -157,35 +197,91 @@ AffineSeedDependency AffineSeedDependency::add(const AffineSeedDependency &lhs,
 
   AffineSeedDependency scaledLhs = scale(lhs, lhsScale);
   AffineSeedDependency scaledRhs = scale(rhs, rhsScale);
-  CoefficientMap result;
-  llvm::SmallDenseSet<Value> seeds;
-  for (auto [seed, coefficient] : scaledLhs.coefficients) {
-    seeds.insert(seed);
-  }
-  for (auto [seed, coefficient] : scaledRhs.coefficients) {
-    seeds.insert(seed);
+  if (scaledLhs.isUnknown() || scaledRhs.isUnknown()) {
+    return getUnknown();
   }
 
-  for (Value seed : seeds) {
-    auto lhsIt = scaledLhs.coefficients.find(seed);
-    auto rhsIt = scaledRhs.coefficients.find(seed);
-    std::optional<int64_t> lhsCoeff =
-        lhsIt == scaledLhs.coefficients.end() ? std::optional<int64_t>(0)
-                                              : lhsIt->second;
-    std::optional<int64_t> rhsCoeff =
-        rhsIt == scaledRhs.coefficients.end() ? std::optional<int64_t>(0)
-                                              : rhsIt->second;
-    std::optional<int64_t> coefficient = addCoefficients(lhsCoeff, rhsCoeff);
-    if (!coefficient || *coefficient != 0) {
-      result[seed] = coefficient;
-    }
+  SeedPositionMap resultSeedPositions;
+  if (!mergeSeedPositionMaps(scaledLhs.seedPositions, scaledRhs.seedPositions,
+                             resultSeedPositions)) {
+    return getUnknown();
   }
-  return getKnown(std::move(result));
+  InvalidatedSeedSet resultInvalidatedSeeds = scaledLhs.invalidatedSeeds;
+  addInvalidatedSeeds(scaledRhs.invalidatedSeeds, resultInvalidatedSeeds);
+
+  MLIRContext *context = nullptr;
+  if (scaledLhs.expression) {
+    context = scaledLhs.expression.getContext();
+  } else if (scaledRhs.expression) {
+    context = scaledRhs.expression.getContext();
+  }
+  AffineExpr resultExpression;
+  if (context) {
+    resultExpression = getExpressionOrZero(scaledLhs, context) +
+                       getExpressionOrZero(scaledRhs, context);
+  }
+  return getKnown(resultExpression, std::move(resultSeedPositions),
+                  std::move(resultInvalidatedSeeds),
+                  scaledLhs.independentOffset || scaledRhs.independentOffset);
+}
+
+static AffineSeedDependency mapNonLinearAffineExpr(
+    const AffineSeedDependency &dependency,
+    llvm::function_ref<AffineExpr(AffineExpr)> mapExpr) {
+  if (dependency.isUninitialized() || dependency.isUnknown()) {
+    return dependency;
+  }
+  if (dependency.isIndependent()) {
+    return AffineSeedDependency::getIndependent();
+  }
+  if (dependency.hasIndependentOffset() || dependency.hasInvalidatedSeeds()) {
+    return AffineSeedDependency::getUnknownForDependentSeeds({dependency});
+  }
+  MLIRContext *context = nullptr;
+  for (auto [seed, position] : dependency.getSeedPositions()) {
+    context = seed.getContext();
+    break;
+  }
+  assert(context && "expected dependent affine expression context");
+  AffineExpr expression = mapExpr(dependency.getExpression(context));
+  return AffineSeedDependency::getKnown(expression, dependency.getSeedPositions(),
+                                        /*invalidatedSeeds=*/{},
+                                        /*hasIndependentOffset=*/false);
+}
+
+AffineSeedDependency
+AffineSeedDependency::floorDiv(const AffineSeedDependency &dependency,
+                               int64_t divisor) {
+  if (divisor == 0) {
+    return getUnknownForDependentSeeds({dependency});
+  }
+  return mapNonLinearAffineExpr(
+      dependency, [&](AffineExpr expr) { return expr.floorDiv(divisor); });
+}
+
+AffineSeedDependency
+AffineSeedDependency::ceilDiv(const AffineSeedDependency &dependency,
+                              int64_t divisor) {
+  if (divisor == 0) {
+    return getUnknownForDependentSeeds({dependency});
+  }
+  return mapNonLinearAffineExpr(
+      dependency, [&](AffineExpr expr) { return expr.ceilDiv(divisor); });
+}
+
+AffineSeedDependency AffineSeedDependency::mod(
+    const AffineSeedDependency &dependency, int64_t modulus) {
+  if (modulus == 0) {
+    return getUnknownForDependentSeeds({dependency});
+  }
+  return mapNonLinearAffineExpr(dependency,
+                                [&](AffineExpr expr) { return expr % modulus; });
 }
 
 AffineSeedDependency AffineSeedDependency::getUnknownForDependentSeeds(
     ArrayRef<AffineSeedDependency> dependencies) {
-  CoefficientMap result;
+  SeedPositionMap seedPositions;
+  InvalidatedSeedSet invalidatedSeeds;
   for (const AffineSeedDependency &dependency : dependencies) {
     if (dependency.isUninitialized()) {
       return AffineSeedDependency();
@@ -193,26 +289,52 @@ AffineSeedDependency AffineSeedDependency::getUnknownForDependentSeeds(
     if (dependency.isUnknown()) {
       return getUnknown();
     }
-    for (auto [seed, coefficient] : dependency.coefficients) {
-      if (!coefficient || *coefficient != 0) {
-        result[seed] = std::nullopt;
-      }
+    if (!mergeSeedPositionMaps(seedPositions, dependency.seedPositions,
+                               seedPositions)) {
+      return getUnknown();
     }
+    addPotentiallyDependentSeeds(dependency, invalidatedSeeds);
   }
-  return getKnown(std::move(result));
+  return getKnown(/*expression=*/AffineExpr(), std::move(seedPositions),
+                  std::move(invalidatedSeeds),
+                  /*hasIndependentOffset=*/false);
 }
 
 bool AffineSeedDependency::isIndependent() const {
-  return isKnown() && coefficients.empty();
+  if (!isKnown() || hasInvalidatedSeeds()) {
+    return false;
+  }
+  if (!expression) {
+    return true;
+  }
+  auto constantExpr = dyn_cast<AffineConstantExpr>(expression);
+  return constantExpr && constantExpr.getValue() == 0;
+}
+
+AffineExpr AffineSeedDependency::getExpression(MLIRContext *context) const {
+  assert(isKnown() && "expected known affine seed dependency");
+  if (expression) {
+    return expression;
+  }
+  return getZeroExpression(context);
+}
+
+bool AffineSeedDependency::hasInvalidatedSeeds() const {
+  assert(isKnown() && "expected known affine seed dependency");
+  return !invalidatedSeeds.empty();
 }
 
 std::optional<int64_t> AffineSeedDependency::getCoefficient(Value seed) const {
   assert(isKnown() && "expected known affine seed dependency");
-  auto it = coefficients.find(seed);
-  if (it == coefficients.end()) {
+  if (invalidatedSeeds.contains(seed)) {
+    return std::nullopt;
+  }
+  auto it = seedPositions.find(seed);
+  if (it == seedPositions.end()) {
     return 0;
   }
-  return it->second;
+  return mlir::iree_compiler::getAffineDimCoefficient(
+      getExpression(seed.getContext()), it->second);
 }
 
 bool AffineSeedDependency::operator==(
@@ -223,12 +345,20 @@ bool AffineSeedDependency::operator==(
   if (!isKnown()) {
     return true;
   }
-  if (coefficients.size() != rhs.coefficients.size()) {
+  if (expression != rhs.expression ||
+      independentOffset != rhs.independentOffset ||
+      seedPositions.size() != rhs.seedPositions.size() ||
+      invalidatedSeeds.size() != rhs.invalidatedSeeds.size()) {
     return false;
   }
-  for (auto [seed, coefficient] : coefficients) {
-    auto rhsIt = rhs.coefficients.find(seed);
-    if (rhsIt == rhs.coefficients.end() || rhsIt->second != coefficient) {
+  for (auto [seed, position] : seedPositions) {
+    auto rhsIt = rhs.seedPositions.find(seed);
+    if (rhsIt == rhs.seedPositions.end() || rhsIt->second != position) {
+      return false;
+    }
+  }
+  for (Value seed : invalidatedSeeds) {
+    if (!rhs.invalidatedSeeds.contains(seed)) {
       return false;
     }
   }
@@ -244,14 +374,20 @@ void AffineSeedDependency::print(raw_ostream &os) const {
     os << "unknown";
     return;
   }
-  os << "known";
-  for (auto [seed, coefficient] : coefficients) {
-    os << " " << seed << "=";
-    if (coefficient) {
-      os << *coefficient;
-    } else {
-      os << "?";
-    }
+  os << "known expr=";
+  if (expression) {
+    os << expression;
+  } else {
+    os << 0;
+  }
+  if (independentOffset) {
+    os << " + <independent>";
+  }
+  for (auto [seed, position] : seedPositions) {
+    os << " " << seed << "=d" << position;
+  }
+  for (Value seed : invalidatedSeeds) {
+    os << " invalidated(" << seed << ")";
   }
 }
 

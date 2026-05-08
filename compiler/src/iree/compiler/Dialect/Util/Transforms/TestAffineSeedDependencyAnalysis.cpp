@@ -6,7 +6,7 @@
 
 #include "iree/compiler/Dialect/Util/Analysis/AffineSeedDependencyAnalysis.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
-#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/DenseMap.h"
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 
@@ -29,7 +29,7 @@ public:
     MLIRContext *context = &getContext();
 
     SmallVector<Operation *> queryOps;
-    llvm::DenseSet<Value> seeds;
+    llvm::DenseMap<Value, unsigned> seedPositions;
     rootOp->walk([&](Operation *op) {
       if (op->getName().getStringRef() != kQueryOpName ||
           op->getNumOperands() < 1) {
@@ -37,14 +37,21 @@ public:
       }
       queryOps.push_back(op);
       for (Value seed : op->getOperands().drop_front()) {
-        seeds.insert(seed);
+        seedPositions.try_emplace(seed,
+                                  static_cast<unsigned>(seedPositions.size()));
       }
     });
 
     DataFlowSolver solver;
     dataflow::loadBaselineAnalyses(solver);
     solver.load<AffineSeedDependencyAnalysis>(
-        [&](Value value) { return seeds.contains(value); });
+        [&](Value value) -> std::optional<unsigned> {
+          auto it = seedPositions.find(value);
+          if (it == seedPositions.end()) {
+            return std::nullopt;
+          }
+          return it->second;
+        });
     if (failed(solver.initializeAndRun(rootOp))) {
       return signalPassFailure();
     }
@@ -56,10 +63,32 @@ public:
       queryOp->setAttr(
           "affine_seed_dependency",
           StringAttr::get(context, formatDependency(lattice, queryOp)));
+      queryOp->setAttr(
+          "affine_seed_expression",
+          StringAttr::get(context, formatExpression(lattice, queryOp)));
     }
   }
 
 private:
+  static std::string formatExpression(
+      const AffineSeedDependencyLattice *lattice, Operation *queryOp) {
+    if (!lattice || lattice->getValue().isUninitialized()) {
+      return "uninitialized";
+    }
+    const AffineSeedDependency &dependency = lattice->getValue();
+    if (dependency.isUnknown()) {
+      return "unknown";
+    }
+
+    std::string result;
+    llvm::raw_string_ostream os(result);
+    os << dependency.getExpression(queryOp->getContext());
+    if (dependency.hasInvalidatedSeeds()) {
+      os << " invalidated";
+    }
+    return os.str();
+  }
+
   static std::string formatDependency(
       const AffineSeedDependencyLattice *lattice, Operation *queryOp) {
     if (!lattice || lattice->getValue().isUninitialized()) {

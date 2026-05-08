@@ -265,11 +265,18 @@ using SetIntDivisibilityFn =
 
 class AffineSeedDependency {
 public:
-  // Maps seed values to the coefficient in the affine expression represented
-  // by this value. Missing seeds have coefficient zero, present integer values
-  // are known coefficients, and present std::nullopt values are seed-specific
-  // unknown coefficients.
-  using CoefficientMap = llvm::DenseMap<Value, std::optional<int64_t>>;
+  // Lattice state for the affine relationship from selected seed values to an
+  // analyzed value. A known state carries an MLIR affine expression where affine
+  // dims are seed values, plus the seed-to-dim-position mapping needed to
+  // interpret it. Independent offsets are tracked out of band because current
+  // map_store vectorization materializes them by cloning the index computation
+  // with seed dims replaced by zero. Unsupported or non-separable propagation
+  // can invalidate individual seeds while preserving the remaining known
+  // expression. The global Unknown state means no usable relationship is known.
+  // Maps seed values to the affine dim position used to represent that seed in
+  // the expression.
+  using SeedPositionMap = llvm::DenseMap<Value, unsigned>;
+  using InvalidatedSeedSet = llvm::DenseSet<Value>;
 
   enum class Kind {
     Uninitialized,
@@ -280,8 +287,13 @@ public:
   AffineSeedDependency() = default;
 
   static AffineSeedDependency getIndependent();
-  static AffineSeedDependency getSeed(Value seed);
-  static AffineSeedDependency getKnown(CoefficientMap coefficients);
+  static AffineSeedDependency getSeed(Value seed, unsigned position);
+  static AffineSeedDependency getKnown(AffineExpr expression,
+                                       SeedPositionMap seedPositions =
+                                           SeedPositionMap(),
+                                       InvalidatedSeedSet invalidatedSeeds =
+                                           InvalidatedSeedSet(),
+                                       bool hasIndependentOffset = false);
   static AffineSeedDependency getUnknown();
 
   static AffineSeedDependency join(const AffineSeedDependency &lhs,
@@ -292,6 +304,12 @@ public:
                                   const AffineSeedDependency &rhs,
                                   int64_t lhsScale = 1,
                                   int64_t rhsScale = 1);
+  static AffineSeedDependency floorDiv(const AffineSeedDependency &dependency,
+                                       int64_t divisor);
+  static AffineSeedDependency ceilDiv(const AffineSeedDependency &dependency,
+                                      int64_t divisor);
+  static AffineSeedDependency mod(const AffineSeedDependency &dependency,
+                                  int64_t modulus);
   static AffineSeedDependency getUnknownForDependentSeeds(
       ArrayRef<AffineSeedDependency> dependencies);
 
@@ -301,10 +319,17 @@ public:
   bool isIndependent() const;
   Kind getKind() const { return kind; }
 
-  const CoefficientMap &getCoefficients() const {
+  AffineExpr getExpression(MLIRContext *context) const;
+  const SeedPositionMap &getSeedPositions() const {
     assert(isKnown() && "expected known affine seed dependency");
-    return coefficients;
+    return seedPositions;
   }
+  const InvalidatedSeedSet &getInvalidatedSeeds() const {
+    assert(isKnown() && "expected known affine seed dependency");
+    return invalidatedSeeds;
+  }
+  bool hasInvalidatedSeeds() const;
+  bool hasIndependentOffset() const { return independentOffset; }
   std::optional<int64_t> getCoefficient(Value seed) const;
 
   bool operator==(const AffineSeedDependency &rhs) const;
@@ -312,11 +337,19 @@ public:
 
 private:
   explicit AffineSeedDependency(Kind kind) : kind(kind) {}
-  explicit AffineSeedDependency(CoefficientMap coefficients)
-      : kind(Kind::Known), coefficients(std::move(coefficients)) {}
+  AffineSeedDependency(AffineExpr expression, SeedPositionMap seedPositions,
+                       InvalidatedSeedSet invalidatedSeeds,
+                       bool hasIndependentOffset)
+      : kind(Kind::Known), expression(expression),
+        seedPositions(std::move(seedPositions)),
+        invalidatedSeeds(std::move(invalidatedSeeds)),
+        independentOffset(hasIndependentOffset) {}
 
   Kind kind = Kind::Uninitialized;
-  CoefficientMap coefficients;
+  AffineExpr expression;
+  SeedPositionMap seedPositions;
+  InvalidatedSeedSet invalidatedSeeds;
+  bool independentOffset = false;
 };
 
 inline raw_ostream &operator<<(raw_ostream &os,

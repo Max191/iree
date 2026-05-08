@@ -888,14 +888,13 @@ def AnnotateMapStoreContiguousDimHintsPass :
   let description = [{
     Annotates `iree_linalg_ext.map_store` ops with
     `transfer_scatter_indexing_map` metadata. The analysis is seeded with
-    map_store input indices and solved once per function containing unannotated
-    map_store ops. For each output index whose dependency on input indices has
-    fully known affine coefficients, the pass emits the corresponding linear
-    affine expression over input vector dims. Output indices with unknown,
-    unsupported, or seed-specific unknown dependencies are represented by fresh
-    symbols, which the vectorizer materializes from full index vectors. Ops with
-    existing `transfer_scatter_indexing_map` or legacy `contiguous_dim_hints`
-    are treated as already annotated.
+    map_store input indices and solved for each unannotated map_store op. For
+    each output index whose dependency on input indices has a fully known
+    affine expression, the pass emits that expression over input vector dims.
+    Output indices with unknown, unsupported, or invalidated dependencies are
+    represented by fresh symbols, which the vectorizer materializes from full
+    index vectors. Ops with existing `transfer_scatter_indexing_map` or legacy
+    `contiguous_dim_hints` are treated as already annotated.
 
     This pass intentionally materializes metadata for every visited unannotated
     map_store after a successful analysis. When an output index cannot be

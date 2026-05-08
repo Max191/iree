@@ -9,6 +9,7 @@
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -74,13 +75,22 @@ public:
   }
 
   AffineSeedDependency visitFloorDivExpr(AffineBinaryOpExpr expr) {
-    return visitNonLinearExpr(expr);
+    return visitDivOrModExpr(expr, [](const AffineSeedDependency &dependency,
+                                      int64_t divisor) {
+      return AffineSeedDependency::floorDiv(dependency, divisor);
+    });
   }
   AffineSeedDependency visitCeilDivExpr(AffineBinaryOpExpr expr) {
-    return visitNonLinearExpr(expr);
+    return visitDivOrModExpr(expr, [](const AffineSeedDependency &dependency,
+                                      int64_t divisor) {
+      return AffineSeedDependency::ceilDiv(dependency, divisor);
+    });
   }
   AffineSeedDependency visitModExpr(AffineBinaryOpExpr expr) {
-    return visitNonLinearExpr(expr);
+    return visitDivOrModExpr(expr, [](const AffineSeedDependency &dependency,
+                                      int64_t divisor) {
+      return AffineSeedDependency::mod(dependency, divisor);
+    });
   }
 
 private:
@@ -95,6 +105,19 @@ private:
       return AffineSeedDependency::getIndependent();
     }
     return AffineSeedDependency::getUnknownForDependentSeeds({lhs, rhs});
+  }
+
+  AffineSeedDependency visitDivOrModExpr(
+      AffineBinaryOpExpr expr,
+      llvm::function_ref<AffineSeedDependency(const AffineSeedDependency &,
+                                              int64_t)>
+          apply) {
+    AffineSeedDependency lhs = visit(expr.getLHS());
+    auto rhsConstant = dyn_cast<AffineConstantExpr>(expr.getRHS());
+    if (!rhsConstant) {
+      return visitNonLinearExpr(expr);
+    }
+    return apply(lhs, rhsConstant.getValue());
   }
 
   AffineMap map;
@@ -121,9 +144,10 @@ AffineSeedDependency inferLocalAffineSeedDependency(
     return it->second;
   }
 
-  for (Value seed : seeds) {
+  for (auto [position, seed] : llvm::enumerate(seeds)) {
     if (value == seed) {
-      AffineSeedDependency dependency = AffineSeedDependency::getSeed(value);
+      AffineSeedDependency dependency =
+          AffineSeedDependency::getSeed(value, position);
       memo.try_emplace(value, dependency);
       return dependency;
     }
@@ -201,14 +225,10 @@ AffineSeedDependency inferLocalAffineSeedDependency(
                                                 scopeRegion, seeds, memo,
                                                 inFlight);
   } else {
-    SmallVector<AffineSeedDependency> argDeps = getOperandDeps();
-    if (llvm::all_of(argDeps, [](const AffineSeedDependency &dep) {
-          return dep.isIndependent();
-        })) {
-      dependency = AffineSeedDependency::getIndependent();
-    } else {
-      dependency = AffineSeedDependency::getUnknownForDependentSeeds(argDeps);
-    }
+    // Local inference is interface/known-op based. Unsupported operations are
+    // full unknown even when their operands are independent, because the
+    // operation semantics may manufacture a seed-dependent result.
+    dependency = AffineSeedDependency::getUnknown();
   }
 
   memo.try_emplace(value, dependency);
@@ -225,12 +245,27 @@ AffineSeedDependency inferLocalAffineSeedDependency(Value value,
 }
 
 AffineSeedDependencyAnalysis::AffineSeedDependencyAnalysis(
-    DataFlowSolver &solver, SeedPredicate seedPredicate)
+    DataFlowSolver &solver, SeedPositionFn seedPositionFn)
     : SparseForwardDataFlowAnalysis(solver),
-      seedPredicate(std::move(seedPredicate)) {}
+      seedPositionFn(std::move(seedPositionFn)) {}
+
+std::optional<unsigned>
+AffineSeedDependencyAnalysis::getSeedPosition(Value value) const {
+  if (!seedPositionFn) {
+    return std::nullopt;
+  }
+  return seedPositionFn(value);
+}
 
 bool AffineSeedDependencyAnalysis::isSeed(Value value) const {
-  return seedPredicate && seedPredicate(value);
+  return getSeedPosition(value).has_value();
+}
+
+AffineSeedDependency
+AffineSeedDependencyAnalysis::getSeedDependency(Value value) const {
+  std::optional<unsigned> position = getSeedPosition(value);
+  assert(position && "expected seed value");
+  return AffineSeedDependency::getSeed(value, *position);
 }
 
 void AffineSeedDependencyAnalysis::setLattice(
@@ -242,7 +277,7 @@ void AffineSeedDependencyAnalysis::setLattice(
 void AffineSeedDependencyAnalysis::setToEntryState(
     AffineSeedDependencyLattice *lattice) {
   Value value = lattice->getAnchor();
-  setLattice(lattice, isSeed(value) ? AffineSeedDependency::getSeed(value)
+  setLattice(lattice, isSeed(value) ? getSeedDependency(value)
                                     : AffineSeedDependency::getIndependent());
 }
 
@@ -254,7 +289,7 @@ void AffineSeedDependencyAnalysis::setToUnknown(
 void AffineSeedDependencyAnalysis::setToSeedOrUnknown(
     AffineSeedDependencyLattice *lattice) {
   Value value = lattice->getAnchor();
-  setLattice(lattice, isSeed(value) ? AffineSeedDependency::getSeed(value)
+  setLattice(lattice, isSeed(value) ? getSeedDependency(value)
                                     : AffineSeedDependency::getUnknown());
 }
 
@@ -266,7 +301,7 @@ LogicalResult AffineSeedDependencyAnalysis::visitOperation(
     Value value = result->getAnchor();
     if (isSeed(value)) {
       seedResults.insert(value);
-      setLattice(result, AffineSeedDependency::getSeed(value));
+      setLattice(result, getSeedDependency(value));
     }
   }
 
@@ -365,8 +400,8 @@ void AffineSeedDependencyAnalysis::visitNonControlFlowArguments(
 
   // Infer LoopLike induction variables as `iv = lowerBound + i * step`.
   // The iteration counter `i` is not a seed-derived value. Therefore an
-  // independent step contributes no seed coefficient, while a seed-dependent
-  // step makes exactly those dependent seed coefficients unknown.
+  // independent step contributes no seed expression, while a seed-dependent
+  // step invalidates the dependent seed expressions.
   if (auto loop = dyn_cast<LoopLikeOpInterface>(op)) {
     std::optional<SmallVector<Value>> ivs = loop.getLoopInductionVars();
     std::optional<SmallVector<OpFoldResult>> lbs = loop.getLoopLowerBounds();
@@ -381,7 +416,7 @@ void AffineSeedDependencyAnalysis::visitNonControlFlowArguments(
       loopIvs.insert(iv);
       AffineSeedDependencyLattice *ivLattice = getLatticeElement(iv);
       if (isSeed(iv)) {
-        setLattice(ivLattice, AffineSeedDependency::getSeed(iv));
+        setLattice(ivLattice, getSeedDependency(iv));
         continue;
       }
 
@@ -392,7 +427,7 @@ void AffineSeedDependencyAnalysis::visitNonControlFlowArguments(
           getDependencyFromOfr(step, block);
       if (!lbDependency || !stepDependency) {
         // Do not pessimize this to unknown: joins are monotonic and unknown
-        // cannot refine back to a precise coefficient map. The lattice query
+        // cannot refine back to a precise affine expression. The lattice query
         // above records a dependency and the solver will revisit this transfer
         // once the bound state is initialized.
         continue;

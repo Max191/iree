@@ -501,31 +501,26 @@ static LogicalResult validateMapStoreTransferScatterIndexingMapDependencies(
           "transfer_scatter indexing map requires known output index "
           "dependencies");
     }
-    for (auto [seed, coefficient] : dependency.getCoefficients()) {
-      if (!coefficient || !llvm::is_contained(inputIndices, seed)) {
+    if (dependency.hasInvalidatedSeeds()) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp,
+          "transfer_scatter indexing map cannot represent invalidated "
+          "dependencies");
+    }
+    for (auto [seed, position] : dependency.getSeedPositions()) {
+      if (position >= inputIndices.size() ||
+          !llvm::is_contained(inputIndices, seed)) {
         return rewriter.notifyMatchFailure(
             mapStoreOp,
-            "transfer_scatter indexing map cannot represent unknown "
+            "transfer_scatter indexing map cannot represent non-local "
             "dependencies");
       }
     }
-    for (auto [inputDim, inputIndex] : llvm::enumerate(inputIndices)) {
-      std::optional<int64_t> expectedCoefficient =
-          getAffineDimCoefficient(expr, inputDim);
-      if (!expectedCoefficient) {
-        return rewriter.notifyMatchFailure(
-            mapStoreOp,
-            "transfer_scatter indexing map requires linear affine results");
-      }
-      std::optional<int64_t> actualCoefficient =
-          dependency.getCoefficient(inputIndex);
-      if (!actualCoefficient ||
-          *actualCoefficient != *expectedCoefficient) {
-        return rewriter.notifyMatchFailure(
-            mapStoreOp,
-            "transfer_scatter indexing map does not match map_store output "
-            "index dependency");
-      }
+    if (dependency.getExpression(rewriter.getContext()) != expr) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp,
+          "transfer_scatter indexing map does not match map_store output "
+          "index dependency");
     }
   }
   return success();
@@ -536,11 +531,8 @@ static bool hasKnownInputDimContribution(AffineMap baseMap) {
     if (affineExprUsesSymbol(expr)) {
       continue;
     }
-    for (int64_t dim = 0, e = baseMap.getNumDims(); dim < e; ++dim) {
-      std::optional<int64_t> coefficient = getAffineDimCoefficient(expr, dim);
-      if (!coefficient || *coefficient != 0) {
-        return true;
-      }
+    if (affineExprUsesDim(expr)) {
+      return true;
     }
   }
   return false;

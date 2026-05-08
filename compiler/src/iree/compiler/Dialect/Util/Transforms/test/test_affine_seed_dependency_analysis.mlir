@@ -81,6 +81,18 @@ util.func @coefficient_overflow_is_per_seed_unknown(%arg0: index) {
 util.func @non_linear_affine_expr_is_per_seed_unknown(%arg0: index) {
   %0 = affine.apply affine_map<(d0) -> (d0 floordiv 2)>(%arg0)
   // CHECK: affine_seed_dependency = "seed0 = ?"
+  // CHECK-SAME: affine_seed_expression = "d0 floordiv 2"
+  "iree_unregistered.test_affine_seed_dependency"(%0, %arg0) : (index, index) -> ()
+  util.return
+}
+
+// -----
+
+// CHECK-LABEL: @non_separable_affine_expr_invalidates_seed
+util.func @non_separable_affine_expr_invalidates_seed(%arg0: index) {
+  %0 = affine.apply affine_map<(d0) -> ((d0 + 1) floordiv 2)>(%arg0)
+  // CHECK: affine_seed_dependency = "seed0 = ?"
+  // CHECK-SAME: affine_seed_expression = "0 invalidated"
   "iree_unregistered.test_affine_seed_dependency"(%0, %arg0) : (index, index) -> ()
   util.return
 }
@@ -114,6 +126,17 @@ util.func @select_conflicting_coefficients(%arg0: index, %cond: i1) {
 // CHECK-LABEL: @unsupported_op_is_full_unknown
 util.func @unsupported_op_is_full_unknown(%arg0: index) {
   %0 = "iree_unregistered.unsupported_index_transform"(%arg0) : (index) -> index
+  // CHECK: affine_seed_dependency = "unknown"
+  "iree_unregistered.test_affine_seed_dependency"(%0, %arg0) : (index, index) -> ()
+  util.return
+}
+
+// -----
+
+// CHECK-LABEL: @unsupported_op_with_independent_operand_is_full_unknown
+util.func @unsupported_op_with_independent_operand_is_full_unknown(%arg0: index) {
+  %c0 = arith.constant 0 : index
+  %0 = "iree_unregistered.unsupported_index_transform"(%c0) : (index) -> index
   // CHECK: affine_seed_dependency = "unknown"
   "iree_unregistered.test_affine_seed_dependency"(%0, %arg0) : (index, index) -> ()
   util.return

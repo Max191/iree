@@ -29,6 +29,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 #include <numeric>
 
@@ -550,15 +551,24 @@ public:
   }
 
   AffineSeedDependency visitFloorDivExpr(AffineBinaryOpExpr expr) {
-    return visitNonLinearExpr(expr);
+    return visitDivOrModExpr(expr, [](const AffineSeedDependency &dependency,
+                                      int64_t divisor) {
+      return AffineSeedDependency::floorDiv(dependency, divisor);
+    });
   }
 
   AffineSeedDependency visitCeilDivExpr(AffineBinaryOpExpr expr) {
-    return visitNonLinearExpr(expr);
+    return visitDivOrModExpr(expr, [](const AffineSeedDependency &dependency,
+                                      int64_t divisor) {
+      return AffineSeedDependency::ceilDiv(dependency, divisor);
+    });
   }
 
   AffineSeedDependency visitModExpr(AffineBinaryOpExpr expr) {
-    return visitNonLinearExpr(expr);
+    return visitDivOrModExpr(expr, [](const AffineSeedDependency &dependency,
+                                      int64_t divisor) {
+      return AffineSeedDependency::mod(dependency, divisor);
+    });
   }
 
 private:
@@ -573,6 +583,19 @@ private:
       return AffineSeedDependency::getIndependent();
     }
     return AffineSeedDependency::getUnknownForDependentSeeds({lhs, rhs});
+  }
+
+  AffineSeedDependency visitDivOrModExpr(
+      AffineBinaryOpExpr expr,
+      llvm::function_ref<AffineSeedDependency(const AffineSeedDependency &,
+                                              int64_t)>
+          apply) {
+    AffineSeedDependency lhs = visit(expr.getLHS());
+    auto rhsConstant = dyn_cast<AffineConstantExpr>(expr.getRHS());
+    if (!rhsConstant) {
+      return visitNonLinearExpr(expr);
+    }
+    return apply(lhs, rhsConstant.getValue());
   }
 
   AffineMap map;
@@ -742,8 +765,13 @@ struct ArithSelectInferAffineSeedDependencyOpInterface
       Operation *op, ArrayRef<AffineSeedDependency> argDeps,
       SetAffineSeedDependencyFn setResultDependencies) const {
     auto selectOp = cast<arith::SelectOp>(op);
-    setResultDependencies(selectOp.getResult(),
-                          AffineSeedDependency::join(argDeps[1], argDeps[2]));
+    AffineSeedDependency valueDependency =
+        AffineSeedDependency::join(argDeps[1], argDeps[2]);
+    setResultDependencies(
+        selectOp.getResult(),
+        AffineSeedDependency::add(
+            valueDependency,
+            AffineSeedDependency::getUnknownForDependentSeeds({argDeps[0]})));
   }
 };
 

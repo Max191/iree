@@ -24,6 +24,16 @@ inline bool affineExprUsesSymbol(AffineExpr expr) {
                         affineExprUsesSymbol(binaryExpr.getRHS()));
 }
 
+/// Returns true if `expr` references any affine dim.
+inline bool affineExprUsesDim(AffineExpr expr) {
+  if (isa<AffineDimExpr>(expr)) {
+    return true;
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  return binaryExpr && (affineExprUsesDim(binaryExpr.getLHS()) ||
+                        affineExprUsesDim(binaryExpr.getRHS()));
+}
+
 /// Returns the linear coefficient of `dimPosition` in `expr`.
 ///
 /// This intentionally handles only the affine fragment needed by current

@@ -172,17 +172,17 @@ def InferAffineSeedDependencyOpInterface :
   let description = [{
     Allows operations to participate in affine seed-dependency analysis.
 
-    Seed values are selected by the analysis caller. Known dependencies are
-    sparse affine coefficient maps from those seeds to an operation result.
-    Missing map entries imply a zero coefficient, entries with no integer value
-    represent a seed-specific unknown coefficient, and the global unknown state
-    means that no per-seed relationship is known for the result.
+    Seed values are selected by the analysis caller and mapped to affine dim
+    expressions. Known dependencies carry the affine expression relating a value
+    to those seed dims, plus any seed dims whose relationship was invalidated by
+    unsupported or non-affine semantics. The global unknown state means that no
+    usable relationship is known for the result.
   }];
 
   let methods = [
     InterfaceMethod<
     /*desc=*/[{
-      Infers affine coefficient relationships from selected seed values to
+      Infers affine expression relationships from selected seed values to
       operation results.
     }],
     /*retTy=*/"void",

@@ -91,6 +91,52 @@ func.func @stride_keeps_non_contiguous_dim_scattered(
 
 // -----
 
+func.func @floordiv_expression_uses_symbol_metadata(
+    %input: tensor<4xf32>, %output: tensor<2xf32>
+) -> tensor<2xf32> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> (d0 floordiv 2)>(%idx0)
+      iree_linalg_ext.yield %1, %mask : index, i1
+  } : tensor<4xf32> into tensor<2xf32> -> tensor<2xf32>
+  return %0 : tensor<2xf32>
+}
+// ANNOTATE-DAG: #[[$FLOORDIV_ANNOTATED_MAP:.+]] = affine_map<(d0)[s0] -> (s0)>
+// ANNOTATE-LABEL: @floordiv_expression_uses_symbol_metadata
+// ANNOTATE: iree_linalg_ext.map_store
+// ANNOTATE-SAME: transfer_scatter_indexing_map = #[[$FLOORDIV_ANNOTATED_MAP]]
+// VECTORIZE-DAG: #[[$FLOORDIV_BASE_MAP:.+]] = affine_map<(d0)[s0] -> (s0)>
+// VECTORIZE-LABEL: @floordiv_expression_uses_symbol_metadata
+// VECTORIZE: iree_linalg_ext.map_store
+// VECTORIZE-SAME: transfer_scatter_indexing_map = #[[$FLOORDIV_BASE_MAP]]
+// VECTORIZE-NOT: iree_vector_ext.transfer_scatter
+
+// -----
+
+func.func @floordiv_with_offset_uses_symbol_metadata(
+    %input: tensor<4xf32>, %output: tensor<3xf32>
+) -> tensor<3xf32> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0) -> ((d0 + 1) floordiv 2)>(%idx0)
+      iree_linalg_ext.yield %1, %mask : index, i1
+  } : tensor<4xf32> into tensor<3xf32> -> tensor<3xf32>
+  return %0 : tensor<3xf32>
+}
+// ANNOTATE-DAG: #[[$FLOORDIV_OFFSET_ANNOTATED_MAP:.+]] = affine_map<(d0)[s0] -> (s0)>
+// ANNOTATE-LABEL: @floordiv_with_offset_uses_symbol_metadata
+// ANNOTATE: iree_linalg_ext.map_store
+// ANNOTATE-SAME: transfer_scatter_indexing_map = #[[$FLOORDIV_OFFSET_ANNOTATED_MAP]]
+// VECTORIZE-DAG: #[[$FLOORDIV_OFFSET_BASE_MAP:.+]] = affine_map<(d0)[s0] -> (s0)>
+// VECTORIZE-LABEL: @floordiv_with_offset_uses_symbol_metadata
+// VECTORIZE: iree_linalg_ext.map_store
+// VECTORIZE-SAME: transfer_scatter_indexing_map = #[[$FLOORDIV_OFFSET_BASE_MAP]]
+// VECTORIZE-NOT: iree_vector_ext.transfer_scatter
+
+// -----
+
 // Input dim 1 contributes to both output dims. The transfer_scatter indexing
 // map can represent this directly.
 func.func @duplicate_candidate_maps_to_both_outputs(
