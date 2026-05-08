@@ -283,9 +283,9 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
   if (enableMasking) {
     funcPassManager.addPass(createMaterializeVectorTileSizesPass());
   }
-  // Keep map_store contiguous hint materialization immediately before
-  // GenericVectorization, which consumes the hints when vectorizeMapStore is
-  // enabled below.
+  // Keep map_store transfer_scatter metadata materialization immediately before
+  // GenericVectorization, which consumes it when vectorizeMapStore is enabled
+  // below.
   funcPassManager.addPass(createAnnotateMapStoreContiguousDimHintsPass());
   // Vectorize.
   GenericVectorizationPassOptions options;

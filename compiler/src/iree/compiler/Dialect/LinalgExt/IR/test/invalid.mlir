@@ -673,6 +673,90 @@ func.func @map_store_contiguous_dim_hints_output_dim_out_of_range(
 
 // -----
 
+func.func @map_store_transfer_scatter_indexing_map_with_contiguous_dim_hints(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected at most one of contiguous_dim_hints and transfer_scatter_indexing_map}}
+  iree_linalg_ext.map_store {contiguous_dim_hints = array<i64: 0, 0>, transfer_scatter_indexing_map = affine_map<(d0) -> (d0)>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_transfer_scatter_indexing_map_wrong_dim_count(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected transfer_scatter_indexing_map to have 1 dims}}
+  iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0, d1) -> (d0)>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_transfer_scatter_indexing_map_wrong_result_count(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected transfer_scatter_indexing_map to have 1 results}}
+  iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0) -> (d0, d0)>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_transfer_scatter_indexing_map_symbol_in_expr(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected transfer_scatter_indexing_map symbols to be full output dim results}}
+  iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0)[s0] -> (d0 + s0)>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_transfer_scatter_indexing_map_unused_symbol(
+    %input: memref<4xf32>, %output: memref<4xf32>
+) {
+  // expected-error@+1 {{expected transfer_scatter_indexing_map symbols to be used exactly once}}
+  iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0)[s0] -> (d0)>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %mask : index, i1
+  } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+func.func @map_store_transfer_scatter_indexing_map_duplicate_symbol(
+    %input: memref<4xf32>, %output: memref<4x4xf32>
+) {
+  // expected-error@+1 {{expected transfer_scatter_indexing_map symbols to be used exactly once}}
+  iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0)[s0] -> (s0, s0)>} %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      iree_linalg_ext.yield %idx0, %idx0, %mask : index, index, i1
+  } : memref<4xf32> into memref<4x4xf32>
+  return
+}
+
+// -----
+
 func.func @arg_compare_invalid_dim(
     %input_val: tensor<2x10xf32>,
     %out_val: tensor<2xf32>,

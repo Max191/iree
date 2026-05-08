@@ -9,6 +9,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/Utils/AffineExprUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -842,7 +843,7 @@ MapStoreOp MapStoreOp::createIdentityMapStore(OpBuilder &builder, Location loc,
     resultType.push_back(output.getType());
   }
   auto mapStoreOp = MapStoreOp::create(builder, loc, resultType, input, output,
-                                       DenseI64ArrayAttr{});
+                                       DenseI64ArrayAttr{}, AffineMapAttr{});
 
   // Add the transformation block with an identity transformation.
   Region &region = mapStoreOp.getTransformationRegion();
@@ -877,9 +878,54 @@ LogicalResult MapStoreOp::verify() {
                     llvm::IsaPred<IndexType>)) {
     return emitOpError("expected block arguments to be index types");
   }
+  AffineMapAttr transferScatterMapAttr = getTransferScatterIndexingMapAttr();
+  if (transferScatterMapAttr) {
+    AffineMap transferScatterMap = transferScatterMapAttr.getValue();
+    if (transferScatterMap.getNumDims() != getInputRank()) {
+      return emitOpError("expected ")
+             << kMapStoreTransferScatterIndexingMapAttr << " to have "
+             << getInputRank() << " dims";
+    }
+    if (transferScatterMap.getNumResults() != getOutputRank()) {
+      return emitOpError("expected ")
+             << kMapStoreTransferScatterIndexingMapAttr << " to have "
+             << getOutputRank() << " results";
+    }
+    SmallVector<int64_t> symbolOutputDims(transferScatterMap.getNumSymbols(),
+                                          -1);
+    for (auto [outputDim, expr] :
+         llvm::enumerate(transferScatterMap.getResults())) {
+      if (auto symbolExpr = dyn_cast<AffineSymbolExpr>(expr)) {
+        int64_t symbol = symbolExpr.getPosition();
+        if (symbolOutputDims[symbol] != -1) {
+          return emitOpError("expected ")
+                 << kMapStoreTransferScatterIndexingMapAttr
+                 << " symbols to be used exactly once";
+        }
+        symbolOutputDims[symbol] = outputDim;
+        continue;
+      }
+      if (affineExprUsesSymbol(expr)) {
+        return emitOpError("expected ")
+               << kMapStoreTransferScatterIndexingMapAttr
+               << " symbols to be full output dim results";
+      }
+    }
+    if (llvm::is_contained(symbolOutputDims, -1)) {
+      return emitOpError("expected ")
+             << kMapStoreTransferScatterIndexingMapAttr
+             << " symbols to be used exactly once";
+    }
+  }
+
   DenseI64ArrayAttr hintsAttr = getContiguousDimHintsAttr();
   if (!hintsAttr) {
     return success();
+  }
+  if (transferScatterMapAttr) {
+    return emitOpError("expected at most one of ")
+           << kMapStoreContiguousDimHintsAttr << " and "
+           << kMapStoreTransferScatterIndexingMapAttr;
   }
   ArrayRef<int64_t> hintValues = hintsAttr.asArrayRef();
   if (hintValues.size() % 2 != 0) {

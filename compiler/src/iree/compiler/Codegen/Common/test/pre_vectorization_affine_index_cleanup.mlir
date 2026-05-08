@@ -1,8 +1,8 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-pre-vectorization-affine-index-cleanup))" --split-input-file %s | FileCheck %s --check-prefix=CLEANUP
 // Also verify that the convergence-test mode succeeds on the same cases.
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-pre-vectorization-affine-index-cleanup{test-convergence=true}))" --split-input-file %s | FileCheck %s --check-prefix=CLEANUP
-// This only locks the motivating map_store end-to-end hint behavior; the other
-// cases below focus on affine index cleanup behavior.
+// This only locks the motivating map_store end-to-end transfer_scatter metadata
+// behavior; the other cases below focus on affine index cleanup behavior.
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-pre-vectorization-affine-index-cleanup,iree-codegen-annotate-map-store-contiguous-dim-hints))" --split-input-file %s | FileCheck %s --check-prefix=HINT
 
 func.func @motivating_map_store_chain(
@@ -25,9 +25,57 @@ func.func @motivating_map_store_chain(
 // CLEANUP-NOT:   affine.delinearize_index
 // CLEANUP:       affine.apply
 // CLEANUP:       iree_linalg_ext.yield %{{.*}}, %{{.*}}, %{{.*}} : index, index, i1
+// HINT-DAG:      #[[$MOTIVATING_MAP:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 // HINT-LABEL:    func.func @motivating_map_store_chain
 // HINT:          iree_linalg_ext.map_store
-// HINT-SAME:     contiguous_dim_hints = array<i64: 0, 0, 1, 1>
+// HINT-SAME:     transfer_scatter_indexing_map = #[[$MOTIVATING_MAP]]
+
+// -----
+
+func.func @map_store_external_offset_value(
+    %input: tensor<4xf32>, %output: tensor<?xf32>
+) -> tensor<?xf32> {
+  %c0 = arith.constant 0 : index
+  %dim = tensor.dim %output, %c0 : tensor<?xf32>
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index):
+      %mask = arith.constant true
+      %mapped = affine.apply affine_map<(d0)[s0] -> (d0 + s0)>(%idx0)[%dim]
+      iree_linalg_ext.yield %mapped, %mask : index, i1
+  } : tensor<4xf32> into tensor<?xf32> -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+// HINT-DAG:      #[[$EXTERNAL_OFFSET_MAP:.+]] = affine_map<(d0) -> (d0)>
+// HINT-LABEL:    func.func @map_store_external_offset_value
+// HINT:          iree_linalg_ext.map_store
+// HINT-SAME:     transfer_scatter_indexing_map = #[[$EXTERNAL_OFFSET_MAP]]
+
+// -----
+
+func.func @map_store_linearized_multi_input_dims(
+    %base_m: index, %base_n: index,
+    %input: tensor<1x1x2x4x2x1xbf16>,
+    %output: tensor<1x1x128x64xbf16>
+) -> tensor<1x1x128x64xbf16> {
+  %0 = iree_linalg_ext.map_store %input into %output {
+    ^bb0(%idx0: index, %idx1: index, %idx2: index, %idx3: index, %idx4: index, %idx5: index):
+      %c0 = arith.constant 0 : index
+      %mask = arith.constant true
+      %m0 = affine.apply affine_map<(d0, d1) -> (d0 + d1 * 2)>(%idx2, %base_m)
+      %m1 = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%idx3, %base_n)
+      %n0 = affine.apply affine_map<(d0, d1) -> (d0 + d1 * 2)>(%idx4, %base_m)
+      %n1 = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%idx5, %base_n)
+      %m = affine.linearize_index disjoint [%m0, %m1] by (8, 16) : index
+      %n = affine.linearize_index disjoint [%n0, %n1] by (4, 16) : index
+      iree_linalg_ext.yield %c0, %c0, %m, %n, %mask
+          : index, index, index, index, i1
+  } : tensor<1x1x2x4x2x1xbf16> into tensor<1x1x128x64xbf16> -> tensor<1x1x128x64xbf16>
+  return %0 : tensor<1x1x128x64xbf16>
+}
+// HINT-DAG:      #[[$LINEARIZED_MAP:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (0, 0, d2 * 16 + d3, d4 * 16 + d5)>
+// HINT-LABEL:    func.func @map_store_linearized_multi_input_dims
+// HINT:          iree_linalg_ext.map_store
+// HINT-SAME:     transfer_scatter_indexing_map = #[[$LINEARIZED_MAP]]
 
 // -----
 

@@ -649,7 +649,8 @@ def GenericVectorizationPass :
     Option<"vectorizeMapStore", "vectorize-map-store", "bool", /*default=*/"false",
       "Enable vectorization of iree_linalg_ext.map_store operations via VectorizableOpInterface. "
       "Production pipelines enabling this should run "
-      "iree-codegen-annotate-map-store-contiguous-dim-hints immediately before this pass.">
+      "map_store transfer_scatter metadata annotation immediately before this pass "
+      "(currently registered as iree-codegen-annotate-map-store-contiguous-dim-hints).">
   ];
   let dependentDialects = [
     "::mlir::arith::ArithDialect"
@@ -883,24 +884,25 @@ def MaterializeVectorTileSizesPass :
 def AnnotateMapStoreContiguousDimHintsPass :
     InterfacePass<"iree-codegen-annotate-map-store-contiguous-dim-hints",
                   "mlir::FunctionOpInterface"> {
-  let summary = "Annotate exact contiguous dimensions on map_store ops";
+  let summary = "Annotate transfer_scatter indexing metadata on map_store ops";
   let description = [{
-    Annotates `iree_linalg_ext.map_store` ops with `contiguous_dim_hints` for
-    yielded output indices whose affine seed-dependency state proves a unit
-    coefficient on exactly one map_store input index and zero coefficients on
-    the other input indices. The analysis is seeded with map_store input indices
-    and solved once per function containing unannotated map_store ops. This is
-    more expensive than local syntactic matching, but composes through supported
-    affine/index operations, so equivalent SSA forms are not limited to a single
-    syntactic `affine.apply`. The downstream vectorizer still validates that
-    hinted index expressions are representable as transfer_scatter maps.
-    Ambiguous, unsupported, or unknown projections are intentionally left
-    unhinted. Ops with existing `contiguous_dim_hints` are treated as already
-    annotated and are not completed by this pass. If analysis fails, the pass
-    leaves ops unhinted rather than failing compilation because the hints are
-    optional metadata. Each hint is an internal metadata pair `(inputDim,
-    outputDim)` stating that `inputDim` can be represented as a contiguous
-    base-map dimension in `outputDim`.
+    Annotates `iree_linalg_ext.map_store` ops with
+    `transfer_scatter_indexing_map` metadata. The analysis is seeded with
+    map_store input indices and solved once per function containing unannotated
+    map_store ops. For each output index whose dependency on input indices has
+    fully known affine coefficients, the pass emits the corresponding linear
+    affine expression over input vector dims. Output indices with unknown,
+    unsupported, or seed-specific unknown dependencies are represented by fresh
+    symbols, which the vectorizer materializes from full index vectors. Ops with
+    existing `transfer_scatter_indexing_map` or legacy `contiguous_dim_hints`
+    are treated as already annotated.
+
+    This pass intentionally materializes metadata for every visited unannotated
+    map_store after a successful analysis. When an output index cannot be
+    proven affine in the input indices, its result is represented by a symbol;
+    vectorization may still leave tiny all-symbol cases on the memref fallback
+    path. If analysis fails, the pass leaves `transfer_scatter_indexing_map`
+    unset rather than failing compilation because the metadata is optional.
   }];
 }
 
@@ -1037,9 +1039,9 @@ def PreVectorizationAffineIndexCleanupPass :
     map_store regions so composed affine index chains are simplified uniformly
     before vectorization.
 
-    This cleanup prepares tensor index expressions for map_store contiguous
-    dimension hint annotation and generic vectorization. The config-tracking
-    listener preserves lowering configs through any operation replacements
+    This cleanup prepares tensor index expressions for map_store transfer_scatter
+    metadata annotation and generic vectorization. The config-tracking listener
+    preserves lowering configs through any operation replacements
     introduced by the canonicalizer or affine cleanup patterns.
     The affine cleanup patterns are the same family used by map_store-specific
     decomposition cleanup; this pass makes that simplification available before
@@ -1047,8 +1049,8 @@ def PreVectorizationAffineIndexCleanupPass :
 
     This is currently wired into the LLVMGPU vectorization pipeline, where the
     map_store transfer_scatter lowering path is being developed. Other backends
-    can opt in at their pre-vectorization hint annotation point if they need the
-    same affine index cleanup.
+    can opt in at their pre-vectorization metadata annotation point if they need
+    the same affine index cleanup.
   }];
   let dependentDialects = [
     "::mlir::affine::AffineDialect",

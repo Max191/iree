@@ -9,6 +9,11 @@
 
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Region.h"
+#include "mlir/IR/Value.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <functional>
 
@@ -55,6 +60,23 @@ private:
 
   SeedPredicate seedPredicate;
 };
+
+/// Infers seed coefficients from a single-result affine map expression.
+AffineSeedDependency
+inferAffineMapSeedDependency(AffineMap map,
+                             ArrayRef<AffineSeedDependency> argDeps);
+
+/// Infers affine seed dependencies by walking local SSA producers within
+/// `scopeRegion`. Values defined outside `scopeRegion` are treated as
+/// seed-independent captures.
+AffineSeedDependency inferLocalAffineSeedDependency(
+    Value value, Region &scopeRegion, ArrayRef<Value> seeds,
+    llvm::DenseMap<Value, AffineSeedDependency> &memo,
+    llvm::DenseSet<Value> &inFlight);
+
+AffineSeedDependency inferLocalAffineSeedDependency(Value value,
+                                                    Region &scopeRegion,
+                                                    ArrayRef<Value> seeds);
 
 } // namespace mlir::iree_compiler::IREE::Util
 

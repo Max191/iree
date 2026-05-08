@@ -36,7 +36,7 @@ func.func @map_store_f32_not_unit_stride(
 }
 // CHECK-LABEL: @map_store_f32_not_unit_stride
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 
@@ -53,7 +53,7 @@ func.func @map_store_f32_noncontiguous_eight_element_tile(
 }
 // CHECK-LABEL: @map_store_f32_noncontiguous_eight_element_tile
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 
@@ -165,7 +165,7 @@ func.func @map_store_f32_inner_offset_depends_on_outer_dim(
 }
 // CHECK-LABEL: @map_store_f32_inner_offset_depends_on_outer_dim
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 
@@ -315,6 +315,81 @@ func.func @map_store_f32_multiple_hints_same_output_dim(
 
 // -----
 
+func.func @map_store_f32_transfer_scatter_indexing_map_with_offset(
+    %offset: index, %input: tensor<2x3xf32>, %output: tensor<2x20xf32>
+) -> tensor<2x20xf32> {
+  %0 = iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0, d1) -> (d0, d0 * 4 + d1)>} %input into %output {
+    ^bb0(%idx0: index, %idx1: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0, d1, d2) -> (d0 * 4 + d1 + d2 + 7)>(%idx0, %idx1, %offset)
+      iree_linalg_ext.yield %idx0, %1, %mask : index, index, i1
+  } : tensor<2x3xf32> into tensor<2x20xf32> -> tensor<2x20xf32>
+  return %0 : tensor<2x20xf32>
+}
+// CHECK-DAG: #[[$OFFSET_MAP:.+]] = affine_map<(d0, d1, d2) -> (d0 * 4 + d1 + d2 + 7)>
+// CHECK-DAG: #[[$OFFSET_BASE_MAP:.+]] = affine_map<(d0, d1) -> (d0, d0 * 4 + d1)>
+// CHECK-LABEL: @map_store_f32_transfer_scatter_indexing_map_with_offset
+//  CHECK-SAME:     %[[OFFSET_ARG:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
+//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+//       CHECK:   %[[OFFSET:.+]] = affine.apply #[[$OFFSET_MAP]](%[[C0]], %[[C0]], %[[OFFSET_ARG]])
+//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
+//       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[OFFSET]]]
+//  CHECK-SAME:     indexing_maps = [#[[$OFFSET_BASE_MAP]]]
+//  CHECK-SAME:     : vector<2x3xf32>, tensor<2x20xf32> -> tensor<2x20xf32>
+//       CHECK:   return %[[SCATTER]] : tensor<2x20xf32>
+
+// -----
+
+func.func @map_store_f32_transfer_scatter_indexing_map_with_unknown_symbol(
+    %input: tensor<2x3xf32>, %output: tensor<2x6xf32>
+) -> tensor<2x6xf32> {
+  %0 = iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0, d1)[s0] -> (d0, s0)>} %input into %output {
+    ^bb0(%idx0: index, %idx1: index):
+      %mask = arith.constant true
+      %1 = arith.addi %idx0, %idx1 : index
+      iree_linalg_ext.yield %idx0, %1, %mask : index, index, i1
+  } : tensor<2x3xf32> into tensor<2x6xf32> -> tensor<2x6xf32>
+  return %0 : tensor<2x6xf32>
+}
+// CHECK-DAG: #[[$UNKNOWN_BASE_MAP:.+]] = affine_map<(d0, d1)[s0] -> (d0, s0)>
+// CHECK-DAG: #[[$UNKNOWN_INDEX_MAP:.+]] = affine_map<(d0, d1)[s0] -> (d0, d1)>
+// CHECK-LABEL: @map_store_f32_transfer_scatter_indexing_map_with_unknown_symbol
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:     %[[OUTPUT:[a-zA-Z0-9_]+]]
+//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+//       CHECK:   %[[INDEX:.+]] = arith.addi
+//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]
+//       CHECK:   %[[SCATTER:.+]] = iree_vector_ext.transfer_scatter %[[READ]] into %[[OUTPUT]][%[[C0]], %[[C0]]] [%[[INDEX]] : vector<2x3xindex>]
+//  CHECK-SAME:     indexing_maps = [#[[$UNKNOWN_BASE_MAP]], #[[$UNKNOWN_INDEX_MAP]]]
+//  CHECK-SAME:     : vector<2x3xf32>, tensor<2x6xf32> -> tensor<2x6xf32>
+//       CHECK:   return %[[SCATTER]] : tensor<2x6xf32>
+
+// -----
+
+// The metadata map is structurally valid but semantically false: output dim 1
+// also depends on input dim 0, so validation rejects it before
+// transfer_scatter construction. Expected match failure:
+// "transfer_scatter indexing map does not match map_store output index
+// dependency".
+func.func @map_store_f32_reject_bad_transfer_scatter_indexing_map(
+    %input: tensor<2x3xf32>, %output: tensor<2x20xf32>
+) -> tensor<2x20xf32> {
+  %0 = iree_linalg_ext.map_store {transfer_scatter_indexing_map = affine_map<(d0, d1) -> (d0, d1)>} %input into %output {
+    ^bb0(%idx0: index, %idx1: index):
+      %mask = arith.constant true
+      %1 = affine.apply affine_map<(d0, d1) -> (d0 * 4 + d1)>(%idx0, %idx1)
+      iree_linalg_ext.yield %idx0, %1, %mask : index, index, i1
+  } : tensor<2x3xf32> into tensor<2x20xf32> -> tensor<2x20xf32>
+  return %0 : tensor<2x20xf32>
+}
+// CHECK-LABEL: @map_store_f32_reject_bad_transfer_scatter_indexing_map
+//       CHECK:   iree_linalg_ext.map_store
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
+
+// -----
+
 // This hint is structurally valid but semantically false: the hinted input dim
 // has coefficient 2 in the hinted output dim, so validation rejects it before
 // transfer_scatter construction. Expected match failure: "hinted contiguous
@@ -332,7 +407,7 @@ func.func @map_store_f32_reject_bad_contiguous_hint(
 }
 // CHECK-LABEL: @map_store_f32_reject_bad_contiguous_hint
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 
@@ -352,7 +427,7 @@ func.func @map_store_f32_reject_hint_affects_multiple_outputs(
 }
 // CHECK-LABEL: @map_store_f32_reject_hint_affects_multiple_outputs
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 
@@ -373,7 +448,7 @@ func.func @map_store_f32_reject_non_affine_hint(
 }
 // CHECK-LABEL: @map_store_f32_reject_non_affine_hint
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 
@@ -392,7 +467,7 @@ func.func @map_store_f32_mask_depends_on_inner_index(
 }
 // CHECK-LABEL: @map_store_f32_mask_depends_on_inner_index
 //       CHECK:   iree_linalg_ext.map_store
-//   CHECK-NOT:   transfer_scatter
+//   CHECK-NOT:   iree_vector_ext.transfer_scatter
 
 // -----
 

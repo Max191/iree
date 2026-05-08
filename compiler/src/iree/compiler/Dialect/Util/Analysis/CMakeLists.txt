@@ -27,7 +27,9 @@ iree_cc_library(
     "Position.cpp"
   DEPS
     LLVMSupport
+    MLIRAffineDialect
     MLIRAnalysis
+    MLIRArithDialect
     MLIRControlFlowInterfaces
     MLIRDialectUtils
     MLIRIR

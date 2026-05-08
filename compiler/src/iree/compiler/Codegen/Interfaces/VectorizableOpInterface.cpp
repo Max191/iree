@@ -16,9 +16,11 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/Dialect/Util/Analysis/AffineSeedDependencyAnalysis.h"
 #include "iree/compiler/Utils/AffineExprUtils.h"
 #include "iree/compiler/Utils/Indexing.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Transforms/Transforms.h"
 #include "mlir/Dialect/Affine/Utils.h"
@@ -34,6 +36,7 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/ScopeExit.h"
 
 // clang-format off
@@ -465,13 +468,188 @@ struct MapStoreOutputDimPlan {
   SmallVector<int64_t> contiguousInputDims;
 };
 
+struct MapStoreTransferScatterIndexingPlan {
+  AffineMap baseMap;
+  SmallVector<int64_t> symbolOutputDims;
+};
+
+static LogicalResult validateMapStoreTransferScatterIndexingMapDependencies(
+    IREE::LinalgExt::MapStoreOp mapStoreOp, AffineMap baseMap,
+    RewriterBase &rewriter) {
+  SmallVector<Value> inputIndices;
+  inputIndices.reserve(mapStoreOp.getInputRank());
+  for (int64_t inputDim = 0, e = mapStoreOp.getInputRank(); inputDim < e;
+       ++inputDim) {
+    inputIndices.push_back(mapStoreOp.getInputIndex(inputDim));
+  }
+
+  DenseMap<Value, IREE::Util::AffineSeedDependency> memo;
+  DenseSet<Value> inFlight;
+  for (auto [outputDim, expr] : llvm::enumerate(baseMap.getResults())) {
+    if (affineExprUsesSymbol(expr)) {
+      continue;
+    }
+
+    IREE::Util::AffineSeedDependency dependency =
+        IREE::Util::inferLocalAffineSeedDependency(
+            mapStoreOp.getOutputIndex(outputDim),
+            mapStoreOp.getTransformationRegion(), inputIndices, memo,
+            inFlight);
+    if (!dependency.isKnown()) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp,
+          "transfer_scatter indexing map requires known output index "
+          "dependencies");
+    }
+    for (auto [seed, coefficient] : dependency.getCoefficients()) {
+      if (!coefficient || !llvm::is_contained(inputIndices, seed)) {
+        return rewriter.notifyMatchFailure(
+            mapStoreOp,
+            "transfer_scatter indexing map cannot represent unknown "
+            "dependencies");
+      }
+    }
+    for (auto [inputDim, inputIndex] : llvm::enumerate(inputIndices)) {
+      std::optional<int64_t> expectedCoefficient =
+          getAffineDimCoefficient(expr, inputDim);
+      if (!expectedCoefficient) {
+        return rewriter.notifyMatchFailure(
+            mapStoreOp,
+            "transfer_scatter indexing map requires linear affine results");
+      }
+      std::optional<int64_t> actualCoefficient =
+          dependency.getCoefficient(inputIndex);
+      if (!actualCoefficient ||
+          *actualCoefficient != *expectedCoefficient) {
+        return rewriter.notifyMatchFailure(
+            mapStoreOp,
+            "transfer_scatter indexing map does not match map_store output "
+            "index dependency");
+      }
+    }
+  }
+  return success();
+}
+
+static bool hasKnownInputDimContribution(AffineMap baseMap) {
+  for (AffineExpr expr : baseMap.getResults()) {
+    if (affineExprUsesSymbol(expr)) {
+      continue;
+    }
+    for (int64_t dim = 0, e = baseMap.getNumDims(); dim < e; ++dim) {
+      std::optional<int64_t> coefficient = getAffineDimCoefficient(expr, dim);
+      if (!coefficient || *coefficient != 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static FailureOr<MapStoreTransferScatterIndexingPlan>
+getMapStoreTransferScatterIndexingPlan(
+    IREE::LinalgExt::MapStoreOp mapStoreOp, RewriterBase &rewriter) {
+  AffineMapAttr mapAttr = mapStoreOp.getTransferScatterIndexingMapAttr();
+  if (!mapAttr) {
+    return failure();
+  }
+
+  AffineMap baseMap = mapAttr.getValue();
+  if (baseMap.getNumDims() != mapStoreOp.getInputRank() ||
+      baseMap.getNumResults() != mapStoreOp.getOutputRank()) {
+    return rewriter.notifyMatchFailure(
+        mapStoreOp, "invalid transfer_scatter indexing map shape");
+  }
+
+  SmallVector<int64_t> symbolOutputDims(baseMap.getNumSymbols(), -1);
+  for (auto [outputDim, expr] : llvm::enumerate(baseMap.getResults())) {
+    if (auto symbolExpr = dyn_cast<AffineSymbolExpr>(expr)) {
+      int64_t symbol = symbolExpr.getPosition();
+      if (symbol >= static_cast<int64_t>(symbolOutputDims.size()) ||
+          symbolOutputDims[symbol] != -1) {
+        return rewriter.notifyMatchFailure(
+            mapStoreOp,
+            "transfer_scatter indexing map has invalid symbol result");
+      }
+      symbolOutputDims[symbol] = outputDim;
+      continue;
+    }
+    if (affineExprUsesSymbol(expr)) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp,
+          "transfer_scatter indexing map symbols must be full output dims");
+    }
+  }
+  if (llvm::is_contained(symbolOutputDims, -1)) {
+    return rewriter.notifyMatchFailure(
+        mapStoreOp, "transfer_scatter indexing map has unused symbols");
+  }
+  if (failed(validateMapStoreTransferScatterIndexingMapDependencies(
+          mapStoreOp, baseMap, rewriter))) {
+    return failure();
+  }
+
+  return MapStoreTransferScatterIndexingPlan{baseMap,
+                                             std::move(symbolOutputDims)};
+}
+
+static FailureOr<Value>
+cloneMapStoreOutputIndexOffset(IREE::LinalgExt::MapStoreOp mapStoreOp,
+                               RewriterBase &rewriter, Value outputIndex,
+                               Value zero) {
+  IRMapping mapping;
+  for (int64_t dim = 0, e = mapStoreOp.getInputRank(); dim < e; ++dim) {
+    mapping.map(mapStoreOp.getInputIndex(dim), zero);
+  }
+  if (Value mappedValue = mapping.lookupOrNull(outputIndex)) {
+    return mappedValue;
+  }
+
+  Operation *definingOp = outputIndex.getDefiningOp();
+  Region &region = mapStoreOp.getTransformationRegion();
+  if (!definingOp || definingOp->getParentRegion() != &region) {
+    return outputIndex;
+  }
+
+  BackwardSliceOptions options;
+  options.inclusive = true;
+  options.filter = [&](Operation *op) {
+    return op->getParentRegion() == &region;
+  };
+  SetVector<Operation *> slice;
+  if (failed(getBackwardSlice(outputIndex, &slice, options))) {
+    return rewriter.notifyMatchFailure(
+        mapStoreOp, "failed to collect transfer_scatter offset slice");
+  }
+  topologicalSort(slice);
+
+  for (Operation *op : slice) {
+    if (!isMemoryEffectFree(op) || op->getNumRegions() != 0) {
+      return rewriter.notifyMatchFailure(
+          mapStoreOp,
+          "transfer_scatter offset slice contains unsupported op");
+    }
+    rewriter.clone(*op, mapping);
+  }
+
+  Value mappedValue = mapping.lookupOrNull(outputIndex);
+  if (!mappedValue) {
+    return rewriter.notifyMatchFailure(
+        mapStoreOp, "failed to materialize transfer_scatter offset");
+  }
+  return mappedValue;
+}
+
 /// Map store vectorization supports two contiguity modes:
 ///   1. The legacy automatic innermost-dim path, which only recognizes
 ///      `inputIndex` and affine.apply expressions equivalent to
 ///      `inputIndex + constant`.
-///   2. Explicit contiguous-dim hints, which are validated by reconstructing
+///   2. Legacy explicit contiguous-dim hints, which are validated by reconstructing
 ///      affine output-index expressions and checking that hinted source dims
 ///      are unit-coefficient contributors to exactly one output dim.
+/// New analysis-driven vectorization uses `transfer_scatter_indexing_map`,
+/// which directly describes the transfer_scatter base map and uses symbols for
+/// output dims that still need full index vectors.
 /// Both modes are restricted to cases transfer_scatter can represent as a
 /// contiguous vector dimension plus an optional scalar/vector base component.
 static FailureOr<AffineExpr> getMapStoreAffineIndexExpr(
@@ -738,6 +916,8 @@ static FailureOr<MapStoreIndexVectorizationResult>
 vectorizeMapStoreIndicesAndMask(
     IREE::LinalgExt::MapStoreOp mapStoreOp, RewriterBase &rewriter,
     ArrayRef<int64_t> iterationShape,
+    ArrayRef<int64_t> outputDimsToVectorize = {},
+    bool vectorizeAllOutputDims = true,
     ArrayRef<SmallVector<int64_t>> zeroedInputDimsPerOutput = {}) {
   Location loc = mapStoreOp.getLoc();
   RewriterBase::InsertionGuard insertionGuard(rewriter);
@@ -758,11 +938,21 @@ vectorizeMapStoreIndicesAndMask(
       return indices;
     };
 
+    SmallVector<int64_t> outputDims;
+    if (vectorizeAllOutputDims) {
+      llvm::append_range(outputDims,
+                         llvm::seq<int64_t>(0, mapStoreOp.getOutputRank()));
+    } else {
+      llvm::append_range(outputDims, outputDimsToVectorize);
+    }
+
     SmallVector<Value> results;
     if (zeroedInputDimsPerOutput.empty()) {
       auto inlineBodyBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
                                    ArrayRef<Value> yieldedValues) {
-        llvm::append_range(results, yieldedValues.drop_back(/*N=*/1));
+        for (int64_t outputDim : outputDims) {
+          results.push_back(yieldedValues[outputDim]);
+        }
         results.push_back(yieldedValues.back());
       };
       SmallVector<Value> indices = buildInputIndices({});
@@ -772,8 +962,7 @@ vectorizeMapStoreIndicesAndMask(
       return;
     }
 
-    for (int64_t outputDim = 0, e = mapStoreOp.getOutputRank(); outputDim < e;
-         ++outputDim) {
+    for (int64_t outputDim : outputDims) {
       auto inlineBodyBuilder = [&](OpBuilder inlineBuilder, Location inlineLoc,
                                    ArrayRef<Value> yieldedValues) {
         results.push_back(yieldedValues[outputDim]);
@@ -794,8 +983,11 @@ vectorizeMapStoreIndicesAndMask(
     linalg::YieldOp::create(builder, nestedLoc, results);
   };
 
+  int64_t numOutputIndexVectors =
+      vectorizeAllOutputDims ? mapStoreOp.getOutputRank()
+                             : outputDimsToVectorize.size();
   SmallVector<Value> outputTensors;
-  for (int64_t i = 0, e = mapStoreOp.getOutputRank(); i < e; ++i) {
+  for (int64_t i = 0; i < numOutputIndexVectors; ++i) {
     outputTensors.push_back(tensor::EmptyOp::create(
         rewriter, loc, iterationShape, rewriter.getIndexType()));
   }
@@ -869,12 +1061,12 @@ vectorizeMapStoreIndicesAndMask(
   };
 
   SmallVector<Value> outputIndexVectors;
-  outputIndexVectors.reserve(mapStoreOp.getOutputRank());
+  outputIndexVectors.reserve(numOutputIndexVectors);
   SmallVector<vector::TransferWriteOp> outputIndexWriteOps;
-  outputIndexWriteOps.reserve(mapStoreOp.getOutputRank());
+  outputIndexWriteOps.reserve(numOutputIndexVectors);
   for (Value replacement :
        ArrayRef(vectorizationResult->replacements)
-           .take_front(mapStoreOp.getOutputRank())) {
+           .take_front(numOutputIndexVectors)) {
     auto writeOp = replacement.getDefiningOp<vector::TransferWriteOp>();
     if (!writeOp) {
       eraseVectorizationResultsAndGeneric();
@@ -975,15 +1167,27 @@ struct MapStoreOpVectorizationModel
     const bool preserveInnermostContiguousDim =
         !maskDependsOnInnermostInput && innermostOffset.has_value();
 
-    FailureOr<SmallVector<MapStoreOutputDimPlan>> maybeOutputPlans =
-        getMapStoreOutputDimPlans(mapStoreOp, rewriter);
-    if (failed(maybeOutputPlans)) {
-      return failure();
+    std::optional<MapStoreTransferScatterIndexingPlan> transferScatterPlan;
+    if (mapStoreOp.getTransferScatterIndexingMapAttr()) {
+      FailureOr<MapStoreTransferScatterIndexingPlan> maybeTransferScatterPlan =
+          getMapStoreTransferScatterIndexingPlan(mapStoreOp, rewriter);
+      if (failed(maybeTransferScatterPlan)) {
+        return failure();
+      }
+      transferScatterPlan = std::move(*maybeTransferScatterPlan);
     }
-    SmallVector<MapStoreOutputDimPlan> outputPlans =
-        std::move(*maybeOutputPlans);
-    const bool hasExplicitContiguousDimHints =
-        hasContiguousDimHints(outputPlans);
+
+    SmallVector<MapStoreOutputDimPlan> outputPlans;
+    bool hasExplicitContiguousDimHints = false;
+    if (!transferScatterPlan) {
+      FailureOr<SmallVector<MapStoreOutputDimPlan>> maybeOutputPlans =
+          getMapStoreOutputDimPlans(mapStoreOp, rewriter);
+      if (failed(maybeOutputPlans)) {
+        return failure();
+      }
+      outputPlans = std::move(*maybeOutputPlans);
+      hasExplicitContiguousDimHints = hasContiguousDimHints(outputPlans);
+    }
     if (hasExplicitContiguousDimHints && preserveInnermostContiguousDim) {
       // Explicit hints describe additional contiguous dimensions. Keep the
       // legacy automatic innermost-dim preservation as an augmentation so
@@ -1003,25 +1207,40 @@ struct MapStoreOpVectorizationModel
     // convolution regression where an 8-element tile grew from ~3us to ~64us.
     // Keep them on the memref fallback path until transfer_scatter lowers
     // directly to the final dispatch destination.
-    if (!hasExplicitContiguousDimHints && !preserveInnermostContiguousDim &&
-        inputType.getNumElements() <=
-            kTinyNonContiguousMapStoreMaxElements) {
+    const bool transferScatterPlanHasDimContributions =
+        transferScatterPlan &&
+        hasKnownInputDimContribution(transferScatterPlan->baseMap);
+    const bool tinyMapStoreUsesMemrefFallback =
+        inputType.getNumElements() <= kTinyNonContiguousMapStoreMaxElements &&
+        ((!transferScatterPlan && !hasExplicitContiguousDimHints &&
+          !preserveInnermostContiguousDim) ||
+         (transferScatterPlan && !transferScatterPlanHasDimContributions));
+    if (tinyMapStoreUsesMemrefFallback) {
       return rewriter.notifyMatchFailure(
           mapStoreOp, "tiny non-contiguous map_store uses memref fallback");
     }
 
     SmallVector<int64_t> indexVectorShape(inputType.getShape());
-    SmallVector<SmallVector<int64_t>> zeroedInputDimsPerOutput;
-    if (hasExplicitContiguousDimHints) {
-      zeroedInputDimsPerOutput.reserve(outputRank);
-      for (const MapStoreOutputDimPlan &plan : outputPlans) {
-        zeroedInputDimsPerOutput.push_back(plan.contiguousInputDims);
-      }
-    }
     FailureOr<MapStoreIndexVectorizationResult> indexVectorizationResult =
-        vectorizeMapStoreIndicesAndMask(mapStoreOp, rewriter,
-                                        indexVectorShape,
-                                        zeroedInputDimsPerOutput);
+        failure();
+    if (transferScatterPlan) {
+      indexVectorizationResult = vectorizeMapStoreIndicesAndMask(
+          mapStoreOp, rewriter, indexVectorShape,
+          transferScatterPlan->symbolOutputDims,
+          /*vectorizeAllOutputDims=*/false);
+    } else {
+      SmallVector<SmallVector<int64_t>> zeroedInputDimsPerOutput;
+      if (hasExplicitContiguousDimHints) {
+        zeroedInputDimsPerOutput.reserve(outputRank);
+        for (const MapStoreOutputDimPlan &plan : outputPlans) {
+          zeroedInputDimsPerOutput.push_back(plan.contiguousInputDims);
+        }
+      }
+      indexVectorizationResult = vectorizeMapStoreIndicesAndMask(
+          mapStoreOp, rewriter, indexVectorShape,
+          /*outputDimsToVectorize=*/{}, /*vectorizeAllOutputDims=*/true,
+          zeroedInputDimsPerOutput);
+    }
     if (failed(indexVectorizationResult)) {
       return failure();
     }
@@ -1041,55 +1260,77 @@ struct MapStoreOpVectorizationModel
     }
     SmallVector<Value> offsets(outputRank, zero);
 
-    for (int64_t outputDim = 0; outputDim < outputRank; ++outputDim) {
-      if (!hasExplicitContiguousDimHints) {
-        if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
-          baseMapExprs.push_back(getAffineDimExpr(inputRank - 1, ctx));
+    AffineMap baseMap;
+    if (transferScatterPlan) {
+      scatterIndexVectors = std::move(outputIndexVectors);
+      indexVectorMapExprs.append(scatterIndexVectors.size(),
+                                 fullInputDimExprs);
+      baseMap = transferScatterPlan->baseMap;
+      for (auto [outputDim, expr] : llvm::enumerate(baseMap.getResults())) {
+        if (affineExprUsesSymbol(expr)) {
           continue;
         }
-        baseMapExprs.push_back(
-            getAffineSymbolExpr(scatterIndexVectors.size(), ctx));
-        scatterIndexVectors.push_back(outputIndexVectors[outputDim]);
-        indexVectorMapExprs.push_back(fullInputDimExprs);
-        continue;
-      }
-
-      const MapStoreOutputDimPlan &plan = outputPlans[outputDim];
-      Value indexVector = dropContiguousDimsFromIndexVector(
-          rewriter, loc, outputIndexVectors[outputDim],
-          plan.contiguousInputDims);
-      AffineExpr baseExpr = getAffineConstantExpr(0, ctx);
-      // dropContiguousDimsFromIndexVector materializes dropped dimensions by
-      // extracting the lane-0 value from vector constants. A remaining all-zero
-      // scalar or vector means there is no gathered base component for this
-      // output dim.
-      if (!isZeroIndexValue(indexVector)) {
-        if (isa<IndexType>(indexVector.getType())) {
-          offsets[outputDim] = indexVector;
-        } else {
-          baseExpr = baseExpr +
-                     getAffineSymbolExpr(scatterIndexVectors.size(), ctx);
-          scatterIndexVectors.push_back(indexVector);
-          indexVectorMapExprs.push_back(getIndexVectorMapExprs(
-              plan.contiguousInputDims, inputRank, ctx));
+        FailureOr<Value> offset = cloneMapStoreOutputIndexOffset(
+            mapStoreOp, rewriter, mapStoreOp.getOutputIndex(outputDim), zero);
+        if (failed(offset)) {
+          return failure();
         }
+        offsets[outputDim] = *offset;
       }
-      for (int64_t inputDim : plan.contiguousInputDims) {
-        baseExpr = baseExpr + getAffineDimExpr(inputDim, ctx);
-      }
-      baseMapExprs.push_back(baseExpr);
-    }
+    } else {
+      for (int64_t outputDim = 0; outputDim < outputRank; ++outputDim) {
+        if (!hasExplicitContiguousDimHints) {
+          if (preserveInnermostContiguousDim && outputDim == outputRank - 1) {
+            baseMapExprs.push_back(getAffineDimExpr(inputRank - 1, ctx));
+            continue;
+          }
+          baseMapExprs.push_back(
+              getAffineSymbolExpr(scatterIndexVectors.size(), ctx));
+          scatterIndexVectors.push_back(outputIndexVectors[outputDim]);
+          indexVectorMapExprs.push_back(fullInputDimExprs);
+          continue;
+        }
 
-    if (!hasExplicitContiguousDimHints && preserveInnermostContiguousDim &&
-        *innermostOffset != 0) {
-      offsets.back() =
-          arith::ConstantIndexOp::create(rewriter, loc, *innermostOffset);
+        const MapStoreOutputDimPlan &plan = outputPlans[outputDim];
+        Value indexVector = dropContiguousDimsFromIndexVector(
+            rewriter, loc, outputIndexVectors[outputDim],
+            plan.contiguousInputDims);
+        AffineExpr baseExpr = getAffineConstantExpr(0, ctx);
+        // dropContiguousDimsFromIndexVector materializes dropped dimensions by
+        // extracting the lane-0 value from vector constants. A remaining
+        // all-zero scalar or vector means there is no gathered base component
+        // for this output dim.
+        if (!isZeroIndexValue(indexVector)) {
+          if (isa<IndexType>(indexVector.getType())) {
+            offsets[outputDim] = indexVector;
+          } else {
+            baseExpr = baseExpr +
+                       getAffineSymbolExpr(scatterIndexVectors.size(), ctx);
+            scatterIndexVectors.push_back(indexVector);
+            indexVectorMapExprs.push_back(getIndexVectorMapExprs(
+                plan.contiguousInputDims, inputRank, ctx));
+          }
+        }
+        for (int64_t inputDim : plan.contiguousInputDims) {
+          baseExpr = baseExpr + getAffineDimExpr(inputDim, ctx);
+        }
+        baseMapExprs.push_back(baseExpr);
+      }
+
+      if (!hasExplicitContiguousDimHints && preserveInnermostContiguousDim &&
+          *innermostOffset != 0) {
+        offsets.back() =
+            arith::ConstantIndexOp::create(rewriter, loc, *innermostOffset);
+      }
+
+      baseMap =
+          AffineMap::get(inputRank, scatterIndexVectors.size(), baseMapExprs,
+                         ctx);
     }
 
     int64_t numSymbols = scatterIndexVectors.size();
     SmallVector<AffineMap> indexingMaps;
-    indexingMaps.push_back(
-        AffineMap::get(inputRank, numSymbols, baseMapExprs, ctx));
+    indexingMaps.push_back(baseMap);
     for (auto [indexVector, mapExprs] :
          llvm::zip_equal(scatterIndexVectors, indexVectorMapExprs)) {
       ArrayRef<AffineExpr> exprs(mapExprs);

@@ -8,13 +8,221 @@
 
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/Support/MathExtras.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 
 #define DEBUG_TYPE "iree-util-affine-seed-dependency-analysis"
 
 namespace mlir::iree_compiler::IREE::Util {
+
+namespace {
+
+class LocalAffineExprSeedDependencyFinder final
+    : public AffineExprVisitor<LocalAffineExprSeedDependencyFinder,
+                               AffineSeedDependency> {
+public:
+  LocalAffineExprSeedDependencyFinder(
+      AffineMap map, ArrayRef<AffineSeedDependency> argDeps)
+      : map(map), argDeps(argDeps) {}
+
+  AffineSeedDependency visitConstantExpr(AffineConstantExpr expr) {
+    return AffineSeedDependency::getIndependent();
+  }
+
+  AffineSeedDependency visitDimExpr(AffineDimExpr expr) {
+    if (expr.getPosition() >= map.getNumDims() ||
+        expr.getPosition() >= argDeps.size()) {
+      return AffineSeedDependency::getUnknown();
+    }
+    return argDeps[expr.getPosition()];
+  }
+
+  AffineSeedDependency visitSymbolExpr(AffineSymbolExpr expr) {
+    int64_t argIndex = static_cast<int64_t>(map.getNumDims()) +
+                       static_cast<int64_t>(expr.getPosition());
+    if (expr.getPosition() >= map.getNumSymbols() ||
+        argIndex >= static_cast<int64_t>(argDeps.size())) {
+      return AffineSeedDependency::getUnknown();
+    }
+    return argDeps[argIndex];
+  }
+
+  AffineSeedDependency visitAddExpr(AffineBinaryOpExpr expr) {
+    return AffineSeedDependency::add(visit(expr.getLHS()),
+                                     visit(expr.getRHS()));
+  }
+
+  AffineSeedDependency visitMulExpr(AffineBinaryOpExpr expr) {
+    AffineSeedDependency lhs = visit(expr.getLHS());
+    AffineSeedDependency rhs = visit(expr.getRHS());
+    if (auto rhsConstant = dyn_cast<AffineConstantExpr>(expr.getRHS())) {
+      return AffineSeedDependency::scale(lhs, rhsConstant.getValue());
+    }
+    if (auto lhsConstant = dyn_cast<AffineConstantExpr>(expr.getLHS())) {
+      return AffineSeedDependency::scale(rhs, lhsConstant.getValue());
+    }
+    if (lhs.isIndependent() && rhs.isIndependent()) {
+      return AffineSeedDependency::getIndependent();
+    }
+    return AffineSeedDependency::getUnknownForDependentSeeds({lhs, rhs});
+  }
+
+  AffineSeedDependency visitFloorDivExpr(AffineBinaryOpExpr expr) {
+    return visitNonLinearExpr(expr);
+  }
+  AffineSeedDependency visitCeilDivExpr(AffineBinaryOpExpr expr) {
+    return visitNonLinearExpr(expr);
+  }
+  AffineSeedDependency visitModExpr(AffineBinaryOpExpr expr) {
+    return visitNonLinearExpr(expr);
+  }
+
+private:
+  AffineSeedDependency visitInvalidExpr(AffineBinaryOpExpr expr) {
+    return AffineSeedDependency::getUnknown();
+  }
+
+  AffineSeedDependency visitNonLinearExpr(AffineBinaryOpExpr expr) {
+    AffineSeedDependency lhs = visit(expr.getLHS());
+    AffineSeedDependency rhs = visit(expr.getRHS());
+    if (lhs.isIndependent() && rhs.isIndependent()) {
+      return AffineSeedDependency::getIndependent();
+    }
+    return AffineSeedDependency::getUnknownForDependentSeeds({lhs, rhs});
+  }
+
+  AffineMap map;
+  ArrayRef<AffineSeedDependency> argDeps;
+};
+
+} // namespace
+
+AffineSeedDependency
+inferAffineMapSeedDependency(AffineMap map,
+                             ArrayRef<AffineSeedDependency> argDeps) {
+  LocalAffineExprSeedDependencyFinder finder(map, argDeps);
+  if (map.getNumResults() != 1) {
+    return AffineSeedDependency::getUnknown();
+  }
+  return finder.visit(map.getResult(0));
+}
+
+AffineSeedDependency inferLocalAffineSeedDependency(
+    Value value, Region &scopeRegion, ArrayRef<Value> seeds,
+    llvm::DenseMap<Value, AffineSeedDependency> &memo,
+    llvm::DenseSet<Value> &inFlight) {
+  if (auto it = memo.find(value); it != memo.end()) {
+    return it->second;
+  }
+
+  for (Value seed : seeds) {
+    if (value == seed) {
+      AffineSeedDependency dependency = AffineSeedDependency::getSeed(value);
+      memo.try_emplace(value, dependency);
+      return dependency;
+    }
+  }
+
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp || definingOp->getParentRegion() != &scopeRegion) {
+    AffineSeedDependency dependency = AffineSeedDependency::getIndependent();
+    memo.try_emplace(value, dependency);
+    return dependency;
+  }
+  if (!inFlight.insert(value).second) {
+    return AffineSeedDependency::getUnknown();
+  }
+  llvm::scope_exit eraseInFlight([&]() { inFlight.erase(value); });
+
+  auto getOperandDeps = [&]() {
+    return llvm::map_to_vector(definingOp->getOperands(), [&](Value operand) {
+      return inferLocalAffineSeedDependency(operand, scopeRegion, seeds, memo,
+                                            inFlight);
+    });
+  };
+
+  AffineSeedDependency dependency = AffineSeedDependency::getUnknown();
+  if (isa<arith::ConstantOp>(definingOp)) {
+    dependency = AffineSeedDependency::getIndependent();
+  } else if (auto applyOp = dyn_cast<affine::AffineApplyOp>(definingOp)) {
+    dependency =
+        inferAffineMapSeedDependency(applyOp.getAffineMap(), getOperandDeps());
+  } else if (auto linearizeOp =
+                 dyn_cast<affine::AffineLinearizeIndexOp>(definingOp)) {
+    if (linearizeOp.getDynamicBasis().empty()) {
+      SmallVector<OpFoldResult> paddedBasis = linearizeOp.getPaddedBasis();
+      SmallVector<AffineSeedDependency> argDeps = getOperandDeps();
+      dependency = AffineSeedDependency::getIndependent();
+      for (auto [index, indexDep] :
+           llvm::enumerate(ArrayRef(argDeps).take_front(
+               linearizeOp.getMultiIndex().size()))) {
+        int64_t stride = 1;
+        for (OpFoldResult basis : ArrayRef(paddedBasis).drop_front(index + 1)) {
+          std::optional<int64_t> constantBasis = getConstantIntValue(basis);
+          if (!constantBasis ||
+              llvm::MulOverflow(stride, *constantBasis, stride)) {
+            dependency =
+                AffineSeedDependency::getUnknownForDependentSeeds(argDeps);
+            memo.try_emplace(value, dependency);
+            return dependency;
+          }
+        }
+        dependency = AffineSeedDependency::add(
+            dependency, AffineSeedDependency::scale(indexDep, stride));
+      }
+    }
+  } else if (auto addOp = dyn_cast<arith::AddIOp>(definingOp)) {
+    SmallVector<AffineSeedDependency> argDeps = getOperandDeps();
+    dependency = AffineSeedDependency::add(argDeps[0], argDeps[1]);
+  } else if (auto subOp = dyn_cast<arith::SubIOp>(definingOp)) {
+    SmallVector<AffineSeedDependency> argDeps = getOperandDeps();
+    dependency = AffineSeedDependency::add(argDeps[0], argDeps[1], 1, -1);
+  } else if (auto mulOp = dyn_cast<arith::MulIOp>(definingOp)) {
+    SmallVector<AffineSeedDependency> argDeps = getOperandDeps();
+    if (std::optional<int64_t> rhsConstant =
+            getConstantIntValue(mulOp.getRhs())) {
+      dependency = AffineSeedDependency::scale(argDeps[0], *rhsConstant);
+    } else if (std::optional<int64_t> lhsConstant =
+                   getConstantIntValue(mulOp.getLhs())) {
+      dependency = AffineSeedDependency::scale(argDeps[1], *lhsConstant);
+    } else if (argDeps[0].isIndependent() && argDeps[1].isIndependent()) {
+      dependency = AffineSeedDependency::getIndependent();
+    } else {
+      dependency = AffineSeedDependency::getUnknownForDependentSeeds(argDeps);
+    }
+  } else if (auto indexCastOp = dyn_cast<arith::IndexCastOp>(definingOp)) {
+    dependency = inferLocalAffineSeedDependency(indexCastOp.getIn(),
+                                                scopeRegion, seeds, memo,
+                                                inFlight);
+  } else {
+    SmallVector<AffineSeedDependency> argDeps = getOperandDeps();
+    if (llvm::all_of(argDeps, [](const AffineSeedDependency &dep) {
+          return dep.isIndependent();
+        })) {
+      dependency = AffineSeedDependency::getIndependent();
+    } else {
+      dependency = AffineSeedDependency::getUnknownForDependentSeeds(argDeps);
+    }
+  }
+
+  memo.try_emplace(value, dependency);
+  return dependency;
+}
+
+AffineSeedDependency inferLocalAffineSeedDependency(Value value,
+                                                    Region &scopeRegion,
+                                                    ArrayRef<Value> seeds) {
+  DenseMap<Value, AffineSeedDependency> memo;
+  DenseSet<Value> inFlight;
+  return inferLocalAffineSeedDependency(value, scopeRegion, seeds, memo,
+                                        inFlight);
+}
 
 AffineSeedDependencyAnalysis::AffineSeedDependencyAnalysis(
     DataFlowSolver &solver, SeedPredicate seedPredicate)

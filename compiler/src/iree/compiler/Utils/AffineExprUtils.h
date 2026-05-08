@@ -14,6 +14,16 @@
 
 namespace mlir::iree_compiler {
 
+/// Returns true if `expr` references any affine symbol.
+inline bool affineExprUsesSymbol(AffineExpr expr) {
+  if (isa<AffineSymbolExpr>(expr)) {
+    return true;
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  return binaryExpr && (affineExprUsesSymbol(binaryExpr.getLHS()) ||
+                        affineExprUsesSymbol(binaryExpr.getRHS()));
+}
+
 /// Returns the linear coefficient of `dimPosition` in `expr`.
 ///
 /// This intentionally handles only the affine fragment needed by current

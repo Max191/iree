@@ -25,6 +25,8 @@ namespace mlir::iree_compiler::IREE::LinalgExt {
 
 inline constexpr llvm::StringLiteral kMapStoreContiguousDimHintsAttr =
     "contiguous_dim_hints";
+inline constexpr llvm::StringLiteral kMapStoreTransferScatterIndexingMapAttr =
+    "transfer_scatter_indexing_map";
 
 } // namespace mlir::iree_compiler::IREE::LinalgExt
 
