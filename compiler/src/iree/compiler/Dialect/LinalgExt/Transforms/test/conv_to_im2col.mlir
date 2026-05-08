@@ -1,8 +1,8 @@
 // RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(util.func(iree-linalg-ext-convert-conv-to-im2col-op))" %s | FileCheck %s
 
-// Conv batch dims are GEMM M, not im2col batch_pos. They are passthrough M
-// entries with size-1 K window offsets; only conv depth/group dims that appear
-// in both image and filter become batch_pos.
+// Conv batch dims are GEMM M, not im2col batch_pos. They use size-1 K offsets;
+// only conv depth/group dims that appear in both image and filter become
+// batch_pos.
 util.func public @conv_2d_nhwc_hwcf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<3x3x4x16xf32>, %arg2: tensor<1x14x14x16xf32>) -> tensor<1x14x14x16xf32> {
   %0 = linalg.conv_2d_nhwc_hwcf
     {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64> }

@@ -56,20 +56,20 @@ static SmallVector<NamedAttribute> getPrunedAttributeList(linalg::LinalgOp op) {
 }
 
 // Computes `inputKPerm` for the im2col op. Each non-batch input dimension
-// contributes exactly one K-output coordinate (a window offset for M dims,
-// including the trivial size-1 offset for passthrough M dims; a channel
-// coordinate for K dims). The permutation maps each position in output-K
-// delinearization order to the position of the corresponding input dim in
-// input-dim iteration order (ascending over non-batch input dims).
+// contributes exactly one K-output coordinate: a window offset for spatial M
+// dims, a trivial size-1 offset for conv batch M dims, or a channel coordinate
+// for K dims. The permutation maps each position in output-K delinearization
+// order to the position of the corresponding input dim in input-dim iteration
+// order (ascending over non-batch input dims).
 //
 // Output-K order is:
-//   [passthrough-M coords (input-dim ascending order),
+//   [conv batch M coords (input-dim ascending order),
 //    filter-reduction coords (in filter map order: inputChannel + filterLoop)]
 static FailureOr<SmallVector<int64_t>>
 computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
                   const mlir::linalg::ConvolutionDimensions &convDims,
                   ArrayRef<int64_t> batchPos,
-                  ArrayRef<int64_t> mPassthroughInputDims) {
+                  ArrayRef<int64_t> mBatchInputDims) {
   // Map from input dim to its position in input-dim iteration order (ascending
   // over non-batch dims).
   int64_t inputRank = inputMap.getNumResults();
@@ -96,10 +96,10 @@ computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
     return success();
   };
 
-  // Passthrough-M K coords come first, in input-dim ascending order.
-  SmallVector<int64_t> sortedPassthrough(mPassthroughInputDims);
-  llvm::sort(sortedPassthrough);
-  for (int64_t inputDim : sortedPassthrough) {
+  // Conv batch M K coords come first, in input-dim ascending order.
+  SmallVector<int64_t> sortedBatchM(mBatchInputDims);
+  llvm::sort(sortedBatchM);
+  for (int64_t inputDim : sortedBatchM) {
     if (failed(appendInputDim(inputDim))) {
       return failure();
     }
@@ -225,11 +225,10 @@ public:
 
     // The im2col dimension classification mirrors the GEMM roles:
     //   batch_pos = GEMM batch = conv depth/group dims.
-    //   m_pos     = GEMM M     = conv batch dims (passthrough) and conv
-    //                            outputImage dims (windowed).
+    //   m_pos     = GEMM M     = conv batch dims and conv outputImage dims.
     //   k_pos     = GEMM K     = conv inputChannel dims.
-    // Passthrough M dims use stride=dilation=kernel_size=1 and carry a size-1
-    // window-offset slot in the K output.
+    // Conv batch M dims use stride=dilation=kernel_size=1 and carry a size-1
+    // offset slot in the K output.
     SmallVector<int64_t> outputPerm = igemmConvDetails.im2colOutputPerm;
     // Locate the input-tensor dim that uses a given conv iteration dim. Handles
     // compound result exprs (e.g., `d_h + d_kh` for a spatial output dim).
@@ -271,7 +270,7 @@ public:
     SmallVector<OpFoldResult> mKernelSizes(numM, rewriter.getIndexAttr(1));
     SmallVector<int64_t> mShape(numM, -1);
     SmallVector<char> mSlotAssigned(numM, false);
-    SmallVector<int64_t> mPassthroughInputDims;
+    SmallVector<int64_t> mBatchInputDims;
     auto assignMSlot = [&](int64_t canonicalPos) -> FailureOr<int64_t> {
       int64_t mSlot = canonicalPos - numBatch;
       if (mSlot < 0 || mSlot >= numM || mSlotAssigned[mSlot]) {
@@ -331,16 +330,15 @@ public:
       int64_t slot = *mSlot;
       int64_t dim = *inputDim;
       mPos[slot] = dim;
-      // Passthrough M uses stride=dilation=kernel=1 (already initialized).
+      // Conv batch M uses stride=dilation=kernel=1 (already initialized).
       mShape[slot] = inputShape[dim];
-      mPassthroughInputDims.push_back(dim);
+      mBatchInputDims.push_back(dim);
     }
     if (llvm::any_of(mSlotAssigned, [](char assigned) { return !assigned; })) {
       return rewriter.notifyMatchFailure(linalgOp,
                                          "failed to assign all im2col M slots");
     }
-    const int64_t numPassthroughM =
-        static_cast<int64_t>(mPassthroughInputDims.size());
+    const int64_t numBatchM = static_cast<int64_t>(mBatchInputDims.size());
 
     SmallVector<int64_t> kPos;
     for (auto reductionDim : convDims.inputChannel) {
@@ -351,7 +349,7 @@ public:
       }
     }
     FailureOr<SmallVector<int64_t>> inputKPerm = computeInputKPerm(
-        inputMap, filterMap, convDims, batchPos, mPassthroughInputDims);
+        inputMap, filterMap, convDims, batchPos, mBatchInputDims);
     if (failed(inputKPerm)) {
       return rewriter.notifyMatchFailure(linalgOp,
                                          "failed to infer input K permutation");
@@ -404,21 +402,20 @@ public:
       }
     }
 
-    // Each passthrough M input dim contributes a size-1 window-offset slot to
-    // the K output. Prepend them to the first non-empty canonical K group to
+    // Each conv batch M input dim contributes a size-1 offset slot to the K
+    // output. Prepend them to the first non-empty canonical K group to
     // preserve the existing split between input-channel and filter-loop output
     // dims while making the K delinearization cover every non-batch input dim in
     // the same order used by input_k_perm.
-    if (numPassthroughM > 0) {
+    if (numBatchM > 0) {
       if (inputChannelInnerSizes.empty() && filterLoopInnerSizes.empty()) {
         return rewriter.notifyMatchFailure(
-            linalgOp,
-            "expected at least one K output dim with passthrough M dims");
+            linalgOp, "expected at least one K output dim with batch M dims");
       }
       SmallVector<int64_t> &firstK = inputChannelInnerSizes.empty()
                                          ? filterLoopInnerSizes.front()
                                          : inputChannelInnerSizes.front();
-      firstK.insert(firstK.begin(), numPassthroughM, 1);
+      firstK.insert(firstK.begin(), numBatchM, 1);
     }
 
     int64_t numOutputDims = numBatch + numM + inputChannelInnerSizes.size() +
@@ -429,12 +426,12 @@ public:
     for (int64_t dim : batchPos) {
       outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
     }
-    // M dims: one output dim per m_pos entry (passthrough + spatial).
+    // M dims: one output dim per m_pos entry (conv batch + spatial).
     for (int64_t m : mShape) {
       outputSizes.push_back({rewriter.getIndexAttr(m)});
     }
-    // InputChannel K dims first, then filterLoop K dims. Passthrough M
-    // window-offset slots live as size-1 prefixes inside the first K group.
+    // InputChannel K dims first, then filterLoop K dims. Conv batch M offset
+    // slots live as size-1 prefixes inside the first K group.
     for (const auto &innerSizes : inputChannelInnerSizes) {
       outputSizes.push_back(getAsIndexOpFoldResult(getContext(), innerSizes));
     }

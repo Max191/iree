@@ -1412,9 +1412,9 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     #### Attributes
 
     **Convolution metadata** — one entry per `m_pos` dimension:
-    - `strides`: spatial stride per m_pos dimension (1 for passthrough M dims).
-    - `dilations`: dilation factor per m_pos dimension (1 for passthrough M dims).
-    - `kernel_size`: filter kernel extent per m_pos dimension (1 for passthrough
+    - `strides`: spatial stride per m_pos dimension (1 for conv batch M dims).
+    - `dilations`: dilation factor per m_pos dimension (1 for conv batch M dims).
+    - `kernel_size`: filter kernel extent per m_pos dimension (1 for conv batch
       M dims).
 
     **Dimension mapping** — classifies each input dimension by its role in the
@@ -1423,9 +1423,8 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
       both the image-side and filter-side of the IGEMM, e.g. conv groups/depth).
     - `m_pos`: input dimensions that become GEMM M dimensions. This includes
       convolution spatial dims (windowed with stride/dilation/kernel_size) and
-      convolution batch dims (passthrough with trivial stride=1, dilation=1,
-      kernel_size=1 — present in the image-side and output but absent from the
-      filter).
+      convolution batch dims (trivial stride=1, dilation=1, kernel_size=1 —
+      present in the image-side and output but absent from the filter).
     - `k_pos`: input channel dimensions that become part of GEMM K.
 
     **Indexing**:
@@ -1467,23 +1466,23 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
     #### Semantics
 
     For each output position `(b, m, k)`, the op computes input coordinates,
-    where `i` indexes over `m_pos` dimensions (GEMM M: spatial or
-    passthrough) and `j` indexes over `k_pos` dimensions (GEMM K channel):
+    where `i` indexes over `m_pos` dimensions (GEMM M: spatial or conv batch)
+    and `j` indexes over `k_pos` dimensions (GEMM K channel):
     ```
       m_input_coord[i] = m_coord[i] * stride[i] + window_offset[i] * dilation[i]
       channel_coord[j] = k_coord[j]
     ```
     where `m_coord` and `window_offset`/`k_coord` come from delinearizing the
-    M and K output indices using `output_sizes`. For passthrough M dimensions
-    (those originating from convolution batch dims) `stride=dilation=1` and
-    the corresponding `window_offset` is drawn from a size-1 coordinate, so the
-    formula reduces to `m_input_coord[i] = m_coord[i]`.
+    M and K output indices using `output_sizes`. For conv batch M dimensions,
+    `stride=dilation=1` and the corresponding `window_offset` is drawn from a
+    size-1 coordinate, so the formula reduces to
+    `m_input_coord[i] = m_coord[i]`.
 
     #### Examples
 
-    Basic im2col (NHWC conv, 3x3 kernel). The conv batch dim (N) is a
-    passthrough M dim with `stride=dilation=kernel_size=1`, so its K window
-    offset is a size-1 coordinate:
+    Basic im2col (NHWC conv, 3x3 kernel). The conv batch dim (N) is an M dim
+    with `stride=dilation=kernel_size=1`, so its K offset is a size-1
+    coordinate:
     ```mlir
       %im2col = iree_linalg_ext.im2col
           strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [1, 3, 3]

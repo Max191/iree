@@ -2798,13 +2798,13 @@ LogicalResult Im2colOp::verify() {
   //   -> total inner sizes across all batch dims = batchPos.size()
   //
   // M output dims (GEMM M): collectively produce mPos.size() coordinates
-  //   (one per M input dim, whether windowed-spatial or passthrough).
+  //   (one per M input dim, whether spatial or conv batch).
   //   -> total inner sizes across all M dims = mPos.size()
   //
   // K output dims (GEMM K): collectively produce (mPos.size() + kPos.size())
   //   coordinates (one window offset per M input dim + one channel coordinate
-  //   per K input dim, indexed by input_k_perm). Passthrough M dims contribute
-  //   a size-1 window-offset slot.
+  //   per K input dim, indexed by input_k_perm). Conv batch M dims contribute
+  //   a size-1 offset slot.
   //   -> total inner sizes across all K dims = mPos.size() + kPos.size()
   int64_t numBatchOutputDims = batchPos.size();
   int64_t expectedBatchInner = batchPos.size();

@@ -346,9 +346,6 @@ def test_igemm_conv_details():
         '"reduction"',
         '"reduction"',
     ]
-    # After reclassifying conv-batch dims as GEMM-M, conv dim 2 (the parallel
-    # non-channel input/output dim) joins the image-side M set, so the image
-    # map (d3, d1, d4, d2) has M positions [1, 3].
     assert details.im2col_output_perm == [2, 0, 3, 1]
     assert details.filter_reassoc_indices == [[0], [1, 2], [3]]
     assert details.is_output_channel_first
