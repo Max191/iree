@@ -159,6 +159,19 @@ SmallVector<AffineMap> convertDimsToSymbols(MLIRContext *context,
                                             unsigned numDims,
                                             unsigned numSymbols);
 
+/// Transform-ready metadata for materializing the im2col op that feeds the
+/// IGEMM contraction.
+struct Im2colMetadata {
+  SmallVector<int64_t> strides;
+  SmallVector<int64_t> dilations;
+  SmallVector<int64_t> kernelSizes;
+  SmallVector<SmallVector<int64_t>> outputSizes;
+  SmallVector<int64_t> batchPos;
+  SmallVector<int64_t> mPos;
+  SmallVector<int64_t> kPos;
+  SmallVector<int64_t> inputKPerm;
+};
+
 /// Struct that holds inferred IGEMM details for a convolution operation.
 struct IGEMMGenericConvDetails {
   /// The indexing maps array for a convolution operation with IGEMM
@@ -188,12 +201,15 @@ struct IGEMMGenericConvDetails {
   /// BxMxK. The result of the permutation should match the order that the
   /// output dims are represented in the input tensor.
   SmallVector<int64_t> im2colOutputPerm;
+  /// Metadata for materializing the im2col op that feeds the IGEMM
+  /// contraction.
+  Im2colMetadata im2colMetadata;
   /// Indicates if the OutputChannel is before the OutputImage in the output.
   /// This determines our lhs/rhs ordering.
   bool isOutputChannelFirst;
 
   // Get the indexing map for the IGEMM image operand.
-  AffineMap getIgemmInputImageMap() {
+  AffineMap getIgemmInputImageMap() const {
     return igemmContractionMaps[isOutputChannelFirst ? 1 : 0];
   }
 };

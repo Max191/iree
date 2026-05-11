@@ -441,6 +441,29 @@ enum class Im2colDimKind {
   FilterLoop,
 };
 
+/// Source metadata collected while deriving expanded IGEMM details. These
+/// facts are keyed by original convolution/filter/input dimensions so they can
+/// be projected through canonicalization and collapse without re-inspecting the
+/// original convolution pattern in the transform.
+struct Im2colSourceMetadata {
+  int64_t inputRank = 0;
+  SmallVector<int64_t> inputShape;
+  SmallVector<int64_t> convDimToInputDim;
+  SmallVector<int64_t> convDimToMSize;
+  SmallVector<int64_t> convDimToMStride;
+  SmallVector<int64_t> convDimToMDilation;
+  SmallVector<int64_t> convDimToMKernelSize;
+  SmallVector<int64_t> filterDimSizes;
+  SmallVector<int64_t> filterDimToInputDim;
+  SmallVector<int64_t> parallelFilterDims;
+  SmallVector<int64_t> inputChannelFilterDims;
+};
+
+struct ExpandedIGEMMGenericConvDetails {
+  IGEMMGenericConvDetails details;
+  Im2colSourceMetadata im2colSourceMetadata;
+};
+
 /// Computes the output permutation for the im2col tensor to match the
 /// dimension order of the input tensor.
 static SmallVector<int64_t> computeIm2colOutputPermutation(
@@ -536,6 +559,377 @@ static SmallVector<int64_t> computeIm2colOutputPermutation(
   assignPositions(inputChannelPositions);
   assignPositions(filterLoopPositions);
   return outputPerm;
+}
+
+static LogicalResult setUniqueMapping(SmallVectorImpl<int64_t> &map,
+                                      int64_t key, int64_t value) {
+  if (key < 0 || key >= static_cast<int64_t>(map.size())) {
+    return failure();
+  }
+  if (map[key] != -1 && map[key] != value) {
+    return failure();
+  }
+  map[key] = value;
+  return success();
+}
+
+static FailureOr<Im2colSourceMetadata>
+computeIm2colSourceMetadata(linalg::LinalgOp linalgOp,
+                            const linalg::ConvolutionDimensions &convDims) {
+  Value input = linalgOp.getDpsInputs()[0];
+  Value filter = linalgOp.getDpsInputs()[1];
+  Value output = linalgOp.getDpsInits()[0];
+  auto inputType = cast<ShapedType>(input.getType());
+  auto filterType = cast<ShapedType>(filter.getType());
+  auto outputType = cast<ShapedType>(output.getType());
+  if (!outputType.hasStaticShape()) {
+    LDBG() << "[unimplemented] expected 'outputType' to have static shape.";
+    return failure();
+  }
+
+  SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
+  AffineMap inputMap = indexingMaps[0];
+  AffineMap filterMap = indexingMaps[1];
+  AffineMap outputMap = indexingMaps[2];
+  MLIRContext *ctx = linalgOp->getContext();
+
+  int64_t loopRank = linalgOp.getNumLoops();
+  Im2colSourceMetadata metadata;
+  metadata.inputRank = inputMap.getNumResults();
+  metadata.inputShape = llvm::to_vector(inputType.getShape());
+  metadata.convDimToInputDim.resize(loopRank, -1);
+  metadata.convDimToMSize.resize(loopRank, -1);
+  metadata.convDimToMStride.resize(loopRank, 1);
+  metadata.convDimToMDilation.resize(loopRank, 1);
+  metadata.convDimToMKernelSize.resize(loopRank, 1);
+  metadata.filterDimSizes = llvm::to_vector(filterType.getShape());
+  metadata.filterDimToInputDim.resize(filterMap.getNumResults(), -1);
+
+  for (auto [inputDim, inputExpr] : llvm::enumerate(inputMap.getResults())) {
+    for (int64_t loopDim = 0; loopDim < loopRank; ++loopDim) {
+      if (inputExpr.isFunctionOfDim(loopDim) &&
+          failed(setUniqueMapping(metadata.convDimToInputDim, loopDim,
+                                  inputDim))) {
+        return failure();
+      }
+    }
+  }
+
+  auto getResultPosition = [&](AffineMap map,
+                               unsigned dim) -> std::optional<int64_t> {
+    return map.getResultPosition(getAffineDimExpr(dim, ctx));
+  };
+
+  for (auto iterDim :
+       llvm::concat<const unsigned>(convDims.depth, convDims.outputChannel)) {
+    if (std::optional<int64_t> filterDim =
+            getResultPosition(filterMap, iterDim)) {
+      metadata.parallelFilterDims.push_back(*filterDim);
+    }
+  }
+  for (unsigned iterDim : convDims.inputChannel) {
+    if (std::optional<int64_t> filterDim =
+            getResultPosition(filterMap, iterDim)) {
+      metadata.inputChannelFilterDims.push_back(*filterDim);
+    }
+  }
+
+  auto reductionDims =
+      llvm::concat<const unsigned>(convDims.inputChannel, convDims.filterLoop);
+  for (auto [filterDim, filterExpr] : llvm::enumerate(filterMap.getResults())) {
+    for (unsigned reductionDim : reductionDims) {
+      if (!filterExpr.isFunctionOfDim(reductionDim)) {
+        continue;
+      }
+      int64_t inputDim = metadata.convDimToInputDim[reductionDim];
+      if (inputDim < 0 ||
+          failed(setUniqueMapping(metadata.filterDimToInputDim, filterDim,
+                                  inputDim))) {
+        return failure();
+      }
+    }
+  }
+
+  ArrayRef<int64_t> inputShape = inputType.getShape();
+  ArrayRef<int64_t> filterShape = filterType.getShape();
+  ArrayRef<int64_t> outputShape = outputType.getShape();
+  for (auto [spatialIdx, outputImageDim] :
+       llvm::enumerate(convDims.outputImage)) {
+    unsigned filterLoopDim = convDims.filterLoop[spatialIdx];
+    std::optional<int64_t> outputDim =
+        getResultPosition(outputMap, outputImageDim);
+    std::optional<int64_t> filterDim =
+        getResultPosition(filterMap, filterLoopDim);
+    int64_t inputDim = metadata.convDimToInputDim[outputImageDim];
+    if (!outputDim || !filterDim || inputDim < 0) {
+      return failure();
+    }
+    metadata.convDimToMSize[outputImageDim] = outputShape[*outputDim];
+    metadata.convDimToMStride[outputImageDim] = convDims.strides[spatialIdx];
+    metadata.convDimToMDilation[outputImageDim] =
+        convDims.dilations[spatialIdx];
+    metadata.convDimToMKernelSize[outputImageDim] = filterShape[*filterDim];
+  }
+  for (unsigned batchDim : convDims.batch) {
+    int64_t inputDim = metadata.convDimToInputDim[batchDim];
+    if (inputDim < 0) {
+      return failure();
+    }
+    metadata.convDimToMSize[batchDim] = inputShape[inputDim];
+  }
+
+  return metadata;
+}
+
+static FailureOr<int64_t>
+getCanonicalIm2colPosition(const IGEMMGenericConvDetails &details,
+                           unsigned convDim) {
+  auto it = details.convToIgemmDimMap.find(convDim);
+  if (it == details.convToIgemmDimMap.end()) {
+    return failure();
+  }
+  std::optional<int64_t> inputDim =
+      details.getIgemmInputImageMap().getResultPosition(it->second);
+  if (!inputDim || *inputDim < 0 ||
+      *inputDim >= static_cast<int64_t>(details.im2colOutputPerm.size())) {
+    return failure();
+  }
+  int64_t canonicalPos = details.im2colOutputPerm[*inputDim];
+  if (canonicalPos < 0) {
+    return failure();
+  }
+  return canonicalPos;
+}
+
+static LogicalResult assignIm2colMMetadataSlot(
+    Im2colMetadata &metadata, SmallVectorImpl<int64_t> &mShape,
+    SmallVectorImpl<char> &assignedSlots, int64_t canonicalPos,
+    int64_t numBatch, unsigned convDim,
+    const Im2colSourceMetadata &sourceMetadata) {
+  int64_t mSlot = canonicalPos - numBatch;
+  if (mSlot < 0 || mSlot >= static_cast<int64_t>(metadata.mPos.size()) ||
+      assignedSlots[mSlot]) {
+    return failure();
+  }
+  int64_t inputDim = sourceMetadata.convDimToInputDim[convDim];
+  int64_t mSize = sourceMetadata.convDimToMSize[convDim];
+  if (inputDim < 0 || mSize < 0) {
+    return failure();
+  }
+  assignedSlots[mSlot] = true;
+  metadata.mPos[mSlot] = inputDim;
+  metadata.strides[mSlot] = sourceMetadata.convDimToMStride[convDim];
+  metadata.dilations[mSlot] = sourceMetadata.convDimToMDilation[convDim];
+  metadata.kernelSizes[mSlot] = sourceMetadata.convDimToMKernelSize[convDim];
+  mShape[mSlot] = mSize;
+  return success();
+}
+
+static FailureOr<SmallVector<int64_t>>
+computeFinalInputKPerm(const Im2colSourceMetadata &sourceMetadata,
+                       ArrayRef<int64_t> batchPos,
+                       ArrayRef<int64_t> batchMInputDims,
+                       ArrayRef<int64_t> inputChannelInputDims,
+                       ArrayRef<int64_t> filterLoopInputDims) {
+  llvm::SmallDenseSet<int64_t, 4> batchSet(batchPos.begin(), batchPos.end());
+  DenseMap<int64_t, int64_t> inputDimToIterPos;
+  int64_t iterPos = 0;
+  for (int64_t dim = 0; dim < sourceMetadata.inputRank; ++dim) {
+    if (!batchSet.contains(dim)) {
+      inputDimToIterPos[dim] = iterPos++;
+    }
+  }
+
+  SmallVector<int64_t> inputKPerm;
+  llvm::SmallDenseSet<int64_t, 8> usedInputDims;
+  auto appendInputDim = [&](int64_t inputDim) -> LogicalResult {
+    auto iterPosIt = inputDimToIterPos.find(inputDim);
+    if (iterPosIt == inputDimToIterPos.end() ||
+        !usedInputDims.insert(inputDim).second) {
+      return failure();
+    }
+    inputKPerm.push_back(iterPosIt->second);
+    return success();
+  };
+
+  SmallVector<int64_t> sortedBatchMInputDims(batchMInputDims);
+  llvm::sort(sortedBatchMInputDims);
+  for (int64_t inputDim : sortedBatchMInputDims) {
+    if (failed(appendInputDim(inputDim))) {
+      return failure();
+    }
+  }
+  for (int64_t inputDim : inputChannelInputDims) {
+    if (failed(appendInputDim(inputDim))) {
+      return failure();
+    }
+  }
+  for (int64_t inputDim : filterLoopInputDims) {
+    if (failed(appendInputDim(inputDim))) {
+      return failure();
+    }
+  }
+  if (inputKPerm.size() != inputDimToIterPos.size()) {
+    return failure();
+  }
+  return inputKPerm;
+}
+
+static LogicalResult
+finalizeIm2colMetadata(IGEMMGenericConvDetails &details,
+                       const Im2colSourceMetadata &sourceMetadata) {
+  const linalg::ConvolutionDimensions &convDims = details.convDims;
+  int64_t numBatch = convDims.depth.size();
+  int64_t numM = convDims.batch.size() + convDims.outputImage.size();
+
+  Im2colMetadata metadata;
+  metadata.batchPos.resize(numBatch, -1);
+  metadata.mPos.resize(numM, -1);
+  metadata.strides.resize(numM, 1);
+  metadata.dilations.resize(numM, 1);
+  metadata.kernelSizes.resize(numM, 1);
+
+  for (unsigned convDim : convDims.depth) {
+    FailureOr<int64_t> canonicalPos =
+        getCanonicalIm2colPosition(details, convDim);
+    if (failed(canonicalPos) || *canonicalPos < 0 ||
+        *canonicalPos >= numBatch || metadata.batchPos[*canonicalPos] != -1) {
+      return failure();
+    }
+    int64_t inputDim = sourceMetadata.convDimToInputDim[convDim];
+    if (inputDim < 0) {
+      return failure();
+    }
+    metadata.batchPos[*canonicalPos] = inputDim;
+  }
+
+  SmallVector<int64_t> mShape(numM, -1);
+  SmallVector<char> mSlotAssigned(numM, false);
+  for (unsigned outputImageDim : convDims.outputImage) {
+    FailureOr<int64_t> canonicalPos =
+        getCanonicalIm2colPosition(details, outputImageDim);
+    if (failed(canonicalPos) ||
+        failed(assignIm2colMMetadataSlot(metadata, mShape, mSlotAssigned,
+                                         *canonicalPos, numBatch,
+                                         outputImageDim, sourceMetadata))) {
+      return failure();
+    }
+  }
+
+  SmallVector<int64_t> batchMInputDims;
+  for (unsigned batchDim : convDims.batch) {
+    FailureOr<int64_t> canonicalPos =
+        getCanonicalIm2colPosition(details, batchDim);
+    if (failed(canonicalPos) ||
+        failed(assignIm2colMMetadataSlot(metadata, mShape, mSlotAssigned,
+                                         *canonicalPos, numBatch, batchDim,
+                                         sourceMetadata))) {
+      return failure();
+    }
+    batchMInputDims.push_back(sourceMetadata.convDimToInputDim[batchDim]);
+  }
+
+  if (llvm::any_of(mSlotAssigned, [](char assigned) { return !assigned; })) {
+    return failure();
+  }
+
+  for (unsigned convDim : convDims.inputChannel) {
+    int64_t inputDim = sourceMetadata.convDimToInputDim[convDim];
+    if (inputDim < 0) {
+      return failure();
+    }
+    metadata.kPos.push_back(inputDim);
+  }
+
+  llvm::SmallDenseSet<int64_t, 4> parallelFilterDims(
+      sourceMetadata.parallelFilterDims.begin(),
+      sourceMetadata.parallelFilterDims.end());
+  llvm::SmallDenseSet<int64_t, 4> inputChannelFilterDims(
+      sourceMetadata.inputChannelFilterDims.begin(),
+      sourceMetadata.inputChannelFilterDims.end());
+  SmallVector<SmallVector<int64_t>> inputChannelInnerSizes;
+  SmallVector<SmallVector<int64_t>> filterLoopInnerSizes;
+  SmallVector<int64_t> inputChannelInputDims;
+  SmallVector<int64_t> filterLoopInputDims;
+  for (const auto &indices : details.filterReassocIndices) {
+    bool isParallel =
+        indices.size() == 1 && parallelFilterDims.contains(indices[0]);
+    if (isParallel) {
+      continue;
+    }
+
+    SmallVector<int64_t> innerSizes;
+    SmallVector<int64_t> groupInputDims;
+    innerSizes.reserve(indices.size());
+    groupInputDims.reserve(indices.size());
+    for (int64_t filterDim : indices) {
+      if (filterDim < 0 ||
+          filterDim >= static_cast<int64_t>(
+                           sourceMetadata.filterDimSizes.size()) ||
+          filterDim >= static_cast<int64_t>(
+                           sourceMetadata.filterDimToInputDim.size())) {
+        return failure();
+      }
+      int64_t inputDim = sourceMetadata.filterDimToInputDim[filterDim];
+      if (inputDim < 0) {
+        return failure();
+      }
+      innerSizes.push_back(sourceMetadata.filterDimSizes[filterDim]);
+      groupInputDims.push_back(inputDim);
+    }
+
+    bool isInputChannel = llvm::all_of(indices, [&](int64_t filterDim) {
+      return inputChannelFilterDims.contains(filterDim);
+    });
+    if (isInputChannel) {
+      inputChannelInnerSizes.push_back(std::move(innerSizes));
+      llvm::append_range(inputChannelInputDims, groupInputDims);
+    } else {
+      filterLoopInnerSizes.push_back(std::move(innerSizes));
+      llvm::append_range(filterLoopInputDims, groupInputDims);
+    }
+  }
+
+  if (!batchMInputDims.empty()) {
+    if (inputChannelInnerSizes.empty() && filterLoopInnerSizes.empty()) {
+      return failure();
+    }
+    SmallVector<int64_t> &firstK = inputChannelInnerSizes.empty()
+                                       ? filterLoopInnerSizes.front()
+                                       : inputChannelInnerSizes.front();
+    firstK.insert(firstK.begin(), batchMInputDims.size(), 1);
+  }
+
+  FailureOr<SmallVector<int64_t>> inputKPerm = computeFinalInputKPerm(
+      sourceMetadata, metadata.batchPos, batchMInputDims,
+      inputChannelInputDims, filterLoopInputDims);
+  if (failed(inputKPerm)) {
+    return failure();
+  }
+  metadata.inputKPerm = std::move(*inputKPerm);
+
+  for (int64_t inputDim : metadata.batchPos) {
+    if (inputDim < 0 ||
+        inputDim >= static_cast<int64_t>(sourceMetadata.inputShape.size())) {
+      return failure();
+    }
+    metadata.outputSizes.push_back({sourceMetadata.inputShape[inputDim]});
+  }
+  for (int64_t mSize : mShape) {
+    if (mSize < 0) {
+      return failure();
+    }
+    metadata.outputSizes.push_back({mSize});
+  }
+  for (auto &innerSizes : inputChannelInnerSizes) {
+    metadata.outputSizes.push_back(std::move(innerSizes));
+  }
+  for (auto &innerSizes : filterLoopInnerSizes) {
+    metadata.outputSizes.push_back(std::move(innerSizes));
+  }
+
+  details.im2colMetadata = std::move(metadata);
+  return success();
 }
 
 /// Remaps the result expressions of an affine map by substituting each
@@ -917,7 +1311,7 @@ static SmallVector<ReassociationIndices> getCollapsibleIGEMMIterationGroups(
 /// The expanded form has an identity mapping from conv loop dims to IGEMM
 /// loop dims. Reduction dims are then canonicalized to match the image-side
 /// order to enable subsequent collapsing.
-static FailureOr<IGEMMGenericConvDetails>
+static FailureOr<ExpandedIGEMMGenericConvDetails>
 getExpandedIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   // The failure conditions for these checks differ slightly, so check both.
   if (!linalg::isaConvolutionOpInterface(linalgOp)) {
@@ -969,6 +1363,11 @@ getExpandedIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   auto inputMap = indexingMaps[0];
   auto filterMap = indexingMaps[1];
   auto outputMap = indexingMaps[2];
+  FailureOr<Im2colSourceMetadata> im2colSourceMetadata =
+      computeIm2colSourceMetadata(linalgOp, convDims);
+  if (failed(im2colSourceMetadata)) {
+    return failure();
+  }
 
   bool isOutputChannelFirst = false;
   ArrayRef<unsigned> outputChannelPos = convDims.outputChannel;
@@ -1037,15 +1436,19 @@ getExpandedIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   igemmDetails.convDims = convDims;
   igemmDetails.convToIgemmDimMap = convToIgemmDimMap;
   igemmDetails.igemmLoopIterators = igemmLoopIterators;
-  return canonicalizeReductionOrder(std::move(igemmDetails));
+  ExpandedIGEMMGenericConvDetails expandedDetails;
+  expandedDetails.details = canonicalizeReductionOrder(std::move(igemmDetails));
+  expandedDetails.im2colSourceMetadata = std::move(*im2colSourceMetadata);
+  return expandedDetails;
 }
 
 /// Collapses adjacent same-kind dims in the expanded IGEMM details.
 /// Produces the final collapsed contraction maps, loop bounds, iterator
 /// types, filter reassociation indices, and im2col output permutation.
-static IGEMMGenericConvDetails
-collapseIGEMMGenericConvDetails(const IGEMMGenericConvDetails &expandedDetails,
+static FailureOr<IGEMMGenericConvDetails>
+collapseIGEMMGenericConvDetails(const ExpandedIGEMMGenericConvDetails &expanded,
                                 MLIRContext *ctx) {
+  const IGEMMGenericConvDetails &expandedDetails = expanded.details;
   SmallVector<ReassociationIndices> iterationReassociation =
       getCollapsibleIGEMMIterationGroups(expandedDetails.igemmContractionMaps,
                                          expandedDetails.igemmLoopIterators);
@@ -1057,6 +1460,10 @@ collapseIGEMMGenericConvDetails(const IGEMMGenericConvDetails &expandedDetails,
     result.im2colOutputPerm = computeIm2colOutputPermutation(
         result.igemmContractionMaps[inputMapIndex], result.convDims,
         result.convToIgemmDimMap);
+    if (failed(
+            finalizeIm2colMetadata(result, expanded.im2colSourceMetadata))) {
+      return failure();
+    }
     return result;
   }
 
@@ -1082,18 +1489,26 @@ collapseIGEMMGenericConvDetails(const IGEMMGenericConvDetails &expandedDetails,
   collapsedDetails.im2colOutputPerm = computeIm2colOutputPermutation(
       collapsedInputMap, collapsedDetails.convDims,
       collapsedDetails.convToIgemmDimMap);
+  if (failed(finalizeIm2colMetadata(collapsedDetails,
+                                    expanded.im2colSourceMetadata))) {
+    return failure();
+  }
   return collapsedDetails;
 }
 
 FailureOr<IGEMMGenericConvDetails>
 getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
-  FailureOr<IGEMMGenericConvDetails> expandedDetails =
+  FailureOr<ExpandedIGEMMGenericConvDetails> expandedDetails =
       getExpandedIGEMMGenericConvDetails(linalgOp);
   if (failed(expandedDetails)) {
     return failure();
   }
-  return collapseIGEMMGenericConvDetails(*expandedDetails,
-                                         linalgOp->getContext());
+  FailureOr<IGEMMGenericConvDetails> collapsedDetails =
+      collapseIGEMMGenericConvDetails(*expandedDetails, linalgOp->getContext());
+  if (failed(collapsedDetails)) {
+    return failure();
+  }
+  return *collapsedDetails;
 }
 
 //===---------------------------------------------------------------------===//

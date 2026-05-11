@@ -55,88 +55,6 @@ static SmallVector<NamedAttribute> getPrunedAttributeList(linalg::LinalgOp op) {
   return prunedAttributeList;
 }
 
-// Computes `inputKPerm` for the im2col op. Each non-batch input dimension
-// contributes exactly one K-output coordinate: a window offset for spatial M
-// dims, a trivial size-1 offset for conv batch M dims, or a channel coordinate
-// for K dims. The permutation maps each position in output-K delinearization
-// order to the position of the corresponding input dim in input-dim iteration
-// order (ascending over non-batch input dims).
-//
-// Output-K order is:
-//   [conv batch M coords (input-dim ascending order),
-//    filter-reduction coords (in filter map order: inputChannel + filterLoop)]
-static FailureOr<SmallVector<int64_t>>
-computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
-                  const mlir::linalg::ConvolutionDimensions &convDims,
-                  ArrayRef<int64_t> batchPos,
-                  ArrayRef<int64_t> mBatchInputDims) {
-  // Map from input dim to its position in input-dim iteration order (ascending
-  // over non-batch dims).
-  int64_t inputRank = inputMap.getNumResults();
-  llvm::SmallDenseSet<int64_t, 4> batchSet(batchPos.begin(), batchPos.end());
-  DenseMap<int64_t, int64_t> inputDimToIterPos;
-  int64_t iterPos = 0;
-  for (int64_t d = 0; d < inputRank; ++d) {
-    if (!batchSet.contains(d)) {
-      inputDimToIterPos[d] = iterPos++;
-    }
-  }
-
-  SmallVector<int64_t> inputKPerm;
-  llvm::SmallDenseSet<int64_t, 8> usedInputDims;
-  auto appendInputDim = [&](int64_t inputDim) -> LogicalResult {
-    auto it = inputDimToIterPos.find(inputDim);
-    if (it == inputDimToIterPos.end()) {
-      return failure();
-    }
-    if (!usedInputDims.insert(inputDim).second) {
-      return failure();
-    }
-    inputKPerm.push_back(it->second);
-    return success();
-  };
-
-  // Conv batch M K coords come first, in input-dim ascending order.
-  SmallVector<int64_t> sortedBatchM(mBatchInputDims);
-  llvm::sort(sortedBatchM);
-  for (int64_t inputDim : sortedBatchM) {
-    if (failed(appendInputDim(inputDim))) {
-      return failure();
-    }
-  }
-
-  // Filter reduction coords next, in filter map order. For each reduction dim
-  // that appears in the filter, locate the input dim that references it.
-  auto reductionDims =
-      llvm::concat<const unsigned>(convDims.inputChannel, convDims.filterLoop);
-  for (AffineExpr dimExpr : filterMap.getResults()) {
-    bool foundFilterReduction = false;
-    for (unsigned reductionDim : reductionDims) {
-      if (!dimExpr.isFunctionOfDim(reductionDim)) {
-        continue;
-      }
-      if (foundFilterReduction) {
-        return failure();
-      }
-      foundFilterReduction = true;
-      int64_t inputDim = -1;
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(reductionDim)) {
-          inputDim = idx;
-          break;
-        }
-      }
-      if (inputDim < 0 || failed(appendInputDim(inputDim))) {
-        return failure();
-      }
-    }
-  }
-  if (inputKPerm.size() != inputDimToIterPos.size()) {
-    return failure();
-  }
-  return inputKPerm;
-}
-
 namespace {
 
 using ControlFnTy = std::function<bool(Operation *)>;
@@ -200,244 +118,31 @@ public:
 
     SmallVector<AffineMap> igemmContractionMaps =
         igemmConvDetails.igemmContractionMaps;
-    mlir::linalg::ConvolutionDimensions convDims = igemmConvDetails.convDims;
     SmallVector<ReassociationIndices> filterReassocIndices =
         igemmConvDetails.filterReassocIndices;
     bool isOutputChannelFirst = igemmConvDetails.isOutputChannelFirst;
-    SmallVector<int64_t> igemmLoopBounds = igemmConvDetails.igemmLoopBounds;
     SmallVector<utils::IteratorType> igemmLoopIterators =
         igemmConvDetails.igemmLoopIterators;
+    const LinalgExt::Im2colMetadata &im2colMetadata =
+        igemmConvDetails.im2colMetadata;
 
     Value input = linalgOp.getDpsInputs()[0];
     Value filter = linalgOp.getDpsInputs()[1];
     Value output = linalgOp.getDpsInits()[0];
     auto inputType = cast<ShapedType>(input.getType());
-    auto filterType = cast<ShapedType>(filter.getType());
     auto outputType = cast<ShapedType>(output.getType());
 
-    ArrayRef<int64_t> filterShape = filterType.getShape();
-    ArrayRef<int64_t> outputShape = outputType.getShape();
-    ArrayRef<int64_t> inputShape = inputType.getShape();
-    SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
-    AffineMap inputMap = indexingMaps[0];
-    AffineMap filterMap = indexingMaps[1];
-    AffineMap outputMap = indexingMaps[2];
-
-    // The im2col dimension classification mirrors the GEMM roles:
-    //   batch_pos = GEMM batch = conv depth/group dims.
-    //   m_pos     = GEMM M     = conv batch dims and conv outputImage dims.
-    //   k_pos     = GEMM K     = conv inputChannel dims.
-    // Conv batch M dims use stride=dilation=kernel_size=1 and carry a size-1
-    // offset slot in the K output.
     SmallVector<int64_t> outputPerm = igemmConvDetails.im2colOutputPerm;
-    // Locate the input-tensor dim that uses a given conv iteration dim. Handles
-    // compound result exprs (e.g., `d_h + d_kh` for a spatial output dim).
-    auto getIm2colInputDim = [&](unsigned convDim) -> FailureOr<int64_t> {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(convDim)) {
-          return idx;
-        }
-      }
-      return failure();
-    };
-    auto getCanonicalPos = [&](unsigned convDim) -> int64_t {
-      AffineExpr igemmDimExpr = igemmConvDetails.convToIgemmDimMap.at(convDim);
-      int64_t igemmInputDim = igemmConvDetails.getIgemmInputImageMap()
-                                  .getResultPosition(igemmDimExpr)
-                                  .value();
-      return outputPerm[igemmInputDim];
-    };
-
-    // Build batch_pos from conv depth dims, positioned by canonical layout.
-    SmallVector<int64_t> batchPos(convDims.depth.size());
-    for (unsigned convDim : convDims.depth) {
-      int64_t canonicalPos = getCanonicalPos(convDim);
-      FailureOr<int64_t> inputDim = getIm2colInputDim(convDim);
-      if (failed(inputDim)) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "conv dim not found in input map");
-      }
-      batchPos[canonicalPos] = *inputDim;
-    }
-    const int64_t numBatch = batchPos.size();
-
-    // Build m_pos from conv batch + outputImage dims, positioned by canonical
-    // layout. Track per-entry stride/dilation/kernel_size and M output sizes.
-    const int64_t numM = convDims.batch.size() + convDims.outputImage.size();
-    SmallVector<int64_t> mPos(numM, -1);
-    SmallVector<int64_t> mStrides(numM, 1);
-    SmallVector<int64_t> mDilations(numM, 1);
-    SmallVector<OpFoldResult> mKernelSizes(numM, rewriter.getIndexAttr(1));
-    SmallVector<int64_t> mShape(numM, -1);
-    SmallVector<char> mSlotAssigned(numM, false);
-    SmallVector<int64_t> mBatchInputDims;
-    auto assignMSlot = [&](int64_t canonicalPos) -> FailureOr<int64_t> {
-      int64_t mSlot = canonicalPos - numBatch;
-      if (mSlot < 0 || mSlot >= numM || mSlotAssigned[mSlot]) {
-        return failure();
-      }
-      mSlotAssigned[mSlot] = true;
-      return mSlot;
-    };
-    for (auto [spatialIdx, outputImageDim] :
-         llvm::enumerate(convDims.outputImage)) {
-      int64_t canonicalPos = getCanonicalPos(outputImageDim);
-      FailureOr<int64_t> mSlot = assignMSlot(canonicalPos);
-      if (failed(mSlot)) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "failed to assign im2col M slot");
-      }
-      FailureOr<int64_t> inputDim = getIm2colInputDim(outputImageDim);
-      if (failed(inputDim)) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "conv dim not found in input map");
-      }
-      int64_t slot = *mSlot;
-      int64_t dim = *inputDim;
-      mPos[slot] = dim;
-      mStrides[slot] = convDims.strides[spatialIdx];
-      mDilations[slot] = convDims.dilations[spatialIdx];
-      unsigned filterLoopDim = convDims.filterLoop[spatialIdx];
-      std::optional<int64_t> maybeFilterDim = filterMap.getResultPosition(
-          getAffineDimExpr(filterLoopDim, filterMap.getContext()));
-      if (!maybeFilterDim) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "failed to infer filter shape");
-      }
-      mKernelSizes[slot] =
-          rewriter.getIndexAttr(filterShape[maybeFilterDim.value()]);
-      // Output spatial size lives in the conv output tensor.
-      std::optional<int64_t> maybeOutDim = outputMap.getResultPosition(
-          getAffineDimExpr(outputImageDim, outputMap.getContext()));
-      if (!maybeOutDim) {
-        return rewriter.notifyMatchFailure(
-            linalgOp, "output image dim not found in output map");
-      }
-      mShape[slot] = outputShape[maybeOutDim.value()];
-    }
-    for (unsigned batchDim : convDims.batch) {
-      int64_t canonicalPos = getCanonicalPos(batchDim);
-      FailureOr<int64_t> mSlot = assignMSlot(canonicalPos);
-      if (failed(mSlot)) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "failed to assign im2col M slot");
-      }
-      FailureOr<int64_t> inputDim = getIm2colInputDim(batchDim);
-      if (failed(inputDim)) {
-        return rewriter.notifyMatchFailure(linalgOp,
-                                           "conv dim not found in input map");
-      }
-      int64_t slot = *mSlot;
-      int64_t dim = *inputDim;
-      mPos[slot] = dim;
-      // Conv batch M uses stride=dilation=kernel=1 (already initialized).
-      mShape[slot] = inputShape[dim];
-      mBatchInputDims.push_back(dim);
-    }
-    if (llvm::any_of(mSlotAssigned, [](char assigned) { return !assigned; })) {
-      return rewriter.notifyMatchFailure(linalgOp,
-                                         "failed to assign all im2col M slots");
-    }
-    const int64_t numBatchM = static_cast<int64_t>(mBatchInputDims.size());
-
-    SmallVector<int64_t> kPos;
-    for (auto reductionDim : convDims.inputChannel) {
-      for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-        if (e.isFunctionOfDim(reductionDim)) {
-          kPos.push_back(idx);
-        }
-      }
-    }
-    FailureOr<SmallVector<int64_t>> inputKPerm = computeInputKPerm(
-        inputMap, filterMap, convDims, batchPos, mBatchInputDims);
-    if (failed(inputKPerm)) {
-      return rewriter.notifyMatchFailure(linalgOp,
-                                         "failed to infer input K permutation");
-    }
-
-    // Classify each original filter dim as parallel, inputChannel, or
-    // filterLoop, for partitioning the K output inner sizes.
-    llvm::SmallDenseSet<int64_t, 4> parallelFilterDims;
-    for (auto iterDim :
-         llvm::concat<const unsigned>(convDims.depth, convDims.outputChannel)) {
-      std::optional<int64_t> maybeDim = filterMap.getResultPosition(
-          getAffineDimExpr(iterDim, filterMap.getContext()));
-      if (maybeDim) {
-        parallelFilterDims.insert(maybeDim.value());
-      }
-    }
-    llvm::SmallDenseSet<int64_t, 4> inputChannelFilterDims;
-    for (unsigned iterDim : convDims.inputChannel) {
-      std::optional<int64_t> maybeDim = filterMap.getResultPosition(
-          getAffineDimExpr(iterDim, filterMap.getContext()));
-      if (maybeDim) {
-        inputChannelFilterDims.insert(maybeDim.value());
-      }
-    }
-
-    // Collect K output dim inner sizes from filter reassociation indices,
-    // separated into inputChannel and filterLoop groups. The canonical
-    // im2col output order is: [batch, M, inputChannel K, filterLoop K].
-    SmallVector<SmallVector<int64_t>> inputChannelInnerSizes;
-    SmallVector<SmallVector<int64_t>> filterLoopInnerSizes;
-    for (const auto &indices : filterReassocIndices) {
-      bool isParallel =
-          indices.size() == 1 && parallelFilterDims.contains(indices[0]);
-      if (isParallel) {
-        continue;
-      }
-      SmallVector<int64_t> innerSizes;
-      for (int64_t idx : indices) {
-        innerSizes.push_back(filterShape[idx]);
-      }
-      // Classify as inputChannel if all filter dims in the group are
-      // inputChannel dims; otherwise classify as filterLoop.
-      bool isInputChannel = llvm::all_of(indices, [&](int64_t idx) {
-        return inputChannelFilterDims.contains(idx);
-      });
-      if (isInputChannel) {
-        inputChannelInnerSizes.push_back(innerSizes);
-      } else {
-        filterLoopInnerSizes.push_back(innerSizes);
-      }
-    }
-
-    // Each conv batch M input dim contributes a size-1 offset slot to the K
-    // output. Prepend them to the first non-empty canonical K group to
-    // preserve the existing split between input-channel and filter-loop output
-    // dims while making the K delinearization cover every non-batch input dim in
-    // the same order used by input_k_perm.
-    if (numBatchM > 0) {
-      if (inputChannelInnerSizes.empty() && filterLoopInnerSizes.empty()) {
-        return rewriter.notifyMatchFailure(
-            linalgOp, "expected at least one K output dim with batch M dims");
-      }
-      SmallVector<int64_t> &firstK = inputChannelInnerSizes.empty()
-                                         ? filterLoopInnerSizes.front()
-                                         : inputChannelInnerSizes.front();
-      firstK.insert(firstK.begin(), numBatchM, 1);
-    }
-
-    int64_t numOutputDims = numBatch + numM + inputChannelInnerSizes.size() +
-                            filterLoopInnerSizes.size();
-    SmallVector<OpFoldResult> offsets(numOutputDims, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> mKernelSizes =
+        getAsIndexOpFoldResult(getContext(), im2colMetadata.kernelSizes);
     SmallVector<SmallVector<OpFoldResult>> outputSizes;
-    // Batch dims: each has a single inner size equal to the input dim size.
-    for (int64_t dim : batchPos) {
-      outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
-    }
-    // M dims: one output dim per m_pos entry (conv batch + spatial).
-    for (int64_t m : mShape) {
-      outputSizes.push_back({rewriter.getIndexAttr(m)});
-    }
-    // InputChannel K dims first, then filterLoop K dims. Conv batch M offset
-    // slots live as size-1 prefixes inside the first K group.
-    for (const auto &innerSizes : inputChannelInnerSizes) {
+    outputSizes.reserve(im2colMetadata.outputSizes.size());
+    for (const SmallVector<int64_t> &innerSizes :
+         im2colMetadata.outputSizes) {
       outputSizes.push_back(getAsIndexOpFoldResult(getContext(), innerSizes));
     }
-    for (const auto &innerSizes : filterLoopInnerSizes) {
-      outputSizes.push_back(getAsIndexOpFoldResult(getContext(), innerSizes));
-    }
+    int64_t numOutputDims = outputSizes.size();
+    SmallVector<OpFoldResult> offsets(numOutputDims, rewriter.getIndexAttr(0));
 
     auto loc = linalgOp.getLoc();
     // Shape of the resulting tensor from im2col. Each output dim is the
@@ -461,9 +166,10 @@ public:
                                               inputType.getElementType());
     Value img2ColTensor =
         IREE::LinalgExt::Im2colOp::create(
-            rewriter, loc, input, /*output=*/colTensor, mStrides, mDilations,
-            mKernelSizes, offsets, outputSizes, batchPos, mPos, kPos,
-            *inputKPerm, outputPerm)
+            rewriter, loc, input, /*output=*/colTensor,
+            im2colMetadata.strides, im2colMetadata.dilations, mKernelSizes,
+            offsets, outputSizes, im2colMetadata.batchPos, im2colMetadata.mPos,
+            im2colMetadata.kPos, im2colMetadata.inputKPerm, outputPerm)
             .getResult(0);
 
     Value reshapedFilter = tensor::CollapseShapeOp::create(
