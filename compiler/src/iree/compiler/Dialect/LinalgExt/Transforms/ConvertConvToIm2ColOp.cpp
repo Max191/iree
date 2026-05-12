@@ -92,6 +92,7 @@ computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
   return inputKPerm;
 }
 
+/// Returns the first dim in `dims` that `expr` depends on, if any.
 static std::optional<unsigned> findFunctionOfDim(AffineExpr expr,
                                                  ArrayRef<unsigned> dims) {
   for (unsigned dim : dims) {
@@ -102,6 +103,7 @@ static std::optional<unsigned> findFunctionOfDim(AffineExpr expr,
   return std::nullopt;
 }
 
+/// Returns the first result position in `map` that depends on `dim`, if any.
 static std::optional<int64_t> getResultPositionForDim(AffineMap map,
                                                       unsigned dim) {
   for (auto [idx, expr] : llvm::enumerate(map.getResults())) {
@@ -112,6 +114,12 @@ static std::optional<int64_t> getResultPositionForDim(AffineMap map,
   return std::nullopt;
 }
 
+/// Expands `input_k_perm` after conv batch dims are reclassified as M dims.
+///
+/// Conv batch dims have synthetic unit kernel-window coordinates prepended to
+/// the K output order. `input_k_perm` maps K output order to input shared-dim
+/// order, so this shifts existing output-order indices by the number of
+/// synthetic dims and inserts each synthetic dim at its input-map position.
 static FailureOr<SmallVector<int64_t>> expandInputKPermForBatchMDims(
     AffineMap inputMap, ArrayRef<int64_t> inputKPerm,
     const mlir::linalg::ConvolutionDimensions &convDims) {
@@ -121,34 +129,34 @@ static FailureOr<SmallVector<int64_t>> expandInputKPermForBatchMDims(
 
   SmallVector<int64_t> inverseInputKPerm =
       invertPermutationVector(inputKPerm);
-  SmallVector<int64_t> expandedInverseInputKPerm;
-  int64_t oldInputKIndex = 0;
-  int64_t syntheticOutputIndex = 0;
   int64_t numSyntheticBatchDims = convDims.batch.size();
-  auto reductionDims =
-      llvm::concat<const unsigned>(convDims.inputChannel, convDims.filterLoop);
+  for (int64_t &outputOrderIndex : inverseInputKPerm) {
+    outputOrderIndex += numSyntheticBatchDims;
+  }
 
-  for (AffineExpr inputExpr : inputMap.getResults()) {
+  SmallVector<unsigned> inputKPermDims;
+  llvm::append_range(inputKPermDims, convDims.inputChannel);
+  llvm::append_range(inputKPermDims, convDims.filterLoop);
+  int64_t numSharedDimsSeen = 0;
+  int64_t syntheticOutputIndex = numSyntheticBatchDims;
+
+  for (AffineExpr inputExpr : llvm::reverse(inputMap.getResults())) {
     if (findFunctionOfDim(inputExpr, convDims.batch)) {
-      expandedInverseInputKPerm.push_back(syntheticOutputIndex++);
+      inverseInputKPerm.insert(inverseInputKPerm.end() - numSharedDimsSeen,
+                               --syntheticOutputIndex);
+      ++numSharedDimsSeen;
       continue;
     }
-    for (unsigned reductionDim : reductionDims) {
-      if (inputExpr.isFunctionOfDim(reductionDim)) {
-        if (oldInputKIndex >= static_cast<int64_t>(inverseInputKPerm.size())) {
-          return failure();
-        }
-        expandedInverseInputKPerm.push_back(
-            inverseInputKPerm[oldInputKIndex++] + numSyntheticBatchDims);
-      }
+    if (findFunctionOfDim(inputExpr, inputKPermDims)) {
+      ++numSharedDimsSeen;
     }
   }
 
-  if (syntheticOutputIndex != numSyntheticBatchDims ||
-      oldInputKIndex != static_cast<int64_t>(inputKPerm.size())) {
+  if (syntheticOutputIndex != 0 ||
+      inverseInputKPerm.size() != inputKPerm.size() + numSyntheticBatchDims) {
     return failure();
   }
-  return invertPermutationVector(expandedInverseInputKPerm);
+  return invertPermutationVector(inverseInputKPerm);
 }
 
 namespace {
@@ -256,16 +264,9 @@ public:
         batchPos.push_back(inputDim);
         continue;
       }
-      if (std::optional<unsigned> batchDim =
-              findFunctionOfDim(inputExpr, convDims.batch)) {
-        std::optional<int64_t> outputDim =
-            getResultPositionForDim(outputMap, *batchDim);
-        if (!outputDim) {
-          return rewriter.notifyMatchFailure(
-              linalgOp, "Failed to infer output batch shape.");
-        }
+      if (findFunctionOfDim(inputExpr, convDims.batch)) {
         mPos.push_back(inputDim);
-        mShape.push_back(outputShape[*outputDim]);
+        mShape.push_back(inputShape[inputDim]);
         im2colStrides.push_back(1);
         im2colDilations.push_back(1);
         kernelSizes.push_back(rewriter.getIndexAttr(1));
@@ -378,16 +379,12 @@ public:
     for (const auto &innerSizes : filterLoopInnerSizes) {
       kOutputSizes.push_back(getAsIndexOpFoldResult(getContext(), innerSizes));
     }
+    assert(!kOutputSizes.empty() &&
+           "expected at least one K output dim for convolution");
     if (numSyntheticBatchMDims > 0) {
-      SmallVector<OpFoldResult> syntheticBatchWindowSizes(
-          numSyntheticBatchMDims, rewriter.getIndexAttr(1));
-      if (kOutputSizes.empty()) {
-        kOutputSizes.push_back(std::move(syntheticBatchWindowSizes));
-      } else {
-        kOutputSizes.front().insert(kOutputSizes.front().begin(),
-                                    syntheticBatchWindowSizes.begin(),
-                                    syntheticBatchWindowSizes.end());
-      }
+      kOutputSizes.front().insert(kOutputSizes.front().begin(),
+                                  numSyntheticBatchMDims,
+                                  rewriter.getIndexAttr(1));
     }
 
     int64_t numOutputDims =
@@ -398,7 +395,7 @@ public:
     for (int64_t dim : batchPos) {
       outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
     }
-    // M dims: each spatial output dim is a separate output dimension.
+    // M dims: each batch or spatial output dim is a separate output dimension.
     for (int64_t m : mShape) {
       outputSizes.push_back({rewriter.getIndexAttr(m)});
     }
