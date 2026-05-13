@@ -281,6 +281,11 @@ static void addGPUVectorizationPasses(OpPassManager &funcPassManager,
   if (enableMasking) {
     funcPassManager.addPass(createMaterializeVectorTileSizesPass());
   }
+  // Normalize map_store affine index expressions before deriving vectorization
+  // hints. LLVMGPU enables vectorizeMapStore below, and generic vectorization
+  // consumes the resulting transfer_scatter indexing metadata.
+  funcPassManager.addPass(createPreVectorizationAffineIndexCleanupPass());
+  funcPassManager.addPass(createAnnotateMapStoreContiguousDimHintsPass());
   // Vectorize.
   GenericVectorizationPassOptions options;
   options.vectorizeCopies = vectorizeCopies;

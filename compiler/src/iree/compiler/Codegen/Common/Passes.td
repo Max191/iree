@@ -647,7 +647,11 @@ def GenericVectorizationPass :
             /*default=*/"2147483647",
            "Max vector size allowed to avoid creating large vectors.">,
     Option<"vectorizeMapStore", "vectorize-map-store", "bool", /*default=*/"false",
-      "Enable vectorization of iree_linalg_ext.map_store operations via VectorizableOpInterface.">
+      "Enable vectorization of iree_linalg_ext.map_store operations via "
+      "VectorizableOpInterface. Pipelines relying on inferred transfer_scatter "
+      "indexing metadata should run "
+      "iree-codegen-pre-vectorization-affine-index-cleanup and "
+      "iree-codegen-annotate-map-store-contiguous-dim-hints first.">
   ];
   let dependentDialects = [
     "::mlir::arith::ArithDialect"
