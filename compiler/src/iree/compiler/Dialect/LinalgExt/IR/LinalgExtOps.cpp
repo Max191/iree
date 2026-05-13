@@ -2790,14 +2790,15 @@ LogicalResult Im2colOp::verify() {
            << ")";
   }
 
-  // Verify inner sizes for each output dim type (Batch, M, K) separately.
-  // Output dims in canonical order are: [Batch..., M..., K...].
+  // Verify inner sizes for each output dim type (batch_pos, M, K) separately.
+  // Output dims in canonical order are: [batch_pos..., M..., K...].
   //
   // Batch output dims: each produces 1 coordinate (batch index).
   //   -> total inner sizes across all batch dims = batchPos.size()
   //
-  // M output dims: collectively produce mPos.size() coordinates
-  //   (spatial output positions, one per spatial dimension).
+  // M output dims: collectively produce mPos.size() coordinates. For
+  // convolution lowering, these include convolution batch and output spatial
+  // positions.
   //   -> total inner sizes across all M dims = mPos.size()
   //
   // K output dims: collectively produce (mPos.size() + kPos.size())
@@ -2947,12 +2948,13 @@ LogicalResult Im2colOp::verify() {
         "expected pad_value when output_pad_low/output_pad_high are specified");
   }
 
-  // Note: batch dim shapes between input and output are intentionally NOT
-  // verified. With offset-based batch indexing, the output batch dim can be:
+  // Note: batch_pos dim shapes between input and output are intentionally NOT
+  // verified. With offset-based batch_pos indexing, the output batch_pos dim
+  // can be:
   //   - smaller (tiled: output is a tile, input is the full tensor)
   //   - equal (untiled case)
   //   - larger (output padding for alignment, e.g. tile=64, actual=56)
-  // The output_sizes attribute encodes the valid batch region; padding and
+  // The output_sizes attribute encodes the valid batch_pos region; padding and
   // bounds checking are handled by computeIm2colValidSize.
 
   return success();

@@ -37,7 +37,7 @@ Im2colSourceIndices computeIm2colSourceIndices(OpBuilder &b, Location loc,
   ArrayRef<int64_t> inputKPerm = im2colOp.getInputKPerm();
 
   // Phase 1: Delinearize all canonical output dims uniformly.
-  // Canonical order is [batch..., M..., K...]. For each dim d,
+  // Canonical order is [batch_pos..., M..., K...]. For each dim d,
   // delinearize (offset[d] + iv[actualDim]) using output_sizes[d].
   SmallVector<int64_t> inverseOutputPerm =
       invertPermutationVector(im2colOp.getOutputPerm());
@@ -67,7 +67,7 @@ Im2colSourceIndices computeIm2colSourceIndices(OpBuilder &b, Location loc,
     }
   }
 
-  // Phase 2: Split delinearized coords into batch, M, K groups.
+  // Phase 2: Split delinearized coords into batch_pos, M, K groups.
   auto it = allCoords.begin();
   SmallVector<Value> batchCoords(it, it + batchCoordCount);
   it += batchCoordCount;
@@ -352,9 +352,9 @@ static bool willBeContiguousSlice(OpFoldResult inputSize, OpFoldResult tileSize,
          affineOp.getMap().getResult(0).isMultipleOf(constTileSize.value());
 }
 
-/// Returns true when an M output dim indexes the input like a batch dim: one
-/// output step corresponds to one contiguous input step, with no non-unit
-/// window, stride, or dilation semantics.
+/// Returns true when an M output dim is a contiguous pass-through dim: one
+/// output step corresponds to one input step, with no non-unit window, stride,
+/// or dilation semantics.
 static bool isUnitWindowMOutputDim(Im2colOp im2colOp, int64_t outputDim) {
   SmallVector<int64_t> mOutputDims = im2colOp.getMOutputDims();
   auto it = llvm::find(mOutputDims, outputDim);

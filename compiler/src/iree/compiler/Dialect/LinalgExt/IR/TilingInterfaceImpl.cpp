@@ -2551,7 +2551,7 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
       getSlice(builder, loc, getOutput(), offsets, sizes, outputStrides);
 
   // Adjust offsets by adding the tiling offsets. The offsets are in canonical
-  // [Batch, M, K] order, and output_perm[actual] = canonical, so we use
+  // [batch_pos, M, K] order, and output_perm[actual] = canonical, so we use
   // output_perm directly to map actual tensor dims to canonical positions.
   SmallVector<OpFoldResult> newOffsets(getMixedOffsets());
   ArrayRef<int64_t> outPerm = getOutputPerm();

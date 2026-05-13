@@ -922,7 +922,7 @@ func.func @masked_tensor_multi_mma(%lhs: tensor<?x?x4xf16>, %rhs: tensor<?x?x4xf
 
 // Standard NHWC layout, K tile size (4) divides innermost input dim C (640).
 // Vectorizes along K (output dim 2) with vector width 4.
-// Non-vectorized dims: batch (2) x M (2) = 4 iterations.
+// Non-vectorized dims: batch_pos (2) x M (2) = 4 iterations.
 #im2col_map_k = affine_map<(d0) -> (d0 * 4)>
 func.func @im2col_vectorize_nhwc(
     %input: tensor<2x34x34x640xf32>, %m_off: index, %k: index

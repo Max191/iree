@@ -350,7 +350,8 @@ public:
 
     // Collect K output dim inner sizes from filter reassociation indices,
     // separated into inputChannel and filterLoop groups. The canonical
-    // im2col output order is: [batch, M, inputChannel K, filterLoop K].
+    // im2col output order is: [batch_pos dims, M, inputChannel K,
+    // filterLoop K].
     SmallVector<SmallVector<int64_t>> inputChannelInnerSizes;
     SmallVector<SmallVector<int64_t>> filterLoopInnerSizes;
     for (const auto &indices : filterReassocIndices) {

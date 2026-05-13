@@ -427,10 +427,11 @@ bool isGatherlikeOp(Operation *op) {
 //===---------------------------------------------------------------------===//
 
 /// Classification of IGEMM dims from the image/im2col perspective.
-/// Batch includes depth (group) dims. M includes batch and output spatial dims.
+/// batch_pos includes depth (group) dims. M includes convolution batch and
+/// output spatial dims.
 /// InputChannel and FilterLoop are the two subcategories of reduction dims.
 /// The canonical im2col output order is:
-///   [Batch, M, InputChannel, FilterLoop].
+///   [batch_pos dims, M, InputChannel, FilterLoop].
 enum class Im2colDimKind {
   Batch,
   M,

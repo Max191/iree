@@ -613,9 +613,10 @@ func.func @inner_tiled_dynamic(
 
 // -----
 
-// Im2col: basic NHWC vectorization along K (output dim 2). K tile size (4)
-// divides the innermost input dim C (640), so the analysis picks dim 2 as
-// the vectorized dim with full size 4, and tiles the batch and M dims to 1.
+// Im2col: basic vectorization along K (output dim 2) with an explicit
+// batch_pos dim. K tile size (4) divides the innermost input dim C (640), so
+// the analysis picks dim 2 as the vectorized dim with full size 4, and tiles
+// the batch_pos and M dims to 1.
 
 #im2col_map_k = affine_map<(d0) -> (d0 * 4)>
 // CHECK-LABEL: @im2col_tile_sizes_nhwc
