@@ -34,7 +34,7 @@ static llvm::cl::opt<bool> clTestAlwaysCollapseParallelIGEMMDims(
     "test-always-collapse-parallel-igemm-dims",
     llvm::cl::desc("Collapse parallel dimensions when computing IGEMM "
                    "convolution details"),
-    llvm::cl::Hidden, llvm::cl::init(false));
+    llvm::cl::Hidden, llvm::cl::init(true));
 
 static bool hasAllOneValues(ArrayRef<int64_t> attr) {
   return llvm::all_of(attr, [](int64_t element) { return element == 1; });
