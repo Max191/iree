@@ -878,6 +878,35 @@ def MaterializeVectorTileSizesPass :
   }];
 }
 
+def AnnotateMapStoreContiguousDimHintsPass :
+    InterfacePass<"iree-codegen-annotate-map-store-contiguous-dim-hints",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Annotate transfer_scatter indexing metadata on map_store ops";
+  let description = [{
+    Annotates `iree_linalg_ext.map_store` ops with
+    `transfer_scatter_indexing_map` metadata. The analysis is seeded with
+    map_store input indices and solved for each unannotated map_store op. For
+    each output index whose dependency on input indices has a fully known
+    affine expression, the pass emits that expression over input vector dims.
+    Output indices with unknown, unsupported, or invalidated dependencies are
+    represented by fresh symbols, which the vectorizer materializes from full
+    index vectors. Ops with existing `transfer_scatter_indexing_map` or legacy
+    `contiguous_dim_hints` are treated as already annotated.
+
+    The generated map captures only the seed/input-index contribution. Affine
+    constants and dynamic seed-independent offsets are intentionally excluded
+    from the map and remain implicit; the map_store vectorization path
+    materializes those offsets from the original yielded indices by replacing
+    input index block arguments with zero.
+
+    This pass intentionally materializes metadata for every visited unannotated
+    map_store after a successful analysis. When an output index cannot be
+    proven affine in the input indices, its result is represented by a symbol.
+    If analysis fails, the pass leaves `transfer_scatter_indexing_map` unset
+    rather than failing compilation because the metadata is optional.
+  }];
+}
+
 def MaterializeTuningSpecsPass : Pass<"iree-codegen-materialize-tuning-specs", "ModuleOp"> {
   let summary =
       "Load tuning spec transform dialect libraries and encode them in the module";
