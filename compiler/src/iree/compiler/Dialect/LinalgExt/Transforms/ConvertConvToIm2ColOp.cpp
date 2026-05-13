@@ -56,8 +56,8 @@ static SmallVector<NamedAttribute> getPrunedAttributeList(linalg::LinalgOp op) {
   return prunedAttributeList;
 }
 
-// Computes `inputKPerm` that maps the input spatial and channel dimension order
-// to filter's.
+// Computes `inputKPerm` for the real shared K dims before synthetic conv-batch
+// M dims are inserted.
 static SmallVector<int64_t>
 computeInputKPerm(AffineMap inputMap, AffineMap filterMap,
                   const mlir::linalg::ConvolutionDimensions &convDims) {
@@ -193,9 +193,10 @@ using ControlFnTy = std::function<bool(Operation *)>;
 //
 // In general for 2D case with (N, H, W, C) input and (Kh, Kw, C, D) filter
 // and output (N, Ho, Wo, D) the convolution is the following matrix-matrix
-// multiplication (Ho x Wo, Kh x Kw x C) * (Kh x Kw x C, D) for each input in
-// the N batches. For the case where N > 1 its a batched matrxi-matrix
-// multiplication.
+// multiplication ((N x Ho x Wo), Kh x Kw x C) * (Kh x Kw x C, D). The
+// convolution batch dimension only indexes the image/output operands, so it is
+// represented as an M dimension in the im2col/GEMM metadata rather than as a
+// GEMM batch dimension.
 
 class ConvertConvGeneric final
     : public OpInterfaceRewritePattern<linalg::LinalgOp> {
@@ -321,7 +322,9 @@ public:
     inputKPerm = *expandedInputKPerm;
 
     // Build unified offsets and output_sizes for the im2col op.
-    // Canonical output dim order: [batch, M, inputChannel K, filterLoop K].
+    // Canonical output dim order: [batch_pos dims, M, inputChannel K,
+    // filterLoop K]. For convolutions, batch_pos is used for depth-like dims;
+    // convolution batch dims are M dims with synthetic unit window metadata.
     // At conv-to-im2col time all offsets are zero.
 
     // Classify each original filter dim as parallel, inputChannel, or
@@ -395,11 +398,12 @@ public:
     for (int64_t dim : batchPos) {
       outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
     }
-    // M dims: each batch or spatial output dim is a separate output dimension.
+    // M dims: each convolution batch or spatial output dim is a separate output
+    // dimension.
     for (int64_t m : mShape) {
       outputSizes.push_back({rewriter.getIndexAttr(m)});
     }
-    // Synthetic batch-window K coords first, then inputChannel K dims, then
+    // Synthetic conv-batch unit K coords first, then inputChannel K dims, then
     // filterLoop K dims.
     for (const auto &innerSizes : kOutputSizes) {
       outputSizes.push_back(innerSizes);

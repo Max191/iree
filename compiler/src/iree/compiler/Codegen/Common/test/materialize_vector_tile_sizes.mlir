@@ -638,8 +638,8 @@ func.func @im2col_tile_sizes_nhwc(
 
 // -----
 
-// Im2col: unit-window M dims index the input like batch dims and are
-// vectorizable when they are the innermost input dim.
+// Im2col: unit-window M dims index the input as contiguous pass-through dims
+// and are vectorizable when they are the innermost input dim.
 
 // CHECK-LABEL: @im2col_tile_sizes_unit_m_dim
 func.func @im2col_tile_sizes_unit_m_dim(
@@ -659,7 +659,7 @@ func.func @im2col_tile_sizes_unit_m_dim(
 
 // -----
 
-// Im2col: non-unit stride M dims cannot use the batch-like contiguous path.
+// Im2col: non-unit stride M dims cannot use the unit-window contiguous path.
 
 // CHECK-LABEL: @im2col_tile_sizes_strided_m_dim
 func.func @im2col_tile_sizes_strided_m_dim(

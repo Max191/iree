@@ -956,7 +956,7 @@ func.func @im2col_vectorize_nhwc(
 
 // Unit-window M dim. This is the shape produced when a convolution batch dim is
 // reclassified as an im2col M dim: the synthetic window metadata is all ones, so
-// the M dim is contiguous like an im2col batch dim.
+// the M dim is a contiguous pass-through dim.
 func.func @im2col_vectorize_unit_m_dim(
     %input: tensor<1x16xf32>
 ) -> tensor<1x16x1xf32> {
