@@ -10,6 +10,7 @@
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -28,6 +29,12 @@
 #define DEBUG_TYPE "iree-linalgExt-utils"
 
 namespace mlir::iree_compiler::IREE::LinalgExt {
+
+static llvm::cl::opt<bool> clTestAlwaysCollapseParallelIGEMMDims(
+    "test-always-collapse-parallel-igemm-dims",
+    llvm::cl::desc("Collapse parallel dimensions when computing IGEMM "
+                   "convolution details"),
+    llvm::cl::Hidden, llvm::cl::init(false));
 
 static bool hasAllOneValues(ArrayRef<int64_t> attr) {
   return llvm::all_of(attr, [](int64_t element) { return element == 1; });
@@ -880,19 +887,26 @@ static DenseMap<int64_t, AffineExpr> collapseConvToIgemmDimMap(
   return collapsedMap;
 }
 
-/// Identifies groups of adjacent reduction dims that can be collapsed.
-/// Two adjacent reduction dims can be collapsed if they appear as a
-/// preserved sequence in all indexing maps (checked via
-/// areDimSequencesPreserved).
-static SmallVector<ReassociationIndices> getCollapsibleIGEMMIterationGroups(
-    ArrayRef<AffineMap> maps, ArrayRef<utils::IteratorType> iteratorTypes) {
+/// Identifies groups of adjacent dims with matching iterator types that can be
+/// collapsed. Two adjacent dims can be collapsed if they appear as a preserved
+/// sequence in all indexing maps (checked via areDimSequencesPreserved). When
+/// `collapseParallelDims` is false, parallel dims are kept as singleton groups.
+static SmallVector<ReassociationIndices>
+getCollapsibleIGEMMIterationGroups(ArrayRef<AffineMap> maps,
+                                   ArrayRef<utils::IteratorType> iteratorTypes,
+                                   bool collapseParallelDims) {
   SmallVector<ReassociationIndices> reassociation;
   int64_t rank = iteratorTypes.size();
   for (int64_t dim = 0; dim < rank;) {
+    if (!collapseParallelDims &&
+        iteratorTypes[dim] == utils::IteratorType::parallel) {
+      reassociation.push_back({dim});
+      ++dim;
+      continue;
+    }
     ReassociationIndices group = {dim};
-    while (iteratorTypes[dim] == utils::IteratorType::reduction &&
-           group.back() + 1 < rank &&
-           iteratorTypes[group.back() + 1] == utils::IteratorType::reduction) {
+    while (group.back() + 1 < rank &&
+           iteratorTypes[group.back() + 1] == iteratorTypes[dim]) {
       ReassociationIndices candidate = group;
       candidate.push_back(group.back() + 1);
       if (!linalg::areDimSequencesPreserved(maps, {candidate})) {
@@ -1038,10 +1052,11 @@ getExpandedIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
 /// types, filter reassociation indices, and im2col output permutation.
 static IGEMMGenericConvDetails
 collapseIGEMMGenericConvDetails(const IGEMMGenericConvDetails &expandedDetails,
-                                MLIRContext *ctx) {
+                                MLIRContext *ctx, bool collapseParallelDims) {
   SmallVector<ReassociationIndices> iterationReassociation =
       getCollapsibleIGEMMIterationGroups(expandedDetails.igemmContractionMaps,
-                                         expandedDetails.igemmLoopIterators);
+                                         expandedDetails.igemmLoopIterators,
+                                         collapseParallelDims);
   if (llvm::all_of(iterationReassociation, [](ReassociationIndicesRef group) {
         return group.size() == 1;
       })) {
@@ -1079,14 +1094,16 @@ collapseIGEMMGenericConvDetails(const IGEMMGenericConvDetails &expandedDetails,
 }
 
 FailureOr<IGEMMGenericConvDetails>
-getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
+getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp,
+                           bool collapseParallelDims) {
   FailureOr<IGEMMGenericConvDetails> expandedDetails =
       getExpandedIGEMMGenericConvDetails(linalgOp);
   if (failed(expandedDetails)) {
     return failure();
   }
-  return collapseIGEMMGenericConvDetails(*expandedDetails,
-                                         linalgOp->getContext());
+  collapseParallelDims |= clTestAlwaysCollapseParallelIGEMMDims;
+  return collapseIGEMMGenericConvDetails(
+      *expandedDetails, linalgOp->getContext(), collapseParallelDims);
 }
 
 //===---------------------------------------------------------------------===//

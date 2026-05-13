@@ -199,8 +199,12 @@ struct IGEMMGenericConvDetails {
 };
 
 /// Populate `IGEMMGenericConvDetails` for a given convolution operation.
+/// Collapses adjacent reduction dimensions by default. When
+/// `collapseParallelDims` is true, adjacent parallel dimensions are also
+/// collapsed when the IGEMM indexing maps preserve them.
 FailureOr<IGEMMGenericConvDetails>
-getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp);
+getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp,
+                           bool collapseParallelDims = false);
 
 /// Returns true if the operation increases bitwidths of tensors.
 /// This function checks that the genericOp:

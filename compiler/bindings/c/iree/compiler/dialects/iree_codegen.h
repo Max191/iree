@@ -149,12 +149,18 @@ struct ireeCodegenIGEMMGenericConvDetails {
 };
 
 // Checks if IGEMM generic convolution details can be queried for the given
-// operation.
-MLIR_CAPI_EXPORTED bool ireeCodegenHasIGEMMGenericConvDetails(MlirOperation op);
+// operation. If collapseParallelDims is true, adjacent parallel IGEMM
+// dimensions are also collapsed when possible.
+MLIR_CAPI_EXPORTED bool
+ireeCodegenHasIGEMMGenericConvDetails(MlirOperation op,
+                                      bool collapseParallelDims);
 
-// Gets IGEMM generic convolution details for the given operation.
+// Gets IGEMM generic convolution details for the given operation. If
+// collapseParallelDims is true, adjacent parallel IGEMM dimensions are also
+// collapsed when possible.
 MLIR_CAPI_EXPORTED ireeCodegenIGEMMGenericConvDetails
-ireeCodegenGetIGEMMGenericConvDetails(MlirOperation op);
+ireeCodegenGetIGEMMGenericConvDetails(MlirOperation op,
+                                      bool collapseParallelDims);
 
 struct ireeCodegenScaledContractionDimensions {
   // Batch dimension for scaled contraction (ArrayAttr).

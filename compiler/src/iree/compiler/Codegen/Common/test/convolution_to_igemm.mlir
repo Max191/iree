@@ -1,4 +1,4 @@
-// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-convolution-to-igemm),canonicalize,cse)" %s | FileCheck %s
+// RUN: iree-opt --test-always-collapse-parallel-igemm-dims --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-convolution-to-igemm),canonicalize,cse)" %s | FileCheck %s
 
 #map = affine_map<(d0, d1, d2, d3)->(d0, d1, d2, d3)>
 func.func public @conv_with_consumer(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<3x3x4x16xf32>) -> tensor<1x14x14x16xf16> {
@@ -18,16 +18,17 @@ func.func public @conv_with_consumer(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor
   return %2 : tensor<1x14x14x16xf16>
 }
 // CHECK:      func.func public @conv_with_consumer
-// CHECK-DAG:    %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}} -> tensor<1x14x14x36xf32>
-// CHECK-DAG:    %[[FILL:.+]] = linalg.fill {{.*}} -> tensor<1x14x14x16xf32>
+// CHECK-DAG:    %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}}output_sizes = {{\[}}[1, 14, 14], [1, 3, 3, 4]]{{.*}} -> tensor<196x36xf32>
+// CHECK-DAG:    %[[FILL:.+]] = linalg.fill {{.*}} -> tensor<196x16xf32>
 // CHECK:        %[[MATMUL:.+]] = linalg.generic
-// CHECK-SAME:     iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
-// CHECK-SAME:     ins(%[[IM2COL]], %{{.*}} : tensor<1x14x14x36xf32>
-// CHECK-SAME:     outs(%[[FILL]] : tensor<1x14x14x16xf32>)
+// CHECK-SAME:     iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK-SAME:     ins(%[[IM2COL]], %{{.*}} : tensor<196x36xf32>
+// CHECK-SAME:     outs(%[[FILL]] : tensor<196x16xf32>)
 // CHECK:        %[[TRUNCF:.+]] = linalg.generic
-// CHECK-SAME:     iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-// CHECK-SAME:     ins(%[[MATMUL]] : tensor<1x14x14x16xf32>)
-// CHECK:        return {{.*}} : tensor<1x14x14x16xf16>
+// CHECK-SAME:     iterator_types = ["parallel", "parallel"]
+// CHECK-SAME:     ins(%[[MATMUL]] : tensor<196x16xf32>)
+// CHECK:        %[[EXPANDED:.+]] = tensor.expand_shape %[[TRUNCF]] {{.*}} : tensor<196x16xf16> into tensor<1x14x14x16xf16>
+// CHECK:        return %[[EXPANDED]] : tensor<1x14x14x16xf16>
 
 // -----
 
@@ -60,13 +61,13 @@ module {
 // CHECK:      func.func @fold_with_interface_tensor
 // CHECK-DAG:  %[[LHS:.+]] = iree_tensor_ext.dispatch.tensor.load {{.*}} -> tensor<1x16x16x4xf32>
 // CHECK-DAG:  %[[RHS:.+]] = iree_tensor_ext.dispatch.tensor.load {{.*}} -> tensor<36x16xf32>
-// CHECK-DAG:  %[[RES:.+]] = iree_tensor_ext.dispatch.tensor.load {{.*}} -> tensor<1x14x14x16xf32>
-// CHECK-DAG:  %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}} ins(%[[LHS]] : tensor<1x16x16x4xf32>){{.*}}-> tensor<1x14x14x36xf32>
-// CHECK-DAG:  %[[FILL:.+]] = linalg.fill {{.*}}outs(%[[RES]] : tensor<1x14x14x16xf32>)
+// CHECK-DAG:  %[[RES:.+]] = iree_tensor_ext.dispatch.tensor.load {{.*}} -> tensor<196x16xf32>
+// CHECK-DAG:  %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}}output_sizes = {{\[}}[1, 14, 14], [1, 3, 3, 4]]{{.*}}ins(%[[LHS]] : tensor<1x16x16x4xf32>){{.*}}-> tensor<196x36xf32>
+// CHECK-DAG:  %[[FILL:.+]] = linalg.fill {{.*}}outs(%[[RES]] : tensor<196x16xf32>)
 // CHECK:      %[[MATMUL:.+]] = linalg.generic
-// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
-// CHECK-SAME:   ins(%[[IM2COL]], %[[RHS]] : tensor<1x14x14x36xf32>, tensor<36x16xf32>)
-// CHECK-SAME:   outs(%[[FILL]] : tensor<1x14x14x16xf32>) {
+// CHECK-SAME:   iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK-SAME:   ins(%[[IM2COL]], %[[RHS]] : tensor<196x36xf32>, tensor<36x16xf32>)
+// CHECK-SAME:   outs(%[[FILL]] : tensor<196x16xf32>) {
 // CHECK:      iree_tensor_ext.dispatch.tensor.store %[[MATMUL]]
 
 // -----
@@ -94,13 +95,13 @@ func.func @fold_with_buffer_load_store(
 // CHECK-SAME:   %[[OUTPUT:[a-zA-Z0-9]+]]: memref<1x14x14x16xf32>
 // CHECK-DAG:  %[[LHS:.+]] = iree_codegen.load_from_buffer %[[INPUT]] : memref<1x16x16x4xf32> -> tensor<1x16x16x4xf32>
 // CHECK-DAG:  %[[RHS:.+]] = iree_codegen.load_from_buffer {{.*}} : memref<36x16xf32> -> tensor<36x16xf32>
-// CHECK-DAG:  %[[RES:.+]] = iree_codegen.load_from_buffer {{.*}} : memref<1x14x14x16xf32> -> tensor<1x14x14x16xf32>
-// CHECK-DAG:  %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}} ins(%[[LHS]] : tensor<1x16x16x4xf32>){{.*}}-> tensor<1x14x14x36xf32>
-// CHECK-DAG:  %[[FILL:.+]] = linalg.fill {{.*}}outs(%[[RES]] : tensor<1x14x14x16xf32>)
+// CHECK-DAG:  %[[RES:.+]] = iree_codegen.load_from_buffer {{.*}} : memref<196x16xf32> -> tensor<196x16xf32>
+// CHECK-DAG:  %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}}output_sizes = {{\[}}[1, 14, 14], [1, 3, 3, 4]]{{.*}}ins(%[[LHS]] : tensor<1x16x16x4xf32>){{.*}}-> tensor<196x36xf32>
+// CHECK-DAG:  %[[FILL:.+]] = linalg.fill {{.*}}outs(%[[RES]] : tensor<196x16xf32>)
 // CHECK:      %[[MATMUL:.+]] = linalg.generic
-// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
-// CHECK-SAME:   ins(%[[IM2COL]], %[[RHS]] : tensor<1x14x14x36xf32>, tensor<36x16xf32>)
-// CHECK-SAME:   outs(%[[FILL]] : tensor<1x14x14x16xf32>) {
+// CHECK-SAME:   iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK-SAME:   ins(%[[IM2COL]], %[[RHS]] : tensor<196x36xf32>, tensor<36x16xf32>)
+// CHECK-SAME:   outs(%[[FILL]] : tensor<196x16xf32>) {
 // CHECK:      iree_codegen.store_to_buffer %[[MATMUL]]
 
 // -----
@@ -115,15 +116,15 @@ func.func @conv_with_lowering_config() attributes {translation_info = #iree_code
   %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0, 0, 0], sizes = [3, 3, 128, 64], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x3x128x64xf32>> -> tensor<3x3x128x64xf32>
   %5 = tensor.empty() : tensor<2x32x32x64xf32>
   %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<2x32x32x64xf32>) -> tensor<2x32x32x64xf32>
-  %7 = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : tensor<2xi64>, lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>, promote_operands = [0, 1], reduction = [0, 0, 0, 0, 8], subgroup = [1, 2, 2, 1, 0], workgroup = [1, 2, 2, 4, 0]}>, strides = dense<1> : tensor<2xi64>} ins(%3, %4 : tensor<2x34x34x128xf32>, tensor<3x3x128x64xf32>) outs(%6 : tensor<2x32x32x64xf32>) -> tensor<2x32x32x64xf32>
+  %7 = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : tensor<2xi64>, lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>, promote_operands = [0, 1], reduction = [0, 0, 8], subgroup = [4, 1, 0], workgroup = [4, 4, 0]}>, strides = dense<1> : tensor<2xi64>} ins(%3, %4 : tensor<2x34x34x128xf32>, tensor<3x3x128x64xf32>) outs(%6 : tensor<2x32x32x64xf32>) -> tensor<2x32x32x64xf32>
   iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0, 0, 0], sizes = [2, 32, 32, 64], strides = [1, 1, 1, 1] : tensor<2x32x32x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x32x32x64xf32>>
   return
 }
 
 // CHECK:      func.func @conv_with_lowering_config
-// CHECK-DAG:    %[[IM2COL:.+]] = iree_linalg_ext.im2col
-// CHECK-DAG:    %[[FILL:.+]] = linalg.fill
-// CHECK:        %[[MATMUL:.+]] = linalg.generic {{.*}} ins(%[[IM2COL]], {{.*}}) outs(%[[FILL]] : {{.*}}) {{.*}}lowering_config = {{.*}}
+// CHECK-DAG:    %[[IM2COL:.+]] = iree_linalg_ext.im2col {{.*}}output_sizes = {{\[}}[2, 32, 32], [1, 3, 3, 128]]{{.*}} -> tensor<2048x1152xf32>
+// CHECK-DAG:    %[[FILL:.+]] = linalg.fill {{.*}} -> tensor<2048x64xf32>
+// CHECK:        %[[MATMUL:.+]] = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]{{.*}} ins(%[[IM2COL]], {{.*}} : tensor<2048x1152xf32>, tensor<1152x64xf32>) outs(%[[FILL]] : tensor<2048x64xf32>) {{.*}}lowering_config = #iree_gpu.lowering_config<{{.*}}reduction = [0, 0, 8]{{.*}}subgroup = [4, 1, 0]{{.*}}workgroup = [4, 4, 0]{{.*}}>
 // CHECK:        iree_tensor_ext.dispatch.tensor.store %[[MATMUL]]
 
 // -----

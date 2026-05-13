@@ -47,6 +47,7 @@ using mlir::iree_compiler::IREE::Codegen::TransformDialectCodegenPipelineAttr;
 using mlir::iree_compiler::IREE::Codegen::TranslationInfoAttr;
 using mlir::iree_compiler::IREE::Codegen::VMVXPipelineAttr;
 using mlir::iree_compiler::IREE::HAL::ExecutableVariantOp;
+namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
 
 bool ireeAttributeIsACodegenVMVXPipelineAttr(MlirAttribute attr) {
   return llvm::isa<VMVXPipelineAttr>(unwrap(attr));
@@ -322,31 +323,29 @@ bool ireeCodegenMlirOperationIsACodegenAttentionOp(MlirOperation op) {
       unwrap(op));
 }
 
-bool ireeCodegenHasIGEMMGenericConvDetails(MlirOperation op) {
+bool ireeCodegenHasIGEMMGenericConvDetails(MlirOperation op,
+                                           bool collapseParallelDims) {
   auto linalgOp = llvm::dyn_cast<mlir::linalg::LinalgOp>(unwrap(op));
   if (!linalgOp) {
     return false;
   }
 
   return succeeded(
-      mlir::iree_compiler::IREE::LinalgExt::getIGEMMGenericConvDetails(
-          linalgOp));
+      LinalgExt::getIGEMMGenericConvDetails(linalgOp, collapseParallelDims));
 }
 
 ireeCodegenIGEMMGenericConvDetails
-ireeCodegenGetIGEMMGenericConvDetails(MlirOperation op) {
+ireeCodegenGetIGEMMGenericConvDetails(MlirOperation op,
+                                      bool collapseParallelDims) {
   auto linalgOp = llvm::cast<mlir::linalg::LinalgOp>(unwrap(op));
 
-  llvm::FailureOr<mlir::iree_compiler::IREE::LinalgExt::IGEMMGenericConvDetails>
-      maybeDetails =
-          mlir::iree_compiler::IREE::LinalgExt::getIGEMMGenericConvDetails(
-              linalgOp);
+  llvm::FailureOr<LinalgExt::IGEMMGenericConvDetails> maybeDetails =
+      LinalgExt::getIGEMMGenericConvDetails(linalgOp, collapseParallelDims);
   assert(succeeded(maybeDetails) &&
          "Failed to get IGEMM details; must check with "
          "ireeCodegenHasIGEMMGenericConvDetails first");
 
-  const mlir::iree_compiler::IREE::LinalgExt::IGEMMGenericConvDetails &details =
-      *maybeDetails;
+  const LinalgExt::IGEMMGenericConvDetails &details = *maybeDetails;
 
   mlir::Builder builder(linalgOp.getContext());
 

@@ -910,16 +910,18 @@ NB_MODULE(_ireeCompilerDialects, m) {
 
   iree_codegen_module.def(
       "get_igemm_generic_conv_details",
-      [](MlirOperation op)
+      [](MlirOperation op, bool collapseParallelDims)
           -> std::optional<ireeCodegenIGEMMGenericConvDetails> {
-        if (!ireeCodegenHasIGEMMGenericConvDetails(op)) {
+        if (!ireeCodegenHasIGEMMGenericConvDetails(op, collapseParallelDims)) {
           return std::nullopt;
         }
-        return ireeCodegenGetIGEMMGenericConvDetails(op);
+        return ireeCodegenGetIGEMMGenericConvDetails(op, collapseParallelDims);
       },
       "Gets IGEMM details for a linalg operation. "
-      "Returns None if failed to infer IGEMM convolution details.",
-      py::arg("linalg_op"));
+      "Returns None if failed to infer IGEMM convolution details. "
+      "When collapse_parallel_dims is true, adjacent parallel IGEMM dimensions "
+      "are also collapsed when possible.",
+      py::arg("linalg_op"), py::arg("collapse_parallel_dims") = false);
 
   //===-------------------------------------------------------------------===//
   // Binding to utility function ireeCodegenGetScaledContractionDetails

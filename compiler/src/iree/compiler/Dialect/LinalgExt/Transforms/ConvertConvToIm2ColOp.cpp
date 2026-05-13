@@ -158,6 +158,28 @@ static FailureOr<SmallVector<int64_t>> expandInputKPermForBatchMDims(
   return invertPermutationVector(inverseInputKPerm);
 }
 
+/// Computes reassociation indices for collapsing the convolution output to the
+/// IGEMM output layout. Adjacent output dimensions are grouped when they map to
+/// the same collapsed IGEMM dimension.
+static SmallVector<ReassociationIndices> computeOutputReassociationIndices(
+    AffineMap outputMap,
+    const DenseMap<int64_t, AffineExpr> &convToIgemmDimMap) {
+  SmallVector<ReassociationIndices> reassociation;
+  std::optional<int64_t> previousIgemmDim;
+  for (auto [idx, outputExpr] : llvm::enumerate(outputMap.getResults())) {
+    int64_t outputDim = cast<AffineDimExpr>(outputExpr).getPosition();
+    int64_t igemmDim =
+        cast<AffineDimExpr>(convToIgemmDimMap.at(outputDim)).getPosition();
+    if (previousIgemmDim && *previousIgemmDim == igemmDim) {
+      reassociation.back().push_back(static_cast<int64_t>(idx));
+    } else {
+      reassociation.push_back({static_cast<int64_t>(idx)});
+    }
+    previousIgemmDim = igemmDim;
+  }
+  return reassociation;
+}
+
 namespace {
 
 using ControlFnTy = std::function<bool(Operation *)>;
@@ -246,13 +268,25 @@ public:
     AffineMap outputMap = indexingMaps[2];
 
     SmallVector<int64_t> outputPerm = igemmConvDetails.im2colOutputPerm;
+    auto getCollapsedIgemmDim = [&](unsigned convDim) -> int64_t {
+      return cast<AffineDimExpr>(igemmConvDetails.convToIgemmDimMap.at(convDim))
+          .getPosition();
+    };
+
     SmallVector<int64_t> batchPos;
     SmallVector<int64_t> mPos;
-    SmallVector<int64_t> mShape;
     SmallVector<int64_t> im2colStrides;
     SmallVector<int64_t> im2colDilations;
     SmallVector<OpFoldResult> kernelSizes;
     int64_t numSyntheticBatchMDims = 0;
+    DenseMap<int64_t, SmallVector<unsigned>> igemmDimToParallelConvDims;
+    DenseMap<unsigned, OpFoldResult> parallelConvDimToSize;
+
+    auto appendParallelConvDim = [&](unsigned convDim, OpFoldResult size) {
+      int64_t igemmDim = getCollapsedIgemmDim(convDim);
+      igemmDimToParallelConvDims[igemmDim].push_back(convDim);
+      parallelConvDimToSize[convDim] = size;
+    };
 
     DenseMap<unsigned, int64_t> outputImageDimToIndex;
     for (auto [idx, dim] : llvm::enumerate(convDims.outputImage)) {
@@ -260,13 +294,18 @@ public:
     }
 
     for (auto [inputDim, inputExpr] : llvm::enumerate(inputMap.getResults())) {
-      if (findFunctionOfDim(inputExpr, convDims.depth)) {
+      if (std::optional<unsigned> depthDim =
+              findFunctionOfDim(inputExpr, convDims.depth)) {
         batchPos.push_back(inputDim);
+        appendParallelConvDim(*depthDim,
+                              rewriter.getIndexAttr(inputShape[inputDim]));
         continue;
       }
-      if (findFunctionOfDim(inputExpr, convDims.batch)) {
+      if (std::optional<unsigned> batchDim =
+              findFunctionOfDim(inputExpr, convDims.batch)) {
         mPos.push_back(inputDim);
-        mShape.push_back(inputShape[inputDim]);
+        appendParallelConvDim(*batchDim,
+                              rewriter.getIndexAttr(inputShape[inputDim]));
         im2colStrides.push_back(1);
         im2colDilations.push_back(1);
         kernelSizes.push_back(rewriter.getIndexAttr(1));
@@ -295,7 +334,8 @@ public:
                                              "Failed to infer filter shape.");
         }
         mPos.push_back(inputDim);
-        mShape.push_back(outputShape[*outputDim]);
+        appendParallelConvDim(*outputImage,
+                              rewriter.getIndexAttr(outputShape[*outputDim]));
         im2colStrides.push_back(convDims.strides[outputImageIndex]);
         im2colDilations.push_back(convDims.dilations[outputImageIndex]);
         kernelSizes.push_back(rewriter.getIndexAttr(filterShape[*filterDim]));
@@ -390,24 +430,38 @@ public:
                                   rewriter.getIndexAttr(1));
     }
 
-    int64_t numOutputDims =
-        batchPos.size() + mShape.size() + kOutputSizes.size();
-    SmallVector<OpFoldResult> offsets(numOutputDims, rewriter.getIndexAttr(0));
     SmallVector<SmallVector<OpFoldResult>> outputSizes;
-    // Batch dims: each has a single inner size.
-    for (int64_t dim : batchPos) {
-      outputSizes.push_back({rewriter.getIndexAttr(inputShape[dim])});
+
+    unsigned inputMapIndex = isOutputChannelFirst ? 1 : 0;
+    SmallVector<AffineExpr> canonicalImageMapResults(
+        igemmContractionMaps[inputMapIndex].getResults());
+    SmallVector<int64_t> inverseOutputPerm =
+        invertPermutationVector(outputPerm);
+    applyPermutationToVector(canonicalImageMapResults, inverseOutputPerm);
+
+    for (AffineExpr expr : canonicalImageMapResults) {
+      auto dimExpr = cast<AffineDimExpr>(expr);
+      int64_t igemmDim = dimExpr.getPosition();
+      utils::IteratorType iteratorType = igemmLoopIterators[igemmDim];
+      if (iteratorType == utils::IteratorType::reduction) {
+        break;
+      }
+
+      SmallVector<OpFoldResult> innerSizes;
+      ArrayRef<unsigned> parallelConvDims =
+          igemmDimToParallelConvDims.find(igemmDim)->second;
+      for (unsigned convDim : parallelConvDims) {
+        innerSizes.push_back(parallelConvDimToSize.find(convDim)->second);
+      }
+      outputSizes.push_back(std::move(innerSizes));
     }
-    // M dims: each convolution batch or spatial output dim is a separate output
-    // dimension.
-    for (int64_t m : mShape) {
-      outputSizes.push_back({rewriter.getIndexAttr(m)});
-    }
-    // Synthetic conv-batch unit K coords first, then inputChannel K dims, then
-    // filterLoop K dims.
+
     for (const auto &innerSizes : kOutputSizes) {
       outputSizes.push_back(innerSizes);
     }
+
+    SmallVector<OpFoldResult> offsets(outputSizes.size(),
+                                      rewriter.getIndexAttr(0));
 
     auto loc = linalgOp.getLoc();
     // Shape of the resulting tensor from im2col. Each output dim is the
@@ -436,15 +490,28 @@ public:
             kPos, inputKPerm, outputPerm)
             .getResult(0);
 
+    SmallVector<ReassociationIndices> outputReassocIndices =
+        computeOutputReassociationIndices(outputMap,
+                                          igemmConvDetails.convToIgemmDimMap);
+    bool hasOutputCollapse =
+        llvm::any_of(outputReassocIndices, [](ReassociationIndicesRef group) {
+          return group.size() > 1;
+        });
+    Value collapsedOutput = output;
+    if (hasOutputCollapse) {
+      collapsedOutput = tensor::CollapseShapeOp::create(rewriter, loc, output,
+                                                        outputReassocIndices);
+    }
+
     Value reshapedFilter = tensor::CollapseShapeOp::create(
         rewriter, loc, filter, filterReassocIndices);
 
     auto genericGEMMOp = linalg::GenericOp::create(
-        rewriter, loc, outputType,
+        rewriter, loc, collapsedOutput.getType(),
         /*inputs=*/
         isOutputChannelFirst ? ValueRange{reshapedFilter, img2ColTensor}
                              : ValueRange{img2ColTensor, reshapedFilter},
-        /*outputs=*/ValueRange{output}, igemmContractionMaps,
+        /*outputs=*/ValueRange{collapsedOutput}, igemmContractionMaps,
         igemmLoopIterators,
         [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
           Value lhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[0],
@@ -459,7 +526,12 @@ public:
         });
     genericGEMMOp->setDiscardableAttrs(getPrunedAttributeList(linalgOp));
 
-    rewriter.replaceOp(linalgOp, genericGEMMOp.getResults().front());
+    Value result = genericGEMMOp.getResults().front();
+    if (hasOutputCollapse) {
+      result = tensor::ExpandShapeOp::create(rewriter, loc, outputType, result,
+                                             outputReassocIndices);
+    }
+    rewriter.replaceOp(linalgOp, result);
     return success();
   }
 

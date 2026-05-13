@@ -184,8 +184,9 @@ def test_igemm_conv_details():
     """
     input_module = ir.Module.parse(module_str)
     root_op_list = iree_codegen.get_tuner_root_ops(input_module)
+    conv_op = root_op_list[0]
 
-    details = iree_codegen.get_igemm_generic_conv_details(root_op_list[0])
+    details = iree_codegen.get_igemm_generic_conv_details(conv_op)
     assert details is not None, "IGEMM details should be valid for NHWC_HWCF conv"
     assert details.igemm_loop_bounds == [1, 14, 14, 16, 36]
 
@@ -212,6 +213,18 @@ def test_igemm_conv_details():
     assert details.filter_reassoc_indices == [[0, 1, 2], [3]]
     assert not details.is_output_channel_first
     assert details.conv_to_igemm_dim_map == {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 4, 6: 4}
+
+    collapsed_details = iree_codegen.get_igemm_generic_conv_details(conv_op, True)
+    assert collapsed_details is not None
+    assert collapsed_details.igemm_loop_bounds == [196, 16, 36]
+    collapsed_maps = [attr.value for attr in collapsed_details.igemm_contraction_maps]
+    d0, d1, d2 = [AffineDimExpr.get(i) for i in range(3)]
+    assert collapsed_maps[0] == AffineMap.get(3, 0, [d0, d2])
+    assert collapsed_maps[1] == AffineMap.get(3, 0, [d2, d1])
+    assert collapsed_maps[2] == AffineMap.get(3, 0, [d0, d1])
+    assert collapsed_details.im2col_output_perm == [0, 1]
+    collapsed_dim_map = {0: 0, 1: 0, 2: 0, 3: 1, 4: 2, 5: 2, 6: 2}
+    assert collapsed_details.conv_to_igemm_dim_map == collapsed_dim_map
 
     # Test 2: conv_2d_nhwc_fhwc.
     module_str = """
