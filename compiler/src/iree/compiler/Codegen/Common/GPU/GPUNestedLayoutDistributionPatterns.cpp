@@ -584,10 +584,22 @@ struct DistributeTransferGather final
     ValueRange indices = gatherOp.getOffsets();
     SmallVector<int64_t> strides(rank, 1);
 
-    // getBasePermutationMap inverts the source map, mapping gathered (symbol)
-    // and broadcast (constant) dims to constant 0. This is correct here because
-    // getTransferIndicesFromNestedLayout treats constant-0 dims as broadcast,
-    // leaving the original base offset unchanged for gathered dimensions.
+    // getBasePermutationMap inverts only projected base dims, gathered symbols,
+    // and broadcast constants. More general linear affine base-map results are
+    // verifier-valid for other lowering paths, but this nested-layout path
+    // needs a projected-permutation inverse to distribute transfer indices.
+    AffineMap baseMap = gatherOp.getBaseIndexingMap();
+    if (!llvm::all_of(baseMap.getResults(), [](AffineExpr expr) {
+          return isa<AffineDimExpr, AffineSymbolExpr, AffineConstantExpr>(expr);
+        })) {
+      return rewriter.notifyMatchFailure(
+          gatherOp, "distribution expects projected base indexing map");
+    }
+    // The inverse may also pair unassigned unit vector dimensions with unused
+    // base dimensions so the map remains a valid projected permutation for
+    // transfer lowering. True constant-0 results are still treated as broadcast
+    // by getTransferIndicesFromNestedLayout, leaving the original base offset
+    // unchanged for gathered dimensions.
     AffineMap permMap = gatherOp.getBasePermutationMap();
 
     std::vector<StaticTileOffsetRange::IteratorTy> allMaskOffsets;

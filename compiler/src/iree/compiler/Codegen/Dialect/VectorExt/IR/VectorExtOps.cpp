@@ -18,6 +18,29 @@ using namespace mlir::iree_compiler::IREE::VectorExt;
 
 using VectorValue = TypedValue<VectorType>;
 
+static bool isSupportedBaseIndexingExpr(AffineExpr expr) {
+  if (isa<AffineDimExpr, AffineSymbolExpr, AffineConstantExpr>(expr)) {
+    return true;
+  }
+  auto binaryExpr = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binaryExpr) {
+    return false;
+  }
+
+  switch (binaryExpr.getKind()) {
+  case AffineExprKind::Add:
+    return isSupportedBaseIndexingExpr(binaryExpr.getLHS()) &&
+           isSupportedBaseIndexingExpr(binaryExpr.getRHS());
+  case AffineExprKind::Mul:
+    return (isa<AffineConstantExpr>(binaryExpr.getLHS()) &&
+            isSupportedBaseIndexingExpr(binaryExpr.getRHS())) ||
+           (isa<AffineConstantExpr>(binaryExpr.getRHS()) &&
+            isSupportedBaseIndexingExpr(binaryExpr.getLHS()));
+  default:
+    return false;
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // LayoutConflictResolutionOp
 //===----------------------------------------------------------------------===//
@@ -89,7 +112,7 @@ mlir::iree_compiler::IREE::VectorExt::detail::verifyIndexedVectorOpInterface(
 
   int64_t vectorRank = vectorType.getRank();
   int64_t indexSyms = indexVecs.size();
-  for (AffineMap map : indexingMaps) {
+  for (auto [mapIndex, map] : llvm::enumerate(indexingMaps)) {
     if (map.getNumDims() != vectorRank) {
       return op->emitOpError(
                  "expected all indexing maps to have number of dims "
@@ -102,6 +125,19 @@ mlir::iree_compiler::IREE::VectorExt::detail::verifyIndexedVectorOpInterface(
                  "equal to number of index vecs. expected: ")
              << indexSyms << ", got: " << map.getNumSymbols() << " syms";
     }
+    if (mapIndex == 0) {
+      for (AffineExpr expr : map.getResults()) {
+        if (isSupportedBaseIndexingExpr(expr)) {
+          continue;
+        }
+        return op->emitOpError(
+            "expected base indexing map results to use only dimensions, "
+            "symbols, constants, addition, and multiplication by constants");
+      }
+      continue;
+    }
+    // Non-base maps describe indexing into index vectors and masks, so keep
+    // those restricted to plain projected dimensions.
     for (AffineExpr expr : map.getResults()) {
       if (isa<AffineDimExpr, AffineSymbolExpr>(expr)) {
         continue;
@@ -346,13 +382,42 @@ static IndexingMapFoldResult foldFromStep(int64_t index, Value operand,
     return {operand, map, false};
   }
   assert(map.getNumResults() == 1);
+  AffineExpr replacementExpr = map.getResult(0);
+  auto replacementDim = dyn_cast<AffineDimExpr>(replacementExpr);
+  if (!replacementDim) {
+    return {operand, map, false};
+  }
+  // Keep step folding restricted to a single vector dimension substitution.
+  // More general affine replacement expressions can be valid transfer_scatter
+  // base-map expressions, but folding them here would need to prove that the
+  // replacement does not duplicate or mix vector dimensions across base dims.
+  // Folding `s0` to `d1` is only valid when `s0` names one base dim and no
+  // other base dim already advances with `d1`.
+  bool foundSymbol = false;
+  for (AffineExpr expr : baseMap.getResults()) {
+    if (auto sym = dyn_cast<AffineSymbolExpr>(expr)) {
+      if (sym.getPosition() == index) {
+        if (foundSymbol) {
+          return {operand, map, false};
+        }
+        foundSymbol = true;
+      }
+      continue;
+    }
+    if (expr == replacementDim) {
+      return {operand, map, false};
+    }
+  }
+  if (!foundSymbol) {
+    return {operand, map, false};
+  }
   // Replace the symbol in the base map with the dim expression from the
   // index vec map, making this dimension contiguous.
   SmallVector<AffineExpr> newResults;
   for (AffineExpr expr : baseMap.getResults()) {
     if (auto sym = dyn_cast<AffineSymbolExpr>(expr)) {
       if (sym.getPosition() == index) {
-        expr = map.getResult(0);
+        expr = replacementDim;
       }
     }
     newResults.push_back(expr);
@@ -360,6 +425,33 @@ static IndexingMapFoldResult foldFromStep(int64_t index, Value operand,
   baseMap = AffineMap::get(baseMap.getNumDims(), baseMap.getNumSymbols(),
                            newResults, baseMap.getContext());
   return {Value(), AffineMap(), true};
+}
+
+/// Returns true when a base map can be treated as a contiguous transfer map.
+static bool isContiguousBaseMap(AffineMap map) {
+  llvm::SmallDenseSet<unsigned> seenDims;
+  for (AffineExpr expr : map.getResults()) {
+    if (auto constExpr = dyn_cast<AffineConstantExpr>(expr)) {
+      if (constExpr.getValue() != 0) {
+        return false;
+      }
+      continue;
+    }
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return false;
+    }
+    if (!seenDims.insert(dimExpr.getPosition()).second) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool permutationMapHasConstantResult(AffineMap map) {
+  return llvm::any_of(map.getResults(), [](AffineExpr expr) {
+    return isa<AffineConstantExpr>(expr);
+  });
 }
 
 template <typename OpTy>
@@ -732,6 +824,9 @@ struct FoldContiguousGatherToTransferRead final
     if (!op.getIndexVecs().empty()) {
       return failure();
     }
+    if (!isContiguousBaseMap(op.getBaseIndexingMap())) {
+      return failure();
+    }
 
     AffineMap permutationMap = op.getBasePermutationMap();
     VectorType vectorType = op.getVectorType();
@@ -759,8 +854,17 @@ struct FoldContiguousScatterToTransferWrite final
     if (!op.getIndexVecs().empty()) {
       return failure();
     }
+    if (!isContiguousBaseMap(op.getBaseIndexingMap())) {
+      return failure();
+    }
 
     AffineMap permutationMap = op.getBasePermutationMap();
+    // vector.transfer_write cannot represent broadcast dimensions in its
+    // permutation map. vector.transfer_read can, so the gather fold above does
+    // not need this guard.
+    if (permutationMapHasConstantResult(permutationMap)) {
+      return failure();
+    }
     VectorType vectorType = op.getVectorType();
     Value mask = prepareMaskForContiguousFold(
         rewriter, op.getLoc(), op.getMask(), vectorType, permutationMap,

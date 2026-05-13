@@ -148,7 +148,17 @@ def IREEVectorExt_TransferGatherOp : IREEVectorExt_PureOp<"transfer_gather", [
       lockstep with the vector dimension). A symbol expr means the source
       dimension is gathered (looked up via the corresponding index vector).
       A constant 0 means the source dimension is broadcast (always reads
-      at the base offset).
+      at the base offset). More general affine expressions may combine these
+      terms when a source dimension has both a contiguous vector component and
+      a gathered base component. Map 0 is restricted to linear affine
+      expressions over dimensions and symbols: constants, additions, and
+      multiplication by constants. Folds and lowerings may still require
+      stricter sub-forms for a specific rewrite:
+        - fold-to-transfer rewrites require a contiguous projected base map,
+        - nested-layout distribution requires projected dimension, symbol, or
+          constant results that can be inverted to a projected permutation,
+        - rank-1 scatter lowering supports linear affine base maps after
+          bufferization exposes a memref base.
     - Maps 1..N (index vec maps): `(vector_dims)[symbols] -> (index_vec_dims)`.
       Describes how each index vector is indexed from the vector iteration
       space. Only dim exprs are allowed.
@@ -231,7 +241,9 @@ def IREEVectorExt_TransferScatterOp : IREEVectorExt_PureOp<"transfer_scatter", [
     The `indexing_maps` attribute follows the same structure as
     `transfer_gather`. See `transfer_gather` documentation for details. The
     only difference is that Map 0 describes the destination indexing rather
-    than the source indexing.
+    than the source indexing. As with gather, Map 0 may use linear affine
+    expressions to combine contiguous vector dimensions and scattered symbols,
+    while individual folds/lowerings may accept only stricter sub-forms.
   }];
 
   let assemblyFormat = [{

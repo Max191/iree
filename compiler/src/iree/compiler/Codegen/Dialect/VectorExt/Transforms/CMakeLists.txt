@@ -40,11 +40,14 @@ iree_cc_library(
     ::PassesIncGen
     LLVMSupport
     MLIRArithDialect
+    MLIRArithUtils
     MLIRBufferizationDialect
     MLIRBufferizationTransforms
+    MLIRDialectUtils
     MLIRFuncDialect
     MLIRFunctionInterfaces
     MLIRIR
+    MLIRMemRefDialect
     MLIRPass
     MLIRSCFDialect
     MLIRSupport
@@ -55,6 +58,7 @@ iree_cc_library(
     MLIRVectorDialect
     MLIRVectorUtils
     iree::compiler::Codegen::Dialect::VectorExt::IR::IREEVectorExtDialect
+    iree::compiler::Utils
   PUBLIC
 )
 
