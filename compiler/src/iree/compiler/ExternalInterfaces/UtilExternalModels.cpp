@@ -24,12 +24,15 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 #include <numeric>
 
@@ -514,6 +517,77 @@ struct AffineApplyInferAffineSeedDependencyOpInterface
   }
 };
 
+struct AffineDelinearizeIndexInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          AffineDelinearizeIndexInferAffineSeedDependencyOpInterface,
+          affine::AffineDelinearizeIndexOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto delinearizeOp = cast<affine::AffineDelinearizeIndexOp>(op);
+    // Keep this conservative for now. Linearize/delinearize pairs are expected
+    // to be simplified before this analysis, and any remaining delinearize
+    // dependence is treated as non-separable per seed.
+    AffineSeedDependency resultDep =
+        AffineSeedDependency::getUnknownForDependentSeeds(argDeps);
+    for (Value result : delinearizeOp.getResults()) {
+      setResultDependencies(result, resultDep);
+    }
+  }
+};
+
+struct AffineLinearizeIndexInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          AffineLinearizeIndexInferAffineSeedDependencyOpInterface,
+          affine::AffineLinearizeIndexOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto linearizeOp = cast<affine::AffineLinearizeIndexOp>(op);
+    ValueRange multiIndex = linearizeOp.getMultiIndex();
+    assert(argDeps.size() == linearizeOp->getNumOperands() &&
+           "expected one affine seed dependency per operand");
+
+    if (!linearizeOp.getDynamicBasis().empty()) {
+      setResultDependencies(linearizeOp.getResult(),
+                            AffineSeedDependency::getUnknownForDependentSeeds(
+                                argDeps));
+      return;
+    }
+
+    SmallVector<OpFoldResult> paddedBasis = linearizeOp.getPaddedBasis();
+    AffineSeedDependency resultDep = AffineSeedDependency::getIndependent();
+    // Mirror affine.linearize_index static-basis stride construction documented
+    // on AffineLinearizeIndexOp in MLIR's AffineOps.td: each index is scaled by
+    // the product of the following padded basis elements.
+    for (auto [index, indexDep] :
+         llvm::enumerate(argDeps.take_front(multiIndex.size()))) {
+      int64_t stride = 1;
+      for (OpFoldResult basis : ArrayRef(paddedBasis).drop_front(index + 1)) {
+        std::optional<int64_t> constantBasis = getConstantIntValue(basis);
+        if (!constantBasis) {
+          setResultDependencies(
+              linearizeOp.getResult(),
+              AffineSeedDependency::getUnknownForDependentSeeds(argDeps));
+          return;
+        }
+        std::optional<int64_t> newStride =
+            llvm::checkedMul(stride, *constantBasis);
+        if (!newStride) {
+          setResultDependencies(
+              linearizeOp.getResult(),
+              AffineSeedDependency::getUnknownForDependentSeeds(argDeps));
+          return;
+        }
+        stride = *newStride;
+      }
+      resultDep = AffineSeedDependency::add(
+          resultDep, AffineSeedDependency::scale(indexDep, stride));
+    }
+    setResultDependencies(linearizeOp.getResult(), resultDep);
+  }
+};
+
 template <typename OpTy>
 struct ArithAddInferAffineSeedDependencyOpInterface
     : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
@@ -578,6 +652,46 @@ struct ArithMulIInferAffineSeedDependencyOpInterface
   }
 };
 
+static constexpr unsigned kMinValuePreservingIndexCastWidth = 64;
+
+static bool isValuePreservingIndexCast(Type sourceType, Type resultType) {
+  Type sourceElementType = getElementTypeOrSelf(sourceType);
+  Type resultElementType = getElementTypeOrSelf(resultType);
+  if (isa<IndexType>(sourceElementType)) {
+    auto resultIntegerType = dyn_cast<IntegerType>(resultElementType);
+    // Index-to-integer casts with at least 64 result bits are IREE's
+    // value-preserving index-arithmetic bookkeeping cases for supported index
+    // bitwidths. Narrower integer results may truncate, so treat them
+    // conservatively.
+    return resultIntegerType &&
+           resultIntegerType.getWidth() >= kMinValuePreservingIndexCastWidth;
+  }
+  // Integer-to-index may truncate on targets with narrower index bitwidth, and
+  // this external model does not have range/data-layout information.
+  return false;
+}
+
+struct ArithIndexCastInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithIndexCastInferAffineSeedDependencyOpInterface,
+          arith::IndexCastOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto indexCastOp = cast<arith::IndexCastOp>(op);
+    assert(argDeps.size() == 1 &&
+           "expected one affine seed dependency per operand");
+    if (!isValuePreservingIndexCast(indexCastOp.getIn().getType(),
+                                    indexCastOp.getOut().getType())) {
+      setResultDependencies(indexCastOp.getOut(),
+                            AffineSeedDependency::getUnknownForDependentSeeds(
+                                argDeps));
+      return;
+    }
+    setResultDependencies(indexCastOp.getOut(), argDeps[0]);
+  }
+};
+
 struct ArithConstantInferAffineSeedDependencyOpInterface
     : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
           ArithConstantInferAffineSeedDependencyOpInterface,
@@ -588,6 +702,25 @@ struct ArithConstantInferAffineSeedDependencyOpInterface
     auto constantOp = cast<arith::ConstantOp>(op);
     setResultDependencies(constantOp.getResult(),
                           AffineSeedDependency::getIndependent());
+  }
+};
+
+struct ArithSelectInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithSelectInferAffineSeedDependencyOpInterface, arith::SelectOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto selectOp = cast<arith::SelectOp>(op);
+    assert(argDeps.size() == 3 &&
+           "expected one affine seed dependency per operand");
+    AffineSeedDependency valueDependency =
+        AffineSeedDependency::join(argDeps[1], argDeps[2]);
+    setResultDependencies(
+        selectOp.getResult(),
+        AffineSeedDependency::add(
+            valueDependency,
+            AffineSeedDependency::getUnknownForDependentSeeds({argDeps[0]})));
   }
 };
 
@@ -1487,6 +1620,10 @@ void registerUtilExternalModels(DialectRegistry &registry) {
         ArithSubIInferAffineSeedDependencyOpInterface>(*context);
     arith::MulIOp::attachInterface<
         ArithMulIInferAffineSeedDependencyOpInterface>(*context);
+    arith::IndexCastOp::attachInterface<
+        ArithIndexCastInferAffineSeedDependencyOpInterface>(*context);
+    arith::SelectOp::attachInterface<
+        ArithSelectInferAffineSeedDependencyOpInterface>(*context);
   });
 
   registry.addExtension(
@@ -1501,6 +1638,11 @@ void registerUtilExternalModels(DialectRegistry &registry) {
             AffineDelinearizeIndexInferIntDivisibilityOpInterface>(*context);
         affine::AffineApplyOp::attachInterface<
             AffineApplyInferAffineSeedDependencyOpInterface>(*context);
+        affine::AffineDelinearizeIndexOp::attachInterface<
+            AffineDelinearizeIndexInferAffineSeedDependencyOpInterface>(
+                *context);
+        affine::AffineLinearizeIndexOp::attachInterface<
+            AffineLinearizeIndexInferAffineSeedDependencyOpInterface>(*context);
       });
 
   registry.addExtension(
