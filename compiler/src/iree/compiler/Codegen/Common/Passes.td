@@ -907,6 +907,27 @@ def AnnotateMapStoreContiguousDimHintsPass :
   }];
 }
 
+def PreVectorizationAffineIndexCleanupPass :
+    InterfacePass<"iree-codegen-pre-vectorization-affine-index-cleanup",
+                  "mlir::FunctionOpInterface"> {
+  let summary =
+      "Canonicalize and simplify affine index operations before vectorization";
+  let description = [{
+    Runs the codegen config-tracking canonicalizer plus affine simplification
+    patterns before vectorization. This prepares tensor index expressions for
+    later map_store metadata annotation and generic vectorization while
+    preserving lowering configs through canonicalizer replacements.
+  }];
+  let dependentDialects = [
+    "::mlir::affine::AffineDialect",
+    "::mlir::arith::ArithDialect"
+  ];
+  let options = [
+    Option<"testConvergence", "test-convergence", "bool",
+           /*default=*/"false", "Fails if the patterns fail to converge">
+  ];
+}
+
 def MaterializeTuningSpecsPass : Pass<"iree-codegen-materialize-tuning-specs", "ModuleOp"> {
   let summary =
       "Load tuning spec transform dialect libraries and encode them in the module";
