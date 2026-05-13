@@ -12,6 +12,18 @@ iree_add_all_subdirs()
 
 iree_cc_test(
   NAME
+    AffineExprUtilsTest
+  SRCS
+    "AffineExprUtilsTest.cpp"
+  DEPS
+    MLIRIR
+    gtest
+    iree::compiler::Utils
+    iree::testing::gtest_main
+)
+
+iree_cc_test(
+  NAME
     utils
   SRCS
     "UtilsTest.cpp"

@@ -14,6 +14,7 @@ iree_cc_library(
   NAME
     Utils
   HDRS
+    "AffineExprUtils.h"
     "ConversionUtils.h"
     "EmbeddedDataDirectory.h"
     "EncodingUtils.h"

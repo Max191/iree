@@ -24,6 +24,8 @@ TEST(GetMapCoefficientTest, unitDim) {
   AffineExpr add = d0 + d1;
   ASSERT_EQ(getCoefficient(add, 0).value(), 1);
   ASSERT_EQ(getCoefficient(add, 1).value(), 1);
+  AffineExpr s0 = b.getAffineSymbolExpr(0);
+  ASSERT_EQ(getCoefficient(d0 + s0, 0).value(), 1);
 }
 
 TEST(GetMapCoefficientTest, mul) {
@@ -38,6 +40,11 @@ TEST(GetMapCoefficientTest, mul) {
   ASSERT_EQ(getCoefficient(mul2, 1).value(), 0);
   AffineExpr mul3 = -5 * d0;
   ASSERT_EQ(getCoefficient(mul3, 0).value(), -5);
+  AffineExpr d1 = b.getAffineDimExpr(1);
+  ASSERT_FALSE(getCoefficient(d0 * d1, 0).has_value());
+  ASSERT_FALSE(getCoefficient(d0 * (5 * d1), 0).has_value());
+  AffineExpr d2 = b.getAffineDimExpr(2);
+  ASSERT_EQ(getCoefficient(d1 * d2, 0).value(), 0);
 }
 
 TEST(GetMapCoefficientTest, add) {

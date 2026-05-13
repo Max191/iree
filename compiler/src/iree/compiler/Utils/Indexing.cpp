@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Utils/Indexing.h"
+
+#include "llvm/Support/CheckedArithmetic.h"
 #include "mlir/IR/AffineExprVisitor.h"
 
 using namespace mlir;
@@ -71,7 +73,8 @@ LogicalResult basisFromSizesStrides(ArrayRef<int64_t> sizes,
 /// Visit affine expressions recursively and calculate the coefficient of the
 /// dimension `position`. If the dimension doesn't exist in the expression, this
 /// returns `0`. If the coefficient can't be calculated, for example in case of
-/// invalid expressions like modulo, this returns `std::nullopt`.
+/// invalid expressions, non-linear dependence, or arithmetic overflow, this
+/// returns `std::nullopt`.
 class CoefficientFinder
     : public AffineExprVisitor<CoefficientFinder, std::optional<int64_t>> {
 public:
@@ -88,6 +91,9 @@ public:
     }
     return 0;
   }
+  std::optional<int64_t> visitSymbolExpr(AffineSymbolExpr expr) {
+    return 0;
+  }
 
   std::optional<int64_t> visitAddExpr(AffineBinaryOpExpr expr) {
     std::optional<int64_t> lhsVal = visit(expr.getLHS());
@@ -95,7 +101,7 @@ public:
     if (!lhsVal.has_value() || !rhsVal.has_value()) {
       return std::nullopt;
     }
-    return lhsVal.value() + rhsVal.value();
+    return llvm::checkedAdd(lhsVal.value(), rhsVal.value());
   }
 
   std::optional<int64_t> visitMulExpr(AffineBinaryOpExpr expr) {
@@ -105,12 +111,15 @@ public:
       return std::nullopt;
     }
     if (auto lhsConst = dyn_cast<AffineConstantExpr>(expr.getLHS())) {
-      return lhsConst.getValue() * rhsVal.value();
+      return llvm::checkedMul(lhsConst.getValue(), rhsVal.value());
     }
     if (auto rhsConst = dyn_cast<AffineConstantExpr>(expr.getRHS())) {
-      return rhsConst.getValue() * lhsVal.value();
+      return llvm::checkedMul(rhsConst.getValue(), lhsVal.value());
     }
-    return lhsVal.value() * rhsVal.value();
+    if (lhsVal.value() == 0 && rhsVal.value() == 0) {
+      return 0;
+    }
+    return std::nullopt;
   }
 
   // We disallow mod, floor div and ceil div on the position.

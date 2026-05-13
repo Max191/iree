@@ -84,7 +84,8 @@ LogicalResult basisFromSizesStrides(ArrayRef<int64_t> sizes,
 /// Returns the coefficient for the dimension on `position` in the affine
 /// expression `expr`. If the dimension doesn't exist in the expression, `0` is
 /// returned. If the coefficient can't be calculated, for example in case of
-/// invalid expressions, `std::nullopt` is returned.
+/// invalid expressions, non-linear dependence, or arithmetic overflow,
+/// `std::nullopt` is returned.
 /// Example:
 /// Expr: 5 * d0 + 2
 /// Position: 0
