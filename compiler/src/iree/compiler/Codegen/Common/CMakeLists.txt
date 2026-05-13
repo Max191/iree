@@ -140,6 +140,7 @@ iree_cc_library(
     "PassUtils.cpp"
     "Passes.cpp"
     "PatchFuncOps.cpp"
+    "PreVectorizationAffineIndexCleanup.cpp"
     "PropagateConstantOffsets.cpp"
     "PropagateDispatchConfig.cpp"
     "PropagateDispatchSizeBounds.cpp"
