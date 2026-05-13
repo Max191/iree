@@ -121,6 +121,109 @@ func.func @gather_tensor_base_2d(%buffer: tensor<10x20xf32>,
 
 // -----
 
+// Rank-1 transfer_scatter with a linear affine base map lowers to a flattened
+// vector.scatter. Contiguous row-major memrefs can use memref.collapse_shape.
+
+func.func @scatter_affine_rank1_collapse(
+    %src: vector<4xf32>, %dest: memref<4x8xf32>,
+    %idx: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %src into %dest[%c0, %c0]
+    [%idx : vector<4xindex>] {
+      indexing_maps = [affine_map<(d0)[s0] -> (d0, s0 + d0 * 2)>,
+                       affine_map<(d0)[s0] -> (d0)>]
+    } : vector<4xf32>, memref<4x8xf32>
+  return
+}
+
+// CHECK-LABEL:   func.func @scatter_affine_rank1_collapse(
+// CHECK-SAME:        %[[SRC:[^:]+]]: vector<4xf32>, %[[DEST:[^:]+]]: memref<4x8xf32>, %[[IDX:[^:]+]]: vector<4xindex>
+// CHECK-NOT:   iree_vector_ext.transfer_scatter
+// CHECK:       %[[FLAT:.+]] = memref.collapse_shape %[[DEST]]
+// CHECK:       %[[STEP0:.+]] = vector.step : vector<4xindex>
+// CHECK:       %[[STRIDED_STEP0:.+]] = arith.muli %[[STEP0]],
+// CHECK:       %[[STEP1:.+]] = vector.step : vector<4xindex>
+// CHECK:       %[[SCALED_STEP1:.+]] = arith.muli %[[STEP1]],
+// CHECK:       %[[DIM1:.+]] = arith.addi %[[SCALED_STEP1]], %[[IDX]]
+// CHECK:       %[[LINEAR:.+]] = arith.addi %[[STRIDED_STEP0]], %[[DIM1]]
+// CHECK:       vector.scatter %[[FLAT]][%{{.+}}] [%[[LINEAR]]], %{{.+}}, %[[SRC]]
+
+// -----
+
+// Masked rank-1 transfer_scatter preserves the explicit mask when lowering to
+// vector.scatter.
+
+func.func @scatter_affine_rank1_masked(
+    %src: vector<4xf32>, %dest: memref<4x8xf32>, %idx: vector<4xindex>,
+    %mask: vector<4xi1>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %src into %dest[%c0, %c0]
+    [%idx : vector<4xindex>], %mask {
+      indexing_maps = [affine_map<(d0)[s0] -> (d0, s0)>,
+                       affine_map<(d0)[s0] -> (d0)>,
+                       affine_map<(d0)[s0] -> (d0)>]
+    } : vector<4xf32>, memref<4x8xf32>, vector<4xi1>
+  return
+}
+
+// CHECK-LABEL:   func.func @scatter_affine_rank1_masked(
+// CHECK-SAME:        %[[SRC:[^:]+]]: vector<4xf32>, %[[DEST:[^:]+]]: memref<4x8xf32>, %[[IDX:[^:]+]]: vector<4xindex>, %[[MASK:[^:]+]]: vector<4xi1>
+// CHECK-NOT:   iree_vector_ext.transfer_scatter
+// CHECK:       %[[FLAT:.+]] = memref.collapse_shape %[[DEST]]
+// CHECK:       %[[STEP:.+]] = vector.step : vector<4xindex>
+// CHECK:       %[[STRIDED_STEP:.+]] = arith.muli %[[STEP]],
+// CHECK:       %[[LINEAR:.+]] = arith.addi %[[STRIDED_STEP]], %[[IDX]]
+// CHECK:       vector.scatter %[[FLAT]][%{{.+}}] [%[[LINEAR]]], %[[MASK]], %[[SRC]]
+
+// -----
+
+// Non-collapsible strided memrefs use a 1-D reinterpret_cast and preserve
+// logical memref strides in the computed scatter indices.
+
+func.func @scatter_affine_rank1_reinterpret_strided(
+    %src: vector<4xf32>, %dest: memref<4x8xf32, strided<[17, 2]>>,
+    %idx: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %src into %dest[%c0, %c0]
+    [%idx : vector<4xindex>] {
+      indexing_maps = [affine_map<(d0)[s0] -> (d0, s0)>,
+                       affine_map<(d0)[s0] -> (d0)>]
+    } : vector<4xf32>, memref<4x8xf32, strided<[17, 2]>>
+  return
+}
+
+// CHECK-LABEL:   func.func @scatter_affine_rank1_reinterpret_strided(
+// CHECK-SAME:        %[[SRC:[^:]+]]: vector<4xf32>, %[[DEST:[^:]+]]: memref<4x8xf32, strided<[17, 2]>>, %[[IDX:[^:]+]]: vector<4xindex>
+// CHECK-NOT:   iree_vector_ext.transfer_scatter
+// CHECK:       %[[FLAT:.+]] = memref.reinterpret_cast %[[DEST]]
+// CHECK:       %[[STEP:.+]] = vector.step : vector<4xindex>
+// CHECK:       %[[STRIDED_STEP:.+]] = arith.muli %[[STEP]],
+// CHECK:       %[[STRIDED_IDX:.+]] = arith.muli %[[IDX]],
+// CHECK:       %[[LINEAR:.+]] = arith.addi %[[STRIDED_STEP]], %[[STRIDED_IDX]]
+// CHECK:       vector.scatter %[[FLAT]][%{{.+}}] [%[[LINEAR]]], %{{.+}}, %[[SRC]]
+
+// -----
+
+// Sub-byte element scatters stay in the VectorExt form because vector.scatter
+// cannot represent them.
+
+func.func @scatter_rank1_subbyte_kept(
+    %src: vector<4xi1>, %dest: memref<4x8xi1>, %idx: vector<4xindex>) {
+  %c0 = arith.constant 0 : index
+  iree_vector_ext.transfer_scatter %src into %dest[%c0, %c0]
+    [%idx : vector<4xindex>] {
+      indexing_maps = [affine_map<(d0)[s0] -> (d0, s0)>,
+                       affine_map<(d0)[s0] -> (d0)>]
+    } : vector<4xi1>, memref<4x8xi1>
+  return
+}
+
+// CHECK-LABEL:   func.func @scatter_rank1_subbyte_kept(
+// CHECK-NOT:   vector.scatter
+// CHECK:       iree_vector_ext.transfer_scatter
+
+// -----
+
 // `iree_codegen.inner_tiled` lowering. The pass runs three pattern sets in
 // sequence on the op (unroll non-unit iter dims to unit, drop the now-unit
 // iter domain, lower the iter-free vector `inner_tiled` to

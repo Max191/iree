@@ -110,20 +110,50 @@ def IndexedVectorOpInterface : OpInterface<"IndexedVectorOpInterface"> {
     /// vector.transfer_read/write. The base map is
     /// (vector_dims)[symbols] -> (base_dims). This returns
     /// (base_dims) -> (vector_dims), where non-dim results (gathered/scattered
-    /// symbols, broadcast constants) become constant 0.
+    /// symbols, broadcast constants) usually become constant 0. Unit vector
+    /// dimensions that are still unassigned after direct dimension inversion
+    /// are instead paired with unused base dimensions from high to low indices.
+    /// These degenerate dimensions do not change the accessed element, but keep
+    /// transfer lowering on a valid projected permutation. If unused base
+    /// dimensions run out, remaining unit vector dimensions stay mapped to
+    /// constant 0 like broadcast dimensions. Indexed transfer vector shapes are
+    /// expected to be static here; only dimensions with static extent 1 are
+    /// eligible for this degenerate pairing.
     /// Note: conceptually the same as inverseAndBroadcastProjectedPermutation,
     /// but that utility asserts symbol-free maps. Our base map has symbols for
-    /// gathered/scattered dims, which we treat identically to broadcast (map to
-    /// constant 0 in the inverse).
+    /// gathered/scattered dims, which we treat identically to broadcast except
+    /// for the unit-dimension pairing described above.
     AffineMap getBasePermutationMap() {
       AffineMap baseMap = $_op.getBaseIndexingMap();
       MLIRContext *ctx = $_op->getContext();
       SmallVector<AffineExpr> exprs(baseMap.getNumDims(),
                                     getAffineConstantExpr(0, ctx));
+      SmallVector<bool> assignedVectorDims(baseMap.getNumDims(), false);
+      SmallVector<bool> usedBaseDims(baseMap.getNumResults(), false);
       for (auto [i, expr] : llvm::enumerate(baseMap.getResults())) {
         if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
           exprs[dimExpr.getPosition()] = getAffineDimExpr(i, ctx);
+          assignedVectorDims[dimExpr.getPosition()] = true;
+          usedBaseDims[i] = true;
         }
+      }
+      ArrayRef<int64_t> vectorShape = $_op.getVectorType().getShape();
+      int64_t nextBaseDim = static_cast<int64_t>(baseMap.getNumResults()) - 1;
+      // Prefer trailing dimensions to preserve the minor-identity pairing used
+      // by transfer lowering when several unit dimensions are available.
+      for (int64_t vectorDim = static_cast<int64_t>(baseMap.getNumDims()) - 1;
+           vectorDim >= 0; --vectorDim) {
+        if (assignedVectorDims[vectorDim] || vectorShape[vectorDim] != 1) {
+          continue;
+        }
+        while (nextBaseDim >= 0 && usedBaseDims[nextBaseDim]) {
+          --nextBaseDim;
+        }
+        if (nextBaseDim < 0) {
+          break;
+        }
+        exprs[vectorDim] = getAffineDimExpr(nextBaseDim, ctx);
+        usedBaseDims[nextBaseDim] = true;
       }
       return AffineMap::get(baseMap.getNumResults(), /*symbolCount=*/0,
                             exprs, ctx);
