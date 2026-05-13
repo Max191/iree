@@ -240,8 +240,10 @@ def ConvolutionToIGEMMPass :
   let summary =
       "Transforms convolution operations into an implicit GEMM format.";
   let dependentDialects = [
+    "affine::AffineDialect",
+    "arith::ArithDialect",
+    "iree_compiler::IREE::LinalgExt::IREELinalgExtDialect",
     "tensor::TensorDialect",
-    "iree_compiler::IREE::LinalgExt::IREELinalgExtDialect"
   ];
 }
 

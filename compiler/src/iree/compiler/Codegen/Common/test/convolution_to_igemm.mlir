@@ -1,4 +1,5 @@
 // RUN: iree-opt --test-always-collapse-parallel-igemm-dims --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-convolution-to-igemm),canonicalize,cse)" %s | FileCheck %s
+// RUN: iree-opt --test-always-collapse-parallel-igemm-dims --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-pad-convs,iree-codegen-convolution-to-igemm),canonicalize,cse)" %s | FileCheck %s --check-prefix=PADDED
 
 #map = affine_map<(d0, d1, d2, d3)->(d0, d1, d2, d3)>
 func.func public @conv_with_consumer(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<3x3x4x16xf32>) -> tensor<1x14x14x16xf16> {
@@ -126,6 +127,36 @@ func.func @conv_with_lowering_config() attributes {translation_info = #iree_code
 // CHECK-DAG:    %[[FILL:.+]] = linalg.fill {{.*}} -> tensor<2048x64xf32>
 // CHECK:        %[[MATMUL:.+]] = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]{{.*}} ins(%[[IM2COL]], {{.*}} : tensor<2048x1152xf32>, tensor<1152x64xf32>) outs(%[[FILL]] : tensor<2048x64xf32>) {{.*}}lowering_config = #iree_gpu.lowering_config<{{.*}}reduction = [0, 0, 8]{{.*}}subgroup = [4, 1, 0]{{.*}}workgroup = [4, 4, 0]{{.*}}>
 // CHECK:        iree_tensor_ext.dispatch.tensor.store %[[MATMUL]]
+
+// -----
+
+func.func @fold_padded_igemm_result_to_map_store(
+    %arg0: memref<1x16x16x4xf32>,
+    %arg1: memref<3x3x4x63xf32>,
+    %arg2: memref<1x14x14x63xf32>) {
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = iree_codegen.load_from_buffer %arg0 : memref<1x16x16x4xf32> -> tensor<1x16x16x4xf32>
+  %1 = iree_codegen.load_from_buffer %arg1 : memref<3x3x4x63xf32> -> tensor<3x3x4x63xf32>
+  %empty = tensor.empty() : tensor<1x14x14x63xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<1x14x14x63xf32>) -> tensor<1x14x14x63xf32>
+  %2 = linalg.conv_2d_nhwc_hwcf
+    {dilations = dense<1> : tensor<2xi64>,
+     lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>, padding = [64, 128, 128], padding_conv = [0, 0, 0, 128, 0, 0, 0], promote_operands = [0, 1], reduction = [0, 0, 8], subgroup = [4, 1, 0], workgroup = [4, 4, 0]}>,
+     strides = dense<1> : tensor<2xi64>}
+     ins(%0, %1: tensor<1x16x16x4xf32>, tensor<3x3x4x63xf32>)
+    outs(%fill: tensor<1x14x14x63xf32>) -> tensor<1x14x14x63xf32>
+  iree_codegen.store_to_buffer %2, %arg2 : tensor<1x14x14x63xf32> into memref<1x14x14x63xf32>
+  return
+}
+
+// PADDED:      func.func @fold_padded_igemm_result_to_map_store
+// PADDED-DAG:    %[[IM2COL:.+]] = iree_linalg_ext.im2col
+// PADDED:        %[[MATMUL:.+]] = linalg.generic
+// PADDED-SAME:     tensor<196x128xf32>
+// PADDED:        %[[MAP_STORE:.+]] = iree_linalg_ext.map_store %[[MATMUL]]
+// PADDED-NOT:      tensor.expand_shape
+// PADDED-NOT:      tensor.extract_slice
+// PADDED:        iree_codegen.store_to_buffer %[[MAP_STORE]]
 
 // -----
 

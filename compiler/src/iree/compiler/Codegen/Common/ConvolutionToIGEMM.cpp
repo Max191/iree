@@ -4,9 +4,12 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/compiler/Codegen/Common/CombineLayoutTransformation.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/MLIRContext.h"
@@ -154,6 +157,15 @@ convertToIGEMMAndSetConfig(FunctionOpInterface funcOp,
                                      std::move(bubbleCollapseShapePatterns)))) {
       return failure();
     }
+  }
+
+  CombineRelayoutOpsControlFn combineRelayoutControlFn =
+      getCombineRelayoutOpsControlFn(
+          IREE::Codegen::RelayoutCombinationScope::Dispatch);
+  if (failed(combineLayoutTransformation(
+          context, funcOp, /*padDistributionConfigFn=*/nullptr,
+          /*doReshapeByExpansion=*/false, combineRelayoutControlFn))) {
+    return failure();
   }
   return success();
 }
