@@ -1,0 +1,70 @@
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#ifndef IREE_COMPILER_DIALECT_UTIL_ANALYSIS_AFFINE_SEED_DEPENDENCY_ANALYSIS_H_
+#define IREE_COMPILER_DIALECT_UTIL_ANALYSIS_AFFINE_SEED_DEPENDENCY_ANALYSIS_H_
+
+#include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
+#include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Value.h"
+
+#include <functional>
+
+namespace mlir::iree_compiler::IREE::Util {
+
+class AffineSeedDependencyLattice
+    : public dataflow::Lattice<AffineSeedDependency> {
+public:
+  using Lattice::Lattice;
+};
+
+class AffineSeedDependencyAnalysis
+    : public dataflow::SparseForwardDataFlowAnalysis<
+          AffineSeedDependencyLattice> {
+public:
+  using SeedPositionFn = std::function<std::optional<unsigned>(Value)>;
+
+  explicit AffineSeedDependencyAnalysis(
+      DataFlowSolver &solver, SeedPositionFn seedPositionFn = {});
+
+  void setToEntryState(AffineSeedDependencyLattice *lattice) override;
+
+  LogicalResult
+  visitOperation(Operation *op,
+                 ArrayRef<const AffineSeedDependencyLattice *> operands,
+                 ArrayRef<AffineSeedDependencyLattice *> results) override;
+
+  void visitExternalCall(
+      CallOpInterface call,
+      ArrayRef<const AffineSeedDependencyLattice *> argumentLattices,
+      ArrayRef<AffineSeedDependencyLattice *> resultLattices) override;
+
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor,
+      ValueRange successorInputs,
+      ArrayRef<AffineSeedDependencyLattice *> argLattices) override;
+
+private:
+  std::optional<unsigned> getSeedPosition(Value value) const;
+  bool isSeed(Value value) const;
+  AffineSeedDependency getSeedDependency(Value value) const;
+  void setLattice(AffineSeedDependencyLattice *lattice,
+                  const AffineSeedDependency &dependency);
+  void setToUnknown(AffineSeedDependencyLattice *lattice);
+  void setToSeedOrUnknown(AffineSeedDependencyLattice *lattice);
+
+  SeedPositionFn seedPositionFn;
+};
+
+/// Infers seed expressions from a single-result affine map expression.
+AffineSeedDependency
+inferAffineMapSeedDependency(AffineMap map,
+                             ArrayRef<AffineSeedDependency> argDeps);
+
+} // namespace mlir::iree_compiler::IREE::Util
+
+#endif // IREE_COMPILER_DIALECT_UTIL_ANALYSIS_AFFINE_SEED_DEPENDENCY_ANALYSIS_H_

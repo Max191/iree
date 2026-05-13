@@ -13,6 +13,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/Dialect/Util/Analysis/AffineSeedDependencyAnalysis.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
@@ -28,6 +29,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 #include <numeric>
 
@@ -476,6 +478,116 @@ struct ArithDivUIInferIntDivisibilityOpInterface
             : 1;
 
     setResultDivs(divOp, IREE::Util::ConstantIntDivisibility(divUDiv, divSDiv));
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// InferAffineSeedDependencyOpInterface
+//===----------------------------------------------------------------------===//
+
+using AffineSeedDependency = IREE::Util::AffineSeedDependency;
+using SetAffineSeedDependencyFn = IREE::Util::SetAffineSeedDependencyFn;
+
+static std::optional<int64_t> matchConstantInt64(Value value) {
+  APInt intValue;
+  if (!matchPattern(value, m_ConstantInt(&intValue)) ||
+      !intValue.isSignedIntN(64)) {
+    return std::nullopt;
+  }
+  return intValue.getSExtValue();
+}
+
+struct AffineApplyInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          AffineApplyInferAffineSeedDependencyOpInterface,
+          affine::AffineApplyOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto affineApplyOp = cast<affine::AffineApplyOp>(op);
+    assert(argDeps.size() == affineApplyOp.getOperands().size() &&
+           "expected one affine seed dependency per operand");
+    setResultDependencies(
+        affineApplyOp.getResult(),
+        IREE::Util::inferAffineMapSeedDependency(affineApplyOp.getMap(),
+                                                 argDeps));
+  }
+};
+
+template <typename OpTy>
+struct ArithAddInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithAddInferAffineSeedDependencyOpInterface<OpTy>, OpTy> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto addOp = cast<OpTy>(op);
+    assert(argDeps.size() == 2 &&
+           "expected one affine seed dependency per operand");
+    setResultDependencies(addOp.getResult(),
+                          AffineSeedDependency::add(argDeps[0], argDeps[1]));
+  }
+};
+
+struct ArithSubIInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithSubIInferAffineSeedDependencyOpInterface, arith::SubIOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto subOp = cast<arith::SubIOp>(op);
+    assert(argDeps.size() == 2 &&
+           "expected one affine seed dependency per operand");
+    setResultDependencies(
+        subOp.getResult(),
+        AffineSeedDependency::add(argDeps[0], argDeps[1], 1, -1));
+  }
+};
+
+struct ArithMulIInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithMulIInferAffineSeedDependencyOpInterface, arith::MulIOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto mulOp = cast<arith::MulIOp>(op);
+    assert(argDeps.size() == 2 &&
+           "expected one affine seed dependency per operand");
+    if (std::optional<int64_t> rhsConstant =
+            matchConstantInt64(mulOp.getRhs())) {
+      setResultDependencies(mulOp.getResult(),
+                            AffineSeedDependency::scale(argDeps[0],
+                                                        *rhsConstant));
+      return;
+    }
+    if (std::optional<int64_t> lhsConstant =
+            matchConstantInt64(mulOp.getLhs())) {
+      setResultDependencies(mulOp.getResult(),
+                            AffineSeedDependency::scale(argDeps[1],
+                                                        *lhsConstant));
+      return;
+    }
+    if (argDeps[0].isIndependent() && argDeps[1].isIndependent()) {
+      setResultDependencies(mulOp.getResult(),
+                            AffineSeedDependency::getIndependent());
+      return;
+    }
+    setResultDependencies(mulOp.getResult(),
+                          AffineSeedDependency::getUnknownForDependentSeeds(
+                              argDeps));
+  }
+};
+
+struct ArithConstantInferAffineSeedDependencyOpInterface
+    : IREE::Util::InferAffineSeedDependencyOpInterface::ExternalModel<
+          ArithConstantInferAffineSeedDependencyOpInterface,
+          arith::ConstantOp> {
+  void inferResultAffineSeedDependencies(
+      Operation *op, ArrayRef<AffineSeedDependency> argDeps,
+      SetAffineSeedDependencyFn setResultDependencies) const {
+    auto constantOp = cast<arith::ConstantOp>(op);
+    setResultDependencies(constantOp.getResult(),
+                          AffineSeedDependency::getIndependent());
   }
 };
 
@@ -1367,6 +1479,14 @@ void registerUtilExternalModels(DialectRegistry &registry) {
         *context);
     arith::SelectOp::attachInterface<
         ArithSelectInferIntDivisibilityOpInterface>(*context);
+    arith::ConstantOp::attachInterface<
+        ArithConstantInferAffineSeedDependencyOpInterface>(*context);
+    arith::AddIOp::attachInterface<
+        ArithAddInferAffineSeedDependencyOpInterface<arith::AddIOp>>(*context);
+    arith::SubIOp::attachInterface<
+        ArithSubIInferAffineSeedDependencyOpInterface>(*context);
+    arith::MulIOp::attachInterface<
+        ArithMulIInferAffineSeedDependencyOpInterface>(*context);
   });
 
   registry.addExtension(
@@ -1379,6 +1499,8 @@ void registerUtilExternalModels(DialectRegistry &registry) {
             AffineMaxInferIntDivisibilityOpInterface>(*context);
         affine::AffineDelinearizeIndexOp::attachInterface<
             AffineDelinearizeIndexInferIntDivisibilityOpInterface>(*context);
+        affine::AffineApplyOp::attachInterface<
+            AffineApplyInferAffineSeedDependencyOpInterface>(*context);
       });
 
   registry.addExtension(

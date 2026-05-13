@@ -163,6 +163,38 @@ def InferIntDivisibilityOpInterface :
 }
 
 //===----------------------------------------------------------------------===//
+// IREE::Util::InferAffineSeedDependencyOpInterface
+//===----------------------------------------------------------------------===//
+
+def InferAffineSeedDependencyOpInterface :
+    Util_OpInterface<"InferAffineSeedDependencyOpInterface"> {
+
+  let description = [{
+    Allows operations to participate in affine seed-dependency analysis.
+
+    Seed values are selected by the analysis caller and mapped to affine dim
+    expressions. Known dependencies carry the affine expression relating a value
+    to those seed dims, plus any seed dims whose relationship was invalidated by
+    unsupported or non-affine semantics. The global unknown state means that no
+    usable relationship is known for the result.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+    /*desc=*/[{
+      Infers affine expression relationships from selected seed values to
+      operation results.
+    }],
+    /*retTy=*/"void",
+    /*methodName=*/"inferResultAffineSeedDependencies",
+    /*args=*/(ins
+        "::llvm::ArrayRef<::mlir::iree_compiler::IREE::Util::AffineSeedDependency>":$argDeps,
+        "::mlir::iree_compiler::IREE::Util::SetAffineSeedDependencyFn":$setResultDependencies)
+    >
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // IREE::Util::InitializerOpInterface
 //===----------------------------------------------------------------------===//
 

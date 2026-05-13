@@ -7,6 +7,8 @@
 #ifndef IREE_COMPILER_DIALECT_UTIL_IR_UTILTYPES_H_
 #define IREE_COMPILER_DIALECT_UTIL_IR_UTILTYPES_H_
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Endian.h"
@@ -25,6 +27,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include <numeric>
+#include <optional>
 
 // clang-format off: must be included after all LLVM/MLIR headers.
 #include "iree/compiler/Dialect/Util/IR/UtilEnums.h.inc" // IWYU pragma: keep
@@ -256,6 +259,107 @@ inline raw_ostream &operator<<(raw_ostream &os,
 
 using SetIntDivisibilityFn =
     llvm::function_ref<void(Value, const ConstantIntDivisibility &)>;
+
+//===----------------------------------------------------------------------===//
+// Affine seed-dependency lattice payload.
+//===----------------------------------------------------------------------===//
+
+class AffineSeedDependency {
+public:
+  // Lattice state for the affine relationship from selected seed values to an
+  // analyzed value. A known state carries an MLIR affine expression where affine
+  // dims are seed values, plus the seed-to-dim-position mapping needed to
+  // interpret it. Independent offsets are tracked out of band so callers can
+  // distinguish affine seed coefficients from seed-independent arithmetic.
+  // Unsupported or non-separable propagation can invalidate individual seeds
+  // while preserving the remaining known expression. The global Unknown state
+  // means no usable relationship is known. Maps seed values to the affine dim
+  // position used to represent that seed in the expression.
+  using SeedPositionMap = llvm::DenseMap<Value, unsigned>;
+  using InvalidatedSeedSet = llvm::DenseSet<Value>;
+
+  enum class Kind {
+    Uninitialized,
+    Known,
+    Unknown,
+  };
+
+  AffineSeedDependency() = default;
+
+  static AffineSeedDependency getIndependent();
+  static AffineSeedDependency getSeed(Value seed, unsigned position);
+  static AffineSeedDependency getKnown(AffineExpr expression,
+                                       SeedPositionMap seedPositions =
+                                           SeedPositionMap(),
+                                       InvalidatedSeedSet invalidatedSeeds =
+                                           InvalidatedSeedSet(),
+                                       bool hasIndependentOffset = false);
+  static AffineSeedDependency getUnknown();
+
+  static AffineSeedDependency join(const AffineSeedDependency &lhs,
+                                   const AffineSeedDependency &rhs);
+  static AffineSeedDependency scale(const AffineSeedDependency &dependency,
+                                    int64_t scale);
+  static AffineSeedDependency add(const AffineSeedDependency &lhs,
+                                  const AffineSeedDependency &rhs,
+                                  int64_t lhsScale = 1,
+                                  int64_t rhsScale = 1);
+  static AffineSeedDependency floorDiv(const AffineSeedDependency &dependency,
+                                       int64_t divisor);
+  static AffineSeedDependency ceilDiv(const AffineSeedDependency &dependency,
+                                      int64_t divisor);
+  static AffineSeedDependency mod(const AffineSeedDependency &dependency,
+                                  int64_t modulus);
+  static AffineSeedDependency getUnknownForDependentSeeds(
+      ArrayRef<AffineSeedDependency> dependencies);
+
+  bool isUninitialized() const { return kind == Kind::Uninitialized; }
+  bool isKnown() const { return kind == Kind::Known; }
+  bool isUnknown() const { return kind == Kind::Unknown; }
+  bool isIndependent() const;
+  Kind getKind() const { return kind; }
+
+  AffineExpr getExpression(MLIRContext *context) const;
+  const SeedPositionMap &getSeedPositions() const {
+    assert(isKnown() && "expected known affine seed dependency");
+    return seedPositions;
+  }
+  const InvalidatedSeedSet &getInvalidatedSeeds() const {
+    assert(isKnown() && "expected known affine seed dependency");
+    return invalidatedSeeds;
+  }
+  bool hasInvalidatedSeeds() const;
+  bool hasIndependentOffset() const { return independentOffset; }
+  std::optional<int64_t> getCoefficient(Value seed) const;
+
+  bool operator==(const AffineSeedDependency &rhs) const;
+  void print(raw_ostream &os) const;
+
+private:
+  explicit AffineSeedDependency(Kind kind) : kind(kind) {}
+  AffineSeedDependency(AffineExpr expression, SeedPositionMap seedPositions,
+                       InvalidatedSeedSet invalidatedSeeds,
+                       bool hasIndependentOffset)
+      : kind(Kind::Known), expression(expression),
+        seedPositions(std::move(seedPositions)),
+        invalidatedSeeds(std::move(invalidatedSeeds)),
+        independentOffset(hasIndependentOffset) {}
+
+  Kind kind = Kind::Uninitialized;
+  AffineExpr expression;
+  SeedPositionMap seedPositions;
+  InvalidatedSeedSet invalidatedSeeds;
+  bool independentOffset = false;
+};
+
+inline raw_ostream &operator<<(raw_ostream &os,
+                               const AffineSeedDependency &dependency) {
+  dependency.print(os);
+  return os;
+}
+
+using SetAffineSeedDependencyFn =
+    llvm::function_ref<void(Value, const AffineSeedDependency &)>;
 
 //===----------------------------------------------------------------------===//
 // Shape-aware interface utilities

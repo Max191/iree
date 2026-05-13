@@ -14,11 +14,13 @@ iree_cc_library(
   NAME
     Analysis
   HDRS
+    "AffineSeedDependencyAnalysis.h"
     "Explorer.h"
     "GlobalTable.h"
     "IntegerDivisibilityAnalysis.h"
     "Position.h"
   SRCS
+    "AffineSeedDependencyAnalysis.cpp"
     "Explorer.cpp"
     "GlobalTable.cpp"
     "IntegerDivisibilityAnalysis.cpp"
