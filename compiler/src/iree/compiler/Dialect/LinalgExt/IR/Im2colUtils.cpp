@@ -361,7 +361,21 @@ static bool isUnitWindowMOutputDim(Im2colOp im2colOp, int64_t outputDim) {
   if (it == mOutputDims.end()) {
     return false;
   }
-  int64_t idx = it - mOutputDims.begin();
+  int64_t mOutputDimIndex = it - mOutputDims.begin();
+  int64_t canonicalOutputDim =
+      im2colOp.getBatchPos().size() + mOutputDimIndex;
+  SmallVector<SmallVector<OpFoldResult>> outputSizes =
+      im2colOp.getMixedOutputSizes();
+  // An output dimension may represent a collapsed group of M dimensions. A
+  // vectorized slice through that flattened dimension varies the innermost
+  // sub-dimension, so use the back entry in the corresponding output_sizes
+  // group to select the matching window metadata.
+  int64_t idx = 0;
+  for (int64_t i = im2colOp.getBatchPos().size(); i < canonicalOutputDim;
+       ++i) {
+    idx += outputSizes[i].size();
+  }
+  idx += outputSizes[canonicalOutputDim].size() - 1;
   SmallVector<OpFoldResult> kernelSizes = im2colOp.getMixedKernelSize();
   ArrayRef<int64_t> strides = im2colOp.getStrides();
   ArrayRef<int64_t> dilations = im2colOp.getDilations();

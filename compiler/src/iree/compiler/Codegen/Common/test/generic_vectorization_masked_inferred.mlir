@@ -980,6 +980,33 @@ func.func @im2col_vectorize_unit_m_dim(
 
 // -----
 
+// Collapsed M dim where the vectorized output dimension corresponds to the
+// innermost sub-dimension in the output_sizes group. The first two M
+// sub-dimensions have real window metadata, but the innermost sub-dimension is
+// a unit-window channel/pass-through dim and should vectorize.
+func.func @im2col_vectorize_collapsed_m_dim(
+    %input: tensor<32x25x25x256xf32>
+) -> tensor<1x8xf32> {
+  %0 = tensor.empty() : tensor<1x8xf32>
+  %1 = iree_linalg_ext.im2col
+          strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [25, 25, 1]
+          offsets = [0, 0] output_sizes = [[3, 3, 256], [1, 32, 25, 25]]
+          batch_pos = [] m_pos = [1, 2, 3] k_pos = [0]
+          input_k_perm = [3, 0, 1, 2] output_perm = [1, 0]
+          ins(%input : tensor<32x25x25x256xf32>)
+          outs(%0 : tensor<1x8xf32>) -> tensor<1x8xf32>
+  return %1 : tensor<1x8xf32>
+}
+// CHECK-LABEL: func.func @im2col_vectorize_collapsed_m_dim
+//  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]: tensor<32x25x25x256xf32>
+//   CHECK-DAG:   %[[POISON:.+]] = ub.poison : f32
+//   CHECK-NOT:   iree_linalg_ext.im2col
+//       CHECK:   %[[READ:.+]] = vector.transfer_read %[[INPUT]]{{.*}}, %[[POISON]] {in_bounds = [true]} : tensor<32x25x25x256xf32>, vector<8xf32>
+//       CHECK:   %[[FINAL:.+]] = vector.transfer_write %[[READ]], {{.*}} : vector<8xf32>, tensor<1x8xf32>
+//       CHECK:   return %[[FINAL]] : tensor<1x8xf32>
+
+// -----
+
 // Dynamic output shape: vectorization pattern should not match.
 func.func @im2col_no_vectorize_dynamic(
     %input: tensor<2x34x34x640xf32>, %m_size: index, %m_off: index, %k: index
